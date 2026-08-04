@@ -104,3 +104,4 @@ class TestCountTokens:
         text = "héllo wörld 你好 emoji😀test"
         # Should not raise, and should count each whitespace-separated token.
         assert count_tokens(text, word_tokenizer) == len(text.split())
+

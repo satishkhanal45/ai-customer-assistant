@@ -85,3 +85,4 @@ class IngestionSettings(BaseSettings):
         of sync with chunk_size_tokens / chunk_overlap_tokens.
         """
         return self.chunk_overlap_tokens / self.chunk_size_tokens
+

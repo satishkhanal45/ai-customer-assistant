@@ -58,3 +58,4 @@ class TestImmutability:
         settings = IngestionSettings(_env_file=None)
         with pytest.raises(Exception):  # noqa: PT011 - pydantic's frozen-model exception type may vary by version
             settings.chunk_size_tokens = 999  # type: ignore[misc]
+

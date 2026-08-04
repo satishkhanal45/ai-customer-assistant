@@ -190,3 +190,4 @@ def _validate_dimensions(
             f"Expected every embedding to have dimension {expected_dimension}, "
             f"but got mismatches (index, actual_dimension): {mismatched}"
         )
+
