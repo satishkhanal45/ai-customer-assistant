@@ -107,3 +107,4 @@ def process_document(
         expected_dimension=settings.embedding_dimension,
         batch_size=embedding_batch_size,
     )
+

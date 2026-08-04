@@ -6,7 +6,7 @@ import pytest
 
 from ingestion.chunk_embed.chunking import UnknownSourceTypeError, chunk_document
 from ingestion.chunk_embed.types import HeadingMarker
-from backend.tests.chunk_embed.conftest import make_document
+from chunk_embed.conftest import make_document
 
 
 def _chunk(document, tokenizer, long_form_types, structured_types, **overrides):
@@ -312,3 +312,4 @@ class TestMetadataDoesNotDuplicateSourceId:
         chunks = _chunk(document, word_tokenizer, long_form_source_types, structured_source_types)
         assert chunks[0].source_id == "doc-42"
         assert "source_id" not in chunks[0].metadata
+

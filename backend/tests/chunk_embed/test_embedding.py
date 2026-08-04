@@ -165,3 +165,4 @@ class TestDimensionMismatch:
             embed_chunks(
                 chunks, model=wrong_dim_model, normalize_embeddings=True, expected_dimension=768
             )
+

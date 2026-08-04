@@ -203,3 +203,4 @@ class TestFullPipelineRealDocument:
             structured_source_types=frozenset(),
         )
         assert all(ec.chunk.source_id == "alpinist-studios-handbook" for ec in result)
+

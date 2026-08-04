@@ -92,3 +92,4 @@ def count_tokens(text: str, tokenizer: PreTrainedTokenizerBase) -> int:
         The token count.
     """
     return len(encode(text, tokenizer))
+

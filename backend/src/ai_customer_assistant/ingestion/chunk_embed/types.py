@@ -118,3 +118,4 @@ class EmbeddedChunk:
 
     chunk: Chunk
     embedding: tuple[float, ...]
+

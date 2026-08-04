@@ -97,3 +97,4 @@ class TestEmbeddedChunk:
         chunk = make_chunk()
         embedded = EmbeddedChunk(chunk=chunk, embedding=(0.0,) * 768)
         assert isinstance(embedded.embedding, tuple)
+
