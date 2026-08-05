@@ -1,7 +1,7 @@
 """SQLAlchemy models for the tables the storage layer reads/writes.
 
 NOTE: in the real codebase these declarative models almost certainly
-already exist elsewhere (e.g. ``ai_customer_assistant.db.models``), defined
+already exist elsewhere (e.g. ``db.models``), defined
 against the full schema in ``schema.md``. They are reproduced here,
 scoped to only the columns ``repository.py`` touches, purely so this
 module is self-contained and its tests don't depend on an external models
