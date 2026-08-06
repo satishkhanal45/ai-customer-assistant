@@ -12,7 +12,7 @@ from pgvector.sqlalchemy import Vector
 # and "ai-customer-assistant" (hyphenated) can never appear as a dotted segment in
 # an import statement — but adding that directory straight to sys.path makes its
 # direct children, like `db`, ordinary top-level-importable packages.
-SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "ai-customer-assistant"
+SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "ai_customer_assistant"
 sys.path.insert(0, str(SRC_ROOT))
 
 from db.models import Base  # noqa: E402
