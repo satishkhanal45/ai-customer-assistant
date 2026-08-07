@@ -6,7 +6,7 @@ import pytest
 
 from ingestion.chunk_embed.chunking import UnknownSourceTypeError, chunk_document
 from ingestion.chunk_embed.types import HeadingMarker
-from chunk_embed.conftest import make_document
+from tests.chunk_embed.conftest import make_document
 
 
 def _chunk(document, tokenizer, long_form_types, structured_types, **overrides):

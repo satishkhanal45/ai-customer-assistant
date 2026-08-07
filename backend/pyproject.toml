@@ -27,3 +27,6 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = [".", "src/ai_customer_assistant"]
 testpaths = ["tests"]
+
+[tool.pyright]
+extraPaths = [".", "src/ai_customer_assistant"]
