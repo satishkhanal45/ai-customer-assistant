@@ -21,6 +21,9 @@ dependencies = [
     "pydantic>=2.13.4",
     "anthropic>=0.120.2",
     "groq>=1.6.0",
+    "groq>=1.6.0",
+    "trafilatura>=2.2.0",
+    "email-validator>=2.3.0",
 ]
 
 [dependency-groups]

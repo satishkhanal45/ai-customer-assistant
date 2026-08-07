@@ -310,3 +310,19 @@ class KnowledgeInjectionJob(Base):
 
     source: Mapped["KnowledgeSource"] = relationship(back_populates="jobs")
     version: Mapped["KnowledgeSourceVersion | None"] = relationship(back_populates="jobs")
+
+
+TicketStatusEnum = SAEnum("OPEN", "IN_PROGRESS", "RESOLVED", name="ticket_status")
+
+
+class Ticket(Base):
+    __tablename__ = "ticket"
+
+    ticket_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    query: Mapped[str] = mapped_column(Text, nullable=False)
+    priority: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    status: Mapped[str] = mapped_column(TicketStatusEnum, nullable=False, server_default="OPEN")
+    created_at: Mapped[datetime] = mapped_column(nullable=False, server_default=func.now())
