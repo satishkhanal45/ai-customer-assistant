@@ -19,6 +19,55 @@ services:
       timeout: 5s
       retries: 10
 
+  minio:
+    image: minio/minio:latest
+    container_name: ai-customer-assistant-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    env_file:
+      - ./backend/.env
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: ai-customer-assistant-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin123} &&
+      mc mb --ignore-existing local/${MINIO_BUCKET:-knowledge-documents} &&
+      echo 'MinIO bucket ready'
+      "
+    restart: "no"
+
+  tika:
+    image: apache/tika:latest-full
+    container_name: ai-customer-assistant-tika
+    restart: unless-stopped
+    ports:
+      - "9998:9998"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/9998'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
   backend:
     build:
       context: ./backend
@@ -29,13 +78,22 @@ services:
       - ./backend/.env
     environment:
       POSTGRES_HOST: postgres
+      MINIO_ENDPOINT: minio:9000
+      TIKA_BASE_URL: http://tika:9998
+      FRONTEND_DIR: /app/frontend
     depends_on:
       postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      tika:
         condition: service_healthy
     ports:
       - "${APP_PORT:-8000}:8000"
     volumes:
       - ./backend/alembic/versions:/app/alembic/versions
+      - ./frontend:/app/frontend
 
 volumes:
   postgres_data:
+  minio_data:
