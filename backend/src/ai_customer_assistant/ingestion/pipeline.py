@@ -329,10 +329,14 @@ async def _resolve_deps(session: AsyncSession) -> PipelineDeps:
 
 
 def _default_extraction_agent() -> ExtractionAgent:
-    """TODO: wire to the real LLM provider/model settings once config.py
-    (sent empty) is filled in -- see INGESTION_INTEGRATION_NOTES.md."""
+    """Wire the EAV extraction model. Honor EAV_MODEL when set; default to a
+    Groq model that reliably emits the full EAV tool set (resolve_entity +
+    record_attribute_value + record_relation), not just resolve_entity."""
+    import os
+
     from ingestion.extraction.agent import build_extraction_agent
     from langchain_groq import ChatGroq
 
-    llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0)
+    model = os.environ.get("EAV_MODEL", "llama-3.3-70b-versatile")
+    llm = ChatGroq(model=os.environ.get("EAV_MODEL", "llama-3.3-70b-versatile"), temperature=0)
     return build_extraction_agent(llm)

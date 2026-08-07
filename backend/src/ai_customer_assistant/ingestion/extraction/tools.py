@@ -108,13 +108,15 @@ def _apply_no_fact(acc: ChunkExtraction, _args: NoFactFound) -> ChunkExtraction:
     return acc
 
 
-# Dispatch table: tool name -> (schema, folder). Replaces an if/elif ladder
-# over `tool_call["name"]`.
+# Dispatch table: emitted tool name -> (schema, filler). The model calls the
+# tools by their RENAMED snake_case names (from _TOOL_NAME_OVERRIDES), not
+# the pydantic class names -- so the keys must be the override names, or every
+# tool call is silently dropped and extraction is a no-op.
 _HANDLERS: dict[str, tuple[type, Any]] = {
-    ResolveEntityArgs.__name__: (ResolveEntityArgs, _apply_resolve_entity),
-    RecordAttributeValueArgs.__name__: (RecordAttributeValueArgs, _apply_attribute_value),
-    RecordRelationArgs.__name__: (RecordRelationArgs, _apply_relation),
-    NoFactFound.__name__: (NoFactFound, _apply_no_fact),
+    _TOOL_NAME_OVERRIDES[ResolveEntityArgs]: (ResolveEntityArgs, _apply_resolve_entity),
+    _TOOL_NAME_OVERRIDES[RecordAttributeValueArgs]: (RecordAttributeValueArgs, _apply_attribute_value),
+    _TOOL_NAME_OVERRIDES[RecordRelationArgs]: (RecordRelationArgs, _apply_relation),
+    _TOOL_NAME_OVERRIDES[NoFactFound]: (NoFactFound, _apply_no_fact),
 }
 
 

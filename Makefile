@@ -6,11 +6,20 @@ run:
 test:
 	uv run --project backend pytest backend/tests
 
+uvicorn: ## Start the FastAPI local development server
+	POSTGRES_HOST=$(POSTGRES_HOST) \
+	POSTGRES_PORT=$(POSTGRES_PORT) \
+	PYTHONPATH=$(PYTHONPATH) \
+	uv run --env-file backend/.env --project backend uvicorn main:app --reload --app-dir backend/src/ai_customer_assistant
 
 
-# Default environment variables
-POSTGRES_HOST ?= localhost
-POSTGRES_PORT ?= 5433
+# Default environment variables. Use plain "=" (not "?=") so an ambient
+# POSTGRES_HOST/POSTGRES_PORT exported in the shell (e.g. from `source
+# backend/.env`, which contains docker-internal values) can't leak into
+# host-side targets. Override explicitly on the command line if needed:
+#   make ingest POSTGRES_HOST=postgres POSTGRES_PORT=5432
+POSTGRES_HOST = localhost
+POSTGRES_PORT = 5433
 DEFAULT_URL ?= https://alpiniststudios.com/app-prototype-a-complete-guide/
 DEFAULT_USER_ID ?= 00000000-0000-0000-0000-000000000000
 PYTHONPATH := backend:backend/src:backend/src/ai_customer_assistant
@@ -56,3 +65,9 @@ ingest: ## Crawl and ingest a URL (e.g. make ingest URL="https://...")
 verify: ## Check database records for knowledge sources
 	docker exec -it -e PAGER=cat ai-customer-assistant-postgres psql -U ai_assistant -d ai_customer_assistant -c \
 		"SELECT source_id, source_name, source_type, updated_at FROM knowledge_source ORDER BY updated_at DESC;"
+
+psql :
+	docker exec -it ai-customer-assistant-postgres psql -U ai_assistant -d ai_customer_assistant
+
+graph :
+	open frontend/graph_viewer.html

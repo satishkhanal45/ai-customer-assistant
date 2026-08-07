@@ -80,6 +80,7 @@ services:
       POSTGRES_HOST: postgres
       MINIO_ENDPOINT: minio:9000
       TIKA_BASE_URL: http://tika:9998
+      FRONTEND_DIR: /app/frontend
     depends_on:
       postgres:
         condition: service_healthy
@@ -91,6 +92,7 @@ services:
       - "${APP_PORT:-8000}:8000"
     volumes:
       - ./backend/alembic/versions:/app/alembic/versions
+      - ./frontend:/app/frontend
 
 volumes:
   postgres_data:

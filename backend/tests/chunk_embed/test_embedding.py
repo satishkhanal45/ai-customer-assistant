@@ -10,7 +10,7 @@ from ingestion.chunk_embed.embedding import (
     EmptyChunkTextError,
     embed_chunks,
 )
-from backend.tests.chunk_embed.conftest import FakeEmbeddingModel, make_chunk
+from tests.chunk_embed.conftest import FakeEmbeddingModel, make_chunk
 
 
 class TestEmptyInput:

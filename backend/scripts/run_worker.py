@@ -14,12 +14,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
+import warnings
 from pathlib import Path
 
 _PKG_ROOT = Path(__file__).resolve().parent.parent / "src" / "ai_customer_assistant"
 if str(_PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(_PKG_ROOT))
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -58,8 +63,25 @@ def _async_database_url() -> str:
     return sync_url.replace("postgresql+psycopg://", "postgresql+psycopg_async://")
 
 
+
+def _silence_noisy_loggers() -> None:
+    """Suppress verbose HTTP and ML framework logging."""
+    noisy_loggers = [
+        "httpx",
+        "httpcore",
+        "urllib3",
+        "sentence_transformers",
+        "huggingface_hub",
+        "transformers",
+    ]
+    for logger_name in noisy_loggers:
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+    warnings.filterwarnings("ignore", category=UserWarning)
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    _silence_noisy_loggers()  # ADDED
     _load_dotenv_if_available()
 
     engine = create_async_engine(_async_database_url())
@@ -70,6 +92,8 @@ async def main() -> None:
         "ingestion worker starting, polling every %.1fs", deps.settings.poll_interval_seconds
     )
     await run_worker(deps)
+
+
 
 
 if __name__ == "__main__":

@@ -16,7 +16,10 @@ run_migrations() {
 
 start_app() {
   echo "Starting application..."
-  exec uvicorn main:app --host 0.0.0.0 --port "${APP_PORT:-8000}"
+  # --app-dir: the FastAPI app lives at src/ai_customer_assistant/main.py;
+  # without this, "uvicorn main:app" resolves ./main.py (the placeholder)
+  # instead and fails with 'Attribute "app" not found in module "main"'.
+  exec uvicorn main:app --app-dir /app/src/ai_customer_assistant --host 0.0.0.0 --port "${APP_PORT:-8000}"
 }
 
 wait_for_postgres
