@@ -36,6 +36,8 @@ dev = [
 pythonpath = [".", "src/ai_customer_assistant"]
 testpaths = ["tests"]
 
+[tool.pyright]
+extraPaths = [".", "src/ai_customer_assistant"]
 
 [build-system]
 requires = ["hatchling"]
