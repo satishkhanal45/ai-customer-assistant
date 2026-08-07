@@ -46,4 +46,12 @@ if FRONTEND_DIR is not None:
     async def index() -> RedirectResponse:
         return RedirectResponse(url="/graph_viewer_3d.html")
 
+    @app.get("/graph", include_in_schema=False)
+    async def graph_3d() -> RedirectResponse:
+        return RedirectResponse(url="/graph_viewer_3d.html")
+
+    @app.get("/graph2d", include_in_schema=False)
+    async def graph_2d() -> RedirectResponse:
+        return RedirectResponse(url="/graph_viewer.html")
+
     app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
