@@ -149,17 +149,41 @@ def _build_routed_decision(
     )
 
 
+_CHECK_STATUS_UNAVAILABLE = (
+    "Ticket status lookups aren't available yet — I can help you answer "
+    "questions from our knowledge base or open a new support ticket."
+)
+
+
+def _build_check_status_decision(_: Classification, __: int) -> RoutingDecision:
+    """CHECK_TICKET_STATUS is explicitly scoped out of MVP (§2.3): there is
+    no DB status lookup yet. Answer directly instead of routing into the
+    Ticket Agent, whose job is only creating tickets."""
+    return RoutingDecision(
+        next_agent=NextAgent.NONE,
+        clarification_required=False,
+        clarification_question=None,
+        clarification_attempts=0,
+        ticket_type=None,
+        final_response=_CHECK_STATUS_UNAVAILABLE,
+    )
+
+
 _CASE_BUILDERS: dict[str, Callable[[Classification, int], RoutingDecision]] = {
     "ESCALATE": _build_escalation_decision,
     "CLARIFY": _build_clarification_decision,
     "ROUTE": _build_routed_decision,
+    "CHECK_STATUS": _build_check_status_decision,
 }
 
 
-def _decision_case(needs_clarification: bool, exhausted: bool) -> str:
+def _decision_case(needs_clarification: bool, exhausted: bool, intent: Intent) -> str:
     return next(
         case
         for predicate, case in (
+            # CHECK_TICKET_STATUS is scoped out of MVP: answer directly
+            # regardless of confidence tier, before clarification/escalate.
+            (intent is Intent.CHECK_TICKET_STATUS, "CHECK_STATUS"),
             (exhausted, "ESCALATE"),
             (needs_clarification, "CLARIFY"),
             (True, "ROUTE"),
@@ -176,7 +200,7 @@ def _domain_request_decision(
     needs_clarification = is_unknown or tier is not ConfidenceTier.HIGH
     exhausted = is_unknown and (prior_attempts + 1) >= MAX_CLARIFICATION_ATTEMPTS
 
-    case = _decision_case(needs_clarification, exhausted)
+    case = _decision_case(needs_clarification, exhausted, classification.intent)
     return _CASE_BUILDERS[case](classification, prior_attempts)
 
 

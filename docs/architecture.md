@@ -36,7 +36,7 @@ flowchart LR
     DIP[Document Ingestion Pipeline] -->|Indexes into| DB
 
     A([Admin]) -->|Uploads documents| DIP
-    A -->|Configures & monitors| RAG
+   
 ```
 
 * **User** — the customer interacting through the Customer Portal.
