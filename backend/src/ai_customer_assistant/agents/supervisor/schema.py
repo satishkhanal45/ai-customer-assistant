@@ -8,6 +8,8 @@ from __future__ import annotations
 from enum import Enum
 from typing import Optional, TypedDict
 
+from ..contracts import ConversationTurn
+
 
 class RequestCategory(str, Enum):
     GREETING = "GREETING"
@@ -50,11 +52,6 @@ MEDIUM_CONFIDENCE_THRESHOLD = 0.5
 MAX_CLARIFICATION_ATTEMPTS = 3
 
 
-class ConversationTurn(TypedDict):
-    role: str
-    content: str
-
-
 class SupervisorState(TypedDict, total=False):
     """LangGraph state channel for the Supervisor agent.
 
@@ -70,6 +67,15 @@ class SupervisorState(TypedDict, total=False):
     user_message: str
     conversation_history: list[ConversationTurn]
     downstream_result: Optional[dict]
+    # Knowledge Agent output, mapped by the wiring adapter: only
+    # GroundedResponse-shaped fields (answer / is_grounded / citations).
+    # Never a DownstreamResult — Safety's report gate constructs that
+    # contract downstream (see agents_integration_plan_new.md §2.2/§2.4).
+    knowledge_response: Optional[dict]
+    # Correlation id generated once per incoming request at the API
+    # boundary, threaded through every node for cross-agent log
+    # correlation (see agents_integration_plan_new.md §2.1 / §4.6).
+    trace_id: Optional[str]
 
     # --- Supervisor-owned fields ---
     request_category: Optional[RequestCategory]

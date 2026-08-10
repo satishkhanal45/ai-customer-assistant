@@ -105,8 +105,8 @@ class GeminiSupervisorLLMClient:
         contents = [
             *(
                 {
-                    "role": _to_gemini_role(turn["role"]),
-                    "parts": [{"text": turn["content"]}],
+                    "role": _to_gemini_role(turn.role),
+                    "parts": [{"text": turn.content}],
                 }
                 for turn in conversation_history
             ),
@@ -173,8 +173,8 @@ class GroqSupervisorLLMClient:
             },
             *(
                 {
-                    "role": turn["role"],
-                    "content": turn["content"],
+                    "role": turn.role,
+                    "content": turn.content,
                 }
                 for turn in conversation_history
             ),

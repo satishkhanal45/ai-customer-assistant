@@ -1,0 +1,288 @@
+"""Adapter nodes: bridge between the Supervisor's graph and downstream
+agents.
+
+Each downstream agent (Knowledge, Safety, Ticket) is injected as an
+already-built node callable — or, for Knowledge, a compiled subgraph
+wrapped here — rather than constructed by the Supervisor. These adapters
+are single-responsibility: they only map SupervisorState in, drive the
+downstream call, and map the result back out. No routing, no formatting,
+no persistence logic lives in this module.
+
+Async note (see agents_integration_plan_new.md §4.5 / open question #5):
+the Knowledge Agent's graph is async (`ainvoke`), so once a real
+`knowledge_graph` is wired in, the compiled Supervisor graph must be
+driven with `ainvoke` — the adapters below are the first async nodes in
+the Supervisor graph.
+"""
+from __future__ import annotations
+
+import asyncio
+from typing import Any, Callable, Mapping, Optional
+
+from langgraph.config import get_config
+from langgraph.types import interrupt
+
+from ..contracts import flatten_history
+from .routing import _SAFE_FALLBACK_RESPONSE
+from .schema import SupervisorState
+from ..safety_agent.fallback_response import generate_fallback_response
+from ..safety_agent.report import report_grounded, report_ungrounded
+from ..safety_agent.types import GroundednessResult
+
+KnowledgeGraph = Callable[[Mapping[str, Any]], Any]
+
+
+def make_knowledge_agent_node(
+    knowledge_graph: KnowledgeGraph,
+    timeout_s: float = 8,
+) -> Callable[[SupervisorState], Any]:
+    """Build the Knowledge Agent adapter node.
+
+    Maps ``SupervisorState`` -> Knowledge state input:
+      - ``user_message`` -> ``raw_query``
+      - ``conversation_history`` -> flattened role-labeled strings
+        (via ``flatten_history``), matching Knowledge's
+        ``conversation_history: tuple[str, ...]`` channel.
+
+    Runs ``knowledge_graph.ainvoke(...)`` under
+    ``asyncio.wait_for(..., timeout_s)``. On timeout or any exception it
+    returns a GroundedResponse-shaped *error marker* (``error`` key set),
+    not a ``DownstreamResult`` — the Safety gate (Phase 2) is the single
+    place that constructs ``DownstreamStatus.ERROR`` from a failed
+    retrieval.
+
+    Success returns only GroundedResponse fields under ``knowledge_response``:
+    ``{"answer_text", "is_grounded", "citations"}``.
+    """
+    async def knowledge_agent(state: SupervisorState) -> dict:
+        knowledge_input = {
+            "raw_query": state["user_message"],
+            "conversation_history": tuple(
+                flatten_history(state.get("conversation_history", []))
+            ),
+        }
+        try:
+            result = await asyncio.wait_for(
+                knowledge_graph.ainvoke(knowledge_input),
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError:
+            return _error_marker("timeout")
+        except Exception:
+            return _error_marker("error")
+
+        response = result.get("response")
+        if response is None:
+            return _error_marker("missing_response")
+
+        return {
+            "knowledge_response": {
+                "answer_text": response.answer_text,
+                "is_grounded": response.is_grounded,
+                "citations": list(response.citations),
+            }
+        }
+
+    return knowledge_agent
+
+
+def _error_marker(reason: str) -> dict:
+    """GroundedResponse-shaped marker so the Safety gate can map it to
+    ``DownstreamStatus.ERROR`` without guessing at the failure mode."""
+    return {
+        "knowledge_response": {
+            "answer_text": "",
+            "is_grounded": False,
+            "citations": [],
+            "error": reason,
+        }
+    }
+
+
+def _verdict_from_knowledge_hint(knowledge_response: dict) -> GroundednessResult:
+    """Default verdict when no groundedness_check is injected: trust the
+    Knowledge node's own ``is_grounded`` hint until the real embedded
+    similarity check is bound in Phase 6."""
+    hint = bool(knowledge_response.get("is_grounded"))
+    return GroundednessResult(is_grounded=hint, confidence_score=1.0 if hint else 0.0)
+
+
+def _confirms_escalation(resume_value: object) -> bool:
+    """Normalize the customer's resume value into an escalation flag.
+
+    Only an explicit confirmation counts: truthy booleans and the common
+    affirmative strings. Anything else (garbage, empty, ``False``) means
+    the customer declined — matching the plan's "resume with garbage"
+    check (decline is the safe default, never escalates by accident).
+    """
+    if resume_value is True:
+        return True
+    if isinstance(resume_value, str) and resume_value.strip().lower() in {
+        "yes",
+        "y",
+        "true",
+        "confirm",
+    }:
+        return True
+    return False
+
+
+def make_safety_gate_node(
+    groundedness_check: Optional[Callable[[str], GroundednessResult]] = None,
+) -> Callable[[SupervisorState], dict]:
+    """Build the Safety gate adapter node.
+
+    Runs AFTER the Knowledge Agent node and BEFORE the downstream
+    routing/assembly (see ``graph.py``), mapping the ``knowledge_response``
+    channel into the canonical ``DownstreamResult`` the Supervisor's
+    ``decide_post_downstream`` consumes.
+
+    Behavior, per agents_integration_plan_new.md §2.4 / §4.2:
+      - No ``knowledge_response`` in state (placeholder or an injected
+        Knowledge node that already returned a ``downstream_result``):
+        returns an empty update so routing sees the pre-existing result.
+      - Upstream error marker (``error`` key, from the Phase-1 Knowledge
+        adapter's timeout/error/missing_response paths): short-circuits
+        straight to ``DownstreamResult(status=ERROR, ...)`` — the groundedness
+        check is NEVER attempted on a failed retrieval.
+      - Otherwise the answer is checked for groundedness. Grounded ->
+        ``report_grounded`` (GROUNED). Ungrounded -> ``report_ungrounded``
+        gated behind an escalation confirmation via ``interrupt()`` (the
+        Phase-0 checkpointer persists the paused state keyed by
+        ``thread_id``; resume supplies True/False). No new state fields.
+
+    The ``groundedness_check`` callable is injected (default: the
+    Knowledge node's own ``is_grounded`` hint) so every boundary is
+    testable in isolation with a fake — the real
+    ``check_groundedness(answer, retrieved_chunks, embedding_model)``
+    binding is a Phase-6 ``chat_service`` concern, where the shared BGE
+    model and retrieved chunks are available.
+    """
+    def safety_gate(state: SupervisorState) -> dict:
+        knowledge_response = state.get("knowledge_response")
+        if knowledge_response is None:
+            return {}
+
+        if knowledge_response.get("error"):
+            return {
+                "downstream_result": {
+                    "status": "ERROR",
+                    "response": _SAFE_FALLBACK_RESPONSE,
+                    "customer_wants_escalation": False,
+                }
+            }
+
+        answer_text = knowledge_response.get("answer_text", "")
+        verdict = (
+            groundedness_check(answer_text)
+            if groundedness_check is not None
+            else _verdict_from_knowledge_hint(knowledge_response)
+        )
+        if verdict.is_grounded:
+            return {"downstream_result": report_grounded(answer_text)}
+
+        query = state.get("user_message", "")
+        confirmation = interrupt(
+            {
+                "type": "escalation-confirmation",
+                "question": generate_fallback_response(query),
+            }
+        )
+        return {
+            "downstream_result": report_ungrounded(
+                query,
+                verdict,
+                customer_wants_escalation=_confirms_escalation(confirmation),
+            )
+        }
+
+    return safety_gate
+
+
+TicketOps = Callable[[], Any]
+
+
+def _idempotency_key(
+    configurable: Mapping[str, Any],
+    store: Optional[Any] = None,
+) -> str:
+    """Derive the idempotency key for a ticket creation.
+
+    Priority, per agents_integration_plan_new.md §2.3:
+      1. A client-supplied request ID (``configurable["request_id"]``) — the
+         API contract's retry key; a network retry reuses it verbatim.
+      2. Server-derived: ``thread_id`` + the store's per-thread ordinal
+         (``next_sequence``), so distinct tickets in one thread get distinct
+         keys while a retried open of the same ticket maps to the same key.
+         Falls back to ``thread_id`` alone when the store isn't a
+         sequence-tracking ``TicketStore`` (e.g. a hand-rolled fake).
+
+    The key is NOT a ticket id — it identifies the *request* a Ticket row is
+    being created for, which is exactly what ``TicketStore`` de-dupes on.
+    """
+    request_id = configurable.get("request_id") or configurable.get(
+        "idempotency_key"
+    )
+    if request_id:
+        return f"request:{request_id}"
+
+    thread_id = configurable.get("thread_id", "unknown-thread")
+    next_sequence = getattr(store, "next_sequence", None)
+    if callable(next_sequence):
+        return f"{thread_id}:{next_sequence(thread_id)}"
+    return thread_id
+
+
+def make_ticket_agent_node(
+    ticket_ops: TicketOps,
+) -> Callable[[SupervisorState], dict]:
+    """Build the Ticket Agent adapter node.
+
+    Two-step shape, per agents_integration_plan_new.md §2.3 / §4.4:
+      1. opening turn: ``ticket_ops.call(query)`` -> ``PendingTicket``, then
+         ``interrupt()``s for the email (the checkpointer persists the paused
+         state keyed by ``thread_id`` — no ``pending_ticket`` state field is
+         needed);
+      2. resume turn: ``ticket_ops.create_ticket(pending, email, key)`` -> a
+         real ``Ticket``, rendered as a DOWNSTREAM_RESULT-style confirmation
+         the Supervisor's FINALIZE edge turns into ``final_response``.
+
+    Idempotency (Phase 4): the adapter derives an ``idempotency_key`` from the
+    runtime config (client ``request_id``, else ``thread_id`` + per-thread
+    ordinal) and threads it into ``ticket_ops.create_ticket(...)``. A retried
+    resume with the same key hits the store's cache and returns the *existing*
+    ticket — no duplicate row.
+
+    The ESCALATE branch of the post-downstream conditional edge reaches this
+    node re-entrantly (after the safety gate confirms escalation), and the
+    ``CREATE_TICKET`` classification route reaches it directly.
+    ``CHECK_TICKET_STATUS`` is routed away at classification time (§4.4) and
+    never reaches this node.
+    """
+    def ticket_agent(state: SupervisorState) -> dict:
+        query = state.get("user_message", "")
+        pending = ticket_ops.call(query)
+        email = interrupt(
+            {
+                "type": "email-collection",
+                "query": query,
+            }
+        )
+        configurable = (get_config() or {}).get("configurable", {})
+        key = _idempotency_key(configurable, ticket_ops)
+        ticket = ticket_ops.create_ticket(
+            pending, email, idempotency_key=key
+        )
+        confirmation = (
+            f"Your ticket has been created (ID {ticket.ticket_id}). "
+            f"We'll follow up with you at {ticket.email}."
+        )
+        return {
+            "downstream_result": {
+                "status": "GROUNDED",
+                "response": confirmation,
+                "customer_wants_escalation": False,
+            }
+        }
+
+    return ticket_agent

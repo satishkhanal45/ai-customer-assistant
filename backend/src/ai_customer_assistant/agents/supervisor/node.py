@@ -12,7 +12,7 @@ from typing import Callable
 from .classification import parse_llm_response
 from .llm_client import SupervisorLLMClient
 from .prompt import SUPERVISOR_SYSTEM_PROMPT
-from .routing import decide_post_downstream, decide_route
+from .routing import assemble_final_response, decide_route
 from .schema import SupervisorState
 
 
@@ -55,15 +55,12 @@ def make_classify_and_route_node(
 
 
 def assemble_response_node(state: SupervisorState) -> dict:
-    """Run after a downstream agent (Knowledge Agent / Ticket Agent) reports
-    back. Either finalizes the response or reroutes into Ticket Agent as an
-    escalation (KA-ungrounded + customer confirmed they want human help).
-    """
-    downstream_result = state.get("downstream_result") or {}
-    decision = decide_post_downstream(downstream_result)
+    """Run at the FINALIZE end of the post-downstream conditional edge.
 
-    return {
-        "next_agent": decision.next_agent,
-        "ticket_type": decision.ticket_type,
-        "final_response": decision.final_response,
-    }
+    Reduced to pure string formatting since Phase 3: the routing decision
+    (finalize vs. escalate into Ticket Agent) has moved out of this node
+    into the ``_route_after_downstream`` conditional edge in ``graph.py``.
+    All it does is render ``downstream_result["response"]`` into
+    ``final_response`` (with the safe fallback if absent/empty).
+    """
+    return {"final_response": assemble_final_response(state.get("downstream_result"))}

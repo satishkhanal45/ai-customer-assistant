@@ -49,7 +49,7 @@ import json
 import math
 from typing import Callable, Sequence
 
-from sqlalchemy import Boolean, Column, ForeignKey, Integer, MetaData, String, Table, Text, select
+from sqlalchemy import Boolean, Column, ForeignKey, Integer, MetaData, String, Table, Text, cast, select
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import Select
@@ -121,7 +121,9 @@ embedding_chunk_table = Table(
     Column("version_id", String, ForeignKey("knowledge_source_version.version_id"), nullable=False),
     Column("entity_id", String, ForeignKey("entity.id"), nullable=True),
     Column("chunk_index", Integer, nullable=False),
-    Column("chunk_text", Text, nullable=False),
+    # Mirrors the canonical migration's column name (`text`); the Python-side
+    # field on RetrievedChunk stays `chunk_text`.
+    Column("text", Text, nullable=False),
     # Structural mirror only: schema.md specifies VECTOR(768) via
     # pgvector; here (and in this module's SQLite-backed tests) it's
     # stored as JSON text and normalized back to a float tuple by
@@ -235,7 +237,7 @@ def _candidate_chunks_statement() -> Select:
     return (
         select(
             embedding_chunk_table.c.chunk_id,
-            embedding_chunk_table.c.chunk_text,
+            embedding_chunk_table.c.text,
             embedding_chunk_table.c.embedding,
             embedding_chunk_table.c.chunk_index,
             embedding_chunk_table.c.page,
@@ -262,7 +264,10 @@ def _candidate_chunks_statement() -> Select:
             .outerjoin(entity_table, embedding_chunk_table.c.entity_id == entity_table.c.id)
         )
         .where(knowledge_source_version_table.c.version_id == knowledge_source_table.c.current_version_id)
-        .where(knowledge_source_version_table.c.status == VERSION_STATUS_INDEXED)
+        .where(
+            cast(knowledge_source_version_table.c.status, String)
+            == VERSION_STATUS_INDEXED
+        )
         .where(knowledge_source_table.c.is_active.is_(True))
     )
 
@@ -280,7 +285,7 @@ def _row_to_retrieved_chunk(row: Row, similarity_score: float) -> RetrievedChunk
     )
     return RetrievedChunk(
         chunk_id=row.chunk_id,
-        chunk_text=row.chunk_text,
+        chunk_text=row.text,
         similarity_score=round(similarity_score, 4),
         provenance=provenance,
     )
