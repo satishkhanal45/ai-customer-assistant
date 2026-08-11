@@ -15,7 +15,13 @@ from pgvector.sqlalchemy import Vector
 SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "ai_customer_assistant"
 sys.path.insert(0, str(SRC_ROOT))
 
-from db.models import Base  # noqa: E402
+
+# SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "ai-customer-assistant"
+# sys.path.insert(0, str(SRC_ROOT))
+
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "ai_customer_assistant"))
+from db.models import Base
 
 config = context.config
 

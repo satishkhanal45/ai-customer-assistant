@@ -312,4 +312,3 @@ class TestMetadataDoesNotDuplicateSourceId:
         chunks = _chunk(document, word_tokenizer, long_form_source_types, structured_source_types)
         assert chunks[0].source_id == "doc-42"
         assert "source_id" not in chunks[0].metadata
-

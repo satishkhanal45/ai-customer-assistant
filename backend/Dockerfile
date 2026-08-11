@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 FROM python:3.12-slim
 
 # postgresql-client -> pg_isready, used by scripts/entrypoint.sh to wait for the DB
@@ -5,12 +6,13 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends postgresql-client curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=ghcr.io/astral-sh/uv:0.5.11 /uv /uvx /usr/local/bin/
+COPY --from=ghcr.io/astral-sh/uv:0.11.20 /uv /uvx /usr/local/bin/
 
 WORKDIR /app
 
 COPY pyproject.toml* uv.lock* ./
-RUN uv sync --no-install-project
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --no-install-project --no-progress -vv
 
 COPY . .
 RUN uv sync

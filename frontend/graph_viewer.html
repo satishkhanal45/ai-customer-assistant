@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Customer Assistant — Knowledge Graph Viewer</title>
+<script src="https://unpkg.com/cytoscape/dist/cytoscape.min.js"></script>
+<style>
+  :root {
+    --bg: #0f172a; --panel: #1e293b; --panel-2: #273449; --text: #e2e8f0;
+    --muted: #94a3b8; --accent: #38bdf8; --border: #334155;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); }
+  #app { display: flex; flex-direction: column; height: 100vh; }
+  header {
+    display: flex; align-items: center; gap: 10px; padding: 10px 16px;
+    background: var(--panel); border-bottom: 1px solid var(--border); flex-wrap: wrap;
+  }
+  header h1 { font-size: 15px; margin: 0 8px 0 0; font-weight: 600; }
+  header h1 span { color: var(--accent); }
+  .field { position: relative; }
+  .field input {
+    width: 200px; padding: 7px 11px; font-size: 13px; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; outline: none;
+  }
+  .field input:focus { border-color: var(--accent); }
+  .field.small input { width: 150px; }
+  .suggest {
+    position: absolute; top: 38px; left: 0; width: 100%; max-height: 260px; overflow: auto; z-index: 20;
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+    box-shadow: 0 8px 20px rgba(0,0,0,.4); display: none;
+  }
+  .suggest.open { display: block; }
+  .suggest .item { padding: 8px 11px; cursor: pointer; font-size: 13px; border-bottom: 1px solid var(--border); }
+  .suggest .item:hover { background: var(--panel); }
+  .suggest .item .t { color: var(--muted); font-size: 11px; margin-left: 6px; text-transform: uppercase; }
+  label { font-size: 12px; color: var(--muted); }
+  select, button {
+    padding: 7px 10px; font-size: 13px; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; cursor: pointer;
+  }
+  button.primary { background: #0284c7; border-color: #0284c7; font-weight: 600; }
+  button:hover { filter: brightness(1.1); }
+  a.toggle-link {
+    padding: 7px 10px; font-size: 13px; color: var(--text); text-decoration: none;
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+  }
+  a.toggle-link:hover { filter: brightness(1.1); }
+  #main { display: flex; flex: 1; min-height: 0; }
+  #cy { flex: 1; min-width: 0; }
+  #sidebar {
+    width: 320px; padding: 14px; overflow: auto; background: var(--panel);
+    border-left: 1px solid var(--border); display: flex; flex-direction: column; gap: 16px; flex-shrink: 0;
+  }
+  #sidebar h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 8px; }
+  .card { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+  .detail .name { font-size: 15px; font-weight: 600; }
+  .detail .chip { display: inline-block; font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+    padding: 2px 8px; border-radius: 999px; margin: 4px 0; color: #0f172a; font-weight: 700; }
+  .detail .facts { margin-top: 6px; }
+  .fact { border-top: 1px solid var(--border); padding: 7px 0; font-size: 12px; }
+  .fact .k { color: var(--muted); text-transform: capitalize; }
+  .fact .v { margin-top: 2px; word-break: break-word; }
+  .legend .row { display: flex; align-items: center; gap: 8px; font-size: 12px; padding: 3px 0; color: var(--muted); }
+  .swatch { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
+  .hint { font-size: 11px; color: var(--muted); line-height: 1.5; }
+  #status { font-size: 12px; color: var(--muted); }
+  #loading {
+    position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+    background: rgba(15,23,42,.6); z-index: 50; font-size: 14px;
+  }
+  #loading.show { display: flex; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>AI —<span>Knowledge Graph</span></h1>
+    <div class="field">
+      <input id="search" type="text" placeholder="Search entities…" autocomplete="off">
+      <div class="suggest" id="suggest-search"></div>
+    </div>
+    <div class="field small">
+      <input id="pathA" type="text" placeholder="Path A…" autocomplete="off">
+      <div class="suggest" id="suggest-A"></div>
+    </div>
+    <div class="field small">
+      <input id="pathB" type="text" placeholder="Path B…" autocomplete="off">
+      <div class="suggest" id="suggest-B"></div>
+    </div>
+    <a href="graph_viewer_3d.html" class="toggle-link" title="Open the unified viewer (2D/3D toggle)">3D</a>
+    <button id="btnPath" class="primary">Find path</button>
+    <button id="btnExpand">Expand all</button>
+    <button id="btnClear">Clear</button>
+    <div>
+      <label>Depth</label>
+      <select id="depth">
+        <option value="1">1</option><option value="2">2</option><option value="3">3</option>
+      </select>
+    </div>
+    <div>
+      <label>Layout</label>
+      <select id="layout">
+        <option value="cose">cose</option>
+        <option value="breadthfirst">breadthfirst</option>
+        <option value="concentric">concentric</option>
+      </select>
+    </div>
+  </header>
+
+  <div id="main">
+    <div id="cy"></div>
+    <aside id="sidebar">
+      <div>
+        <h2>Entity detail</h2>
+        <div class="card detail" id="detail"><div class="hint">Click a node to inspect it.</div></div>
+      </div>
+      <div>
+        <h2>Legend</h2>
+        <div class="legend" id="legend"></div>
+      </div>
+      <div>
+        <h2>Tips</h2>
+        <div class="hint">
+          • Search a node to seed the graph.<br>
+          • <b>Double-click</b> a node to expand neighbors.<br>
+          • <b>Click</b> a node to see attributes.<br>
+          • Pick path A/B and hit <b>Find path</b>.
+        </div>
+      </div>
+      <div id="status">Ready.</div>
+    </aside>
+  </div>
+</div>
+<div id="loading">Loading…</div>
+
+<script>
+'use strict';
+var API = 'http://127.0.0.1:8000/graph';
+
+var TYPE_COLORS = {
+  company: '#2563eb', organization: '#7c3aed', person: '#059669',
+  internship: '#d97706', internship_program: '#db2777', educational: '#0d9488',
+  institution: '#0d9488', role: '#dc2626', title: '#dc2626', course: '#0891b2'
+};
+function colorFor(t) { return TYPE_COLORS[t] || '#64748b'; }
+
+var nodeTypes = {};
+var edgeIds = {};
+
+var cy = cytoscape({
+  container: document.getElementById('cy'),
+  style: [
+    { selector: 'node', style: {
+        'background-color': 'data(color)', label: 'data(label)', color: '#e2e8f0',
+        'font-size': 9, width: 36, height: 36, 'text-valign': 'bottom', 'text-halign': 'center',
+        'text-margin-y': 3, 'border-width': 1, 'border-color': '#0f172a' } },
+    { selector: 'node:selected', style: { 'border-color': '#fbbf24', 'border-width': 3 } },
+    { selector: 'edge', style: {
+        'curve-style': 'bezier', width: 1.5, 'line-color': '#64748b',
+        'source-arrow-shape': 'triangle', 'target-arrow-shape': 'triangle',
+        'source-arrow-color': '#64748b', 'target-arrow-color': '#64748b', 'arrow-scale': 0.7,
+        label: 'data(label)', 'font-size': 8, color: '#94a3b8',
+        'text-background-color': '#16213a', 'text-background-opacity': 0.85,
+        'text-background-padding': 2, 'overlay-opacity': 0 } },
+    { selector: 'edge.path-edge', style: {
+        'line-color': '#38bdf8', 'target-arrow-color': '#38bdf8', 'line-style': 'dashed',
+        'source-arrow-shape': 'none', label: 'data(label)' } }
+  ],
+  layout: { name: 'cose', animate: false, randomize: true, nodeRepulsion: 9000, idealEdgeLength: 110 }
+});
+
+function status(msg) { document.getElementById('status').textContent = msg; }
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+  });
+}
+
+function apiFetch(path) {
+  document.getElementById('loading').classList.add('show');
+  return fetch(API + path, { headers: { 'Accept': 'application/json' } })
+    .then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
+    .finally(function () { document.getElementById('loading').classList.remove('show'); });
+}
+
+function applyLayout() {
+  var name = document.getElementById('layout').value;
+  var opts = { name: name, animate: true };
+  if (name === 'breadthfirst') opts.root = cy.nodes()[0];
+  cy.layout(opts).run();
+}
+
+function addNodes(nodes) {
+  var els = [];
+  (nodes || []).forEach(function (n) {
+    if (!n || !n.id || nodeTypes[n.id]) return;
+    nodeTypes[n.id] = n.entity_type;
+    els.push({ data: { id: n.id, label: n.name, color: colorFor(n.entity_type), entity_type: n.entity_type } });
+  });
+  if (els.length) cy.add(els);
+}
+
+function addEdges(edges) {
+  var els = [];
+  (edges || []).forEach(function (e) {
+    if (!e || !e.id || edgeIds[e.id]) return;
+    if (!cy.getElementById(e.source_entity_id).length || !cy.getElementById(e.target_entity_id).length) return;
+    edgeIds[e.id] = true;
+    els.push({ data: { id: e.id, source: e.source_entity_id, target: e.target_entity_id, label: e.relation_type } });
+  });
+  if (els.length) cy.add(els);
+}
+
+function updateLegend() {
+  var counts = {};
+  Object.keys(nodeTypes).forEach(function (id) {
+    var t = nodeTypes[id];
+    counts[t] = (counts[t] || 0) + 1;
+  });
+  document.getElementById('legend').innerHTML = Object.keys(counts).sort().map(function (t) {
+    return '<div class="row"><span class="swatch" style="background:' + colorFor(t) + '"></span>' +
+      '<span>' + esc(t) + ' (' + counts[t] + ')</span></div>';
+  }).join('');
+}
+
+function expandNode(id) {
+  apiFetch('/entities/' + id + '/neighbors?depth=1').then(function (frag) {
+    addNodes(frag.nodes); addEdges(frag.edges); updateLegend(); applyLayout();
+  }).catch(function (e) { status('Expand failed: ' + e); });
+}
+
+function seedItem(item) {
+  addNodes([item]);
+  expandNode(item.id);
+}
+
+function showDetail(evt) {
+  var node = evt.target;
+  var id = node.id();
+  var d = document.getElementById('detail');
+  d.innerHTML = '<div class="name">' + esc(node.data('label')) + '</div>' +
+    '<span class="chip" style="background:' + colorFor(node.data('entity_type')) + '">' +
+    esc(node.data('entity_type')) + '</span>' +
+    '<div class="facts" id="facts-' + id + '"></div>';
+  apiFetch('/entities/' + id).then(function (body) {
+    var f = document.getElementById('facts-' + id);
+    if (!f) return;
+    var facts = body.facts || [];
+    if (!facts.length) { f.innerHTML = '<div class="fact"><div class="v">No attributes recorded.</div></div>'; return; }
+    var html = '';
+    facts.forEach(function (x) {
+      html += '<div class="fact"><div class="k">' + esc(x.attribute_name) +
+        (x.multivalue ? ' (multi)' : '') + '</div><div class="v">' + esc(x.value) + '</div></div>';
+    });
+    f.innerHTML = html;
+  }).catch(function (e) { status('Detail failed: ' + e); });
+}
+
+function attachSearch(inputId, suggestId, onPick) {
+  var inp = document.getElementById(inputId);
+  var sug = document.getElementById(suggestId);
+  var timer = null;
+  function open(list) {
+    if (!list || !list.length) { sug.classList.remove('open'); sug.innerHTML = ''; return; }
+    sug.innerHTML = list.map(function (it) {
+      return '<div class="item" data-id="' + it.id + '">' + esc(it.label) +
+        '<span class="t">' + esc(it.entity_type) + '</span></div>';
+    }).join('');
+    sug.classList.add('open');
+    Array.prototype.forEach.call(sug.querySelectorAll('.item'), function (el) {
+      el.addEventListener('mousedown', function (ev) {
+        ev.preventDefault();
+        var item = list.filter(function (it) { return it.id === el.getAttribute('data-id'); })[0];
+        onPick(item);
+      });
+    });
+  }
+  function query() {
+    var q = inp.value.trim();
+    if (!q) { sug.classList.remove('open'); sug.innerHTML = ''; return; }
+    clearTimeout(timer);
+    timer = setTimeout(function () {
+      apiFetch('/search?q=' + encodeURIComponent(q) + '&limit=20').then(open).catch(function (e) { status('Search failed: ' + e); });
+    }, 220);
+  }
+  inp.addEventListener('input', query);
+  inp.addEventListener('focus', query);
+}
+
+document.addEventListener('click', function (ev) {
+  if (!ev.target.closest('.field') && !ev.target.closest('.suggest')) {
+    document.querySelectorAll('.suggest').forEach(function (s) { s.classList.remove('open'); });
+  }
+});
+
+function pathId(tag) {
+  var v = document.getElementById('path' + tag).value.trim();
+  var m = v.match(/\u2014 ([0-9a-fA-F-]+)$/);
+  return m ? m[1] : null;
+}
+
+function runPath() {
+  var a = pathId('A'), b = pathId('B');
+  if (!a || !b) { status('Pick both path endpoints from search.'); return; }
+  if (a === b) { status('Pick two different nodes.'); return; }
+  apiFetch('/path?source=' + a + '&target=' + b + '&max_depth=6').then(function (path) {
+    if (!path || !path.length) { status('No path found between those nodes.'); return; }
+    addNodes(path);
+    for (var i = 0; i < path.length - 1; i++) {
+      cy.add({ data: { id: 'path-' + i, source: path[i].id, target: path[i + 1].id, label: 'step' }, classes: 'path-edge' });
+    }
+    updateLegend();
+    applyLayout();
+    status('Path (' + (path.length - 1) + ' hop' + (path.length - 1 === 1 ? '' : 's') + '): ' +
+      path.map(function (e) { return e.label; }).join(' → '));
+  }).catch(function (e) { status('Path failed: ' + e); });
+}
+
+function expandAll() {
+  var depth = parseInt(document.getElementById('depth').value, 10);
+  var frontier = cy.nodes().map(function (n) { return n.id(); });
+  if (!frontier.length) { status('Seed a node first.'); return; }
+  var seen = {};
+  function level() {
+    if (depth <= 0) { status('Done.'); applyLayout(); return; }
+    depth--;
+    var ids = frontier.slice();
+    frontier = [];
+    Promise.all(ids.map(function (id) {
+      if (seen[id]) return Promise.resolve();
+      seen[id] = true;
+      return apiFetch('/entities/' + id + '/neighbors?depth=1').then(function (frag) {
+        addNodes(frag.nodes); addEdges(frag.edges);
+        frag.nodes.forEach(function (n) { if (!seen[n.id]) frontier.push(n.id); });
+      });
+    })).then(function () { updateLegend(); level(); });
+  }
+  status('Expanding…');
+  level();
+}
+
+cy.on('tap', 'node', function (ev) {
+  if (ev.originalEvent && ev.originalEvent.detail > 1) return;
+  showDetail(ev);
+});
+cy.on('dbltap', 'node', function (ev) { ev.preventDefault(); expandNode(ev.target.id()); });
+
+function init() {
+  attachSearch('search', 'suggest-search', function (item) {
+    document.getElementById('search').value = item.label;
+    document.getElementById('suggest-search').classList.remove('open');
+    seedItem(item);
+  });
+  attachSearch('pathA', 'suggest-A', function (item) {
+    document.getElementById('pathA').value = 'A: ' + item.label + ' \u2014 ' + item.id;
+    document.getElementById('suggest-A').classList.remove('open');
+  });
+  attachSearch('pathB', 'suggest-B', function (item) {
+    document.getElementById('pathB').value = 'B: ' + item.label + ' \u2014 ' + item.id;
+    document.getElementById('suggest-B').classList.remove('open');
+  });
+  document.getElementById('btnPath').addEventListener('click', runPath);
+  document.getElementById('btnExpand').addEventListener('click', expandAll);
+  document.getElementById('btnClear').addEventListener('click', function () {
+    cy.elements().remove(); nodeTypes = {}; edgeIds = {};
+    document.getElementById('detail').innerHTML = '<div class="hint">Click a node to show it.</div>';
+    document.getElementById('legend').innerHTML = '';
+    status('Cleared.');
+  });
+  document.getElementById('layout').addEventListener('change', applyLayout);
+  cy.on('layoutstart', function () { status('Running layout…'); });
+  cy.on('layoutstop', function () { status('Ready.'); });
+}
+
+init();
+</script>
+</body>
+</html>
