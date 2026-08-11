@@ -1,76 +1,62 @@
-import os
-from pathlib import Path
+"""FastAPI app bootstrap (Phase 5, §4.5).
 
-from dotenv import load_dotenv
+Owns the server-side singletons' lifecycle:
 
-load_dotenv(Path(__file__).resolve().parents[2] / ".env")  # backend/.env
+- the durable checkpointer (Postgres via ``AsyncPostgresSaver`` when the
+  ``POSTGRES_*`` env block is configured, else MemorySaver) — built once at
+  startup, closed at shutdown;
+- the shared BGE embedding singleton (§4.6): ``build_shared_embeddings``
+  constructs exactly one ``SentenceTransformer`` for the process, so the
+  real Knowledge graph is *actually* built — ``build_chat_service`` only
+  compiles the full RAG subgraph when both ``shared_embeddings`` and an
+  async ``session_factory`` are supplied. Without this the Supervisor's
+  Knowledge node stays on its Phase-0 placeholder;
+- the ``ChatService``, the single dependency-construction point.
+
+Run with: ``uvicorn main:app`` from ``src/ai_customer_assistant``.
+"""
+from __future__ import annotations
+
+import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
-from fastapi.staticfiles import StaticFiles
 
-from api.graph import router as graph_router
-from api.chat import router as chat_router
-from api.ingest import router as ingest_router
+from api.routes import router
+from db.checkpointer import build_checkpointer
+from db.session import get_async_session_factory
+from services.chat_service import build_chat_service
+from services.embeddings import build_shared_embeddings
 
-app = FastAPI(title="AI Customer Assistant")
-app.include_router(graph_router)
-app.include_router(chat_router)
-app.include_router(ingest_router)
-
-# Local-dev only: the Phase 3 viewer (frontend/graph_viewer.html) is often
-# opened straight from disk (file://, so a null Origin). Allow all origins so
-# it can reach /graph/* without configuring a reverse proxy.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+logger = logging.getLogger(__name__)
 
 
-# The viewer HTML is edited in place (served straight from disk), so make sure
-# browsers always revalidate it instead of reusing a stale cached copy.
-@app.middleware("http")
-async def no_cache_html(request, call_next):
-    response = await call_next(request)
-    if "text/html" in response.headers.get("content-type", ""):
-        response.headers["Cache-Control"] = "no-store"
-    return response
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    checkpointer = await build_checkpointer()
+    # Phase 6 wiring: the real Knowledge graph is compiled only when BOTH the
+    # shared BGE instance and the async session factory are passed in. Lack of
+    # either is a silent-failure hazard (the Supervisor silently keeps its
+    # placeholder node), so never swallow the embedding-model load/DB errors.
+    shared_embeddings = build_shared_embeddings()
+    session_factory = get_async_session_factory()
+    service = await build_chat_service(
+        checkpointer=checkpointer,
+        shared_embeddings=shared_embeddings,
+        session_factory=session_factory,
+    )
+    app.state.chat_service = service
+    yield
+    conn = getattr(checkpointer, "conn", None)
+    close = getattr(conn, "aclose", None)
+    if close is not None:
+        await close()
+
+
+app = FastAPI(title="AI Customer Assistant", lifespan=lifespan)
+app.include_router(router)
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
+async def health() -> dict:
     return {"status": "ok"}
-
-
-# Serve the graph viewer so it can be opened at a real URL instead of file://.
-# Locally the frontend lives at <repo>/frontend; in docker it is mounted at
-# /app/frontend (see docker-compose.yml) and FRONTEND_DIR points at it.
-_static_env = os.getenv("FRONTEND_DIR")
-_static_candidates = [Path(_static_env)] if _static_env else []
-_static_candidates += [
-    Path(__file__).resolve().parents[3] / "frontend",
-    Path(__file__).resolve().parents[2] / "frontend",
-]
-FRONTEND_DIR = next((p for p in _static_candidates if p.is_dir()), None)
-if FRONTEND_DIR is not None:
-    @app.get("/", include_in_schema=False)
-    async def index() -> RedirectResponse:
-        return RedirectResponse(url="/graph_viewer_3d.html")
-
-    @app.get("/graph", include_in_schema=False)
-    async def graph_3d() -> RedirectResponse:
-        return RedirectResponse(url="/graph_viewer_3d.html")
-
-
-    _app_dist = FRONTEND_DIR / "app" / "dist"
-    if _app_dist.is_dir():
-        @app.get("/app", include_in_schema=False)
-        async def app_index() -> RedirectResponse:
-            return RedirectResponse(url="/app/")
-
-        app.mount("/app", StaticFiles(directory=_app_dist, html=True), name="react-app")
-
-    app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
