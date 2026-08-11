@@ -135,6 +135,30 @@ async def find_entities(
     return tuple(_to_entity_ref(entity) for entity in entities)
 
 
+async def find_entities_by_value(
+    session: AsyncSession,
+    *,
+    value_query: str,
+    limit: int = 50,
+) -> tuple[EntityRef, ...]:
+    """Search/filter entities by the VALUES recorded about them -- the
+    inverse of find_entities (which matches on entity.name). Only rows where
+    `Value.searchable = true` are considered (see db/models.py and the
+    extraction schema). Matches are case-insensitive substring on
+    Value.value, deduplicated per entity, ordered by entity name."""
+    stmt = (
+        select(Entity)
+        .join(Value, Value.entity_id == Entity.id)
+        .where(Value.searchable.is_(True), Value.value.ilike(f"%{value_query}%"))
+        .group_by(Entity.id)
+        .order_by(Entity.name)
+        .limit(limit)
+    )
+
+    entities = (await session.execute(stmt)).scalars().all()
+    return tuple(_to_entity_ref(entity) for entity in entities)
+
+
 # Relations aren't meaningfully directional for browsing -- a "founded by"
 # edge should surface when looking at either endpoint. This CTE unions
 # both directions of relation before walking outward, so `get_neighbors`

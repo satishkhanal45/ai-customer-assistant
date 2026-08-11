@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 FROM python:3.12-slim
 
 # postgresql-client -> pg_isready, used by scripts/entrypoint.sh to wait for the DB
@@ -10,7 +11,8 @@ COPY --from=ghcr.io/astral-sh/uv:0.11.20 /uv /uvx /usr/local/bin/
 WORKDIR /app
 
 COPY pyproject.toml* uv.lock* ./
-RUN uv sync --no-install-project --no-progress -vv
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --no-install-project --no-progress -vv
 
 COPY . .
 RUN uv sync
