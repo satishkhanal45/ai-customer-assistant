@@ -18,6 +18,9 @@ dist/
 build/
 *.egg
 
+# langgraph dev / Studio runtime state
+.langgraph_api/
+
 # pytest / coverage
 .pytest_cache/
 .coverage
