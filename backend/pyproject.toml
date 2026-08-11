@@ -32,6 +32,7 @@ dev = [
     "httpx>=0.28.1",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    "langgraph-cli[inmem]>=0.4.31",
 ]
 [tool.pytest.ini_options]
 pythonpath = [".", "src/ai_customer_assistant"]
