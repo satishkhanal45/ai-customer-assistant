@@ -11,9 +11,13 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from api.graph import router as graph_router
+from api.chat import router as chat_router
+from api.ingest import router as ingest_router
 
 app = FastAPI(title="AI Customer Assistant")
 app.include_router(graph_router)
+app.include_router(chat_router)
+app.include_router(ingest_router)
 
 # Local-dev only: the Phase 3 viewer (frontend/graph_viewer.html) is often
 # opened straight from disk (file://, so a null Origin). Allow all origins so
@@ -24,6 +28,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# The viewer HTML is edited in place (served straight from disk), so make sure
+# browsers always revalidate it instead of reusing a stale cached copy.
+@app.middleware("http")
+async def no_cache_html(request, call_next):
+    response = await call_next(request)
+    if "text/html" in response.headers.get("content-type", ""):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/health")
@@ -50,8 +64,13 @@ if FRONTEND_DIR is not None:
     async def graph_3d() -> RedirectResponse:
         return RedirectResponse(url="/graph_viewer_3d.html")
 
-    @app.get("/graph2d", include_in_schema=False)
-    async def graph_2d() -> RedirectResponse:
-        return RedirectResponse(url="/graph_viewer.html")
+
+    _app_dist = FRONTEND_DIR / "app" / "dist"
+    if _app_dist.is_dir():
+        @app.get("/app", include_in_schema=False)
+        async def app_index() -> RedirectResponse:
+            return RedirectResponse(url="/app/")
+
+        app.mount("/app", StaticFiles(directory=_app_dist, html=True), name="react-app")
 
     app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")

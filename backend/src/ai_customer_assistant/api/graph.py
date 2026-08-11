@@ -34,6 +34,7 @@ from ingestion.graph.queries import (
     GraphFragment,
     RelationRef,
     find_entities,
+    find_entities_by_value,
     find_path,
     get_entity,
     get_neighbors,
@@ -160,6 +161,16 @@ async def search_entities(
     session: AsyncSession = Depends(get_session),
 ) -> list[EntityRefResponse]:
     entities = await find_entities(session, entity_type=entity_type, name_query=q, limit=limit)
+    return [EntityRefResponse.from_dataclass(entity) for entity in entities]
+
+
+@router.get("/search_value", response_model=list[EntityRefResponse])
+async def search_entities_by_value(
+    q: str = Query(default=..., min_length=1, description="substring match against searchable Value.value rows"),
+    limit: int = Query(default=50, ge=1, le=200),
+    session: AsyncSession = Depends(get_session),
+) -> list[EntityRefResponse]:
+    entities = await find_entities_by_value(session, value_query=q, limit=limit)
     return [EntityRefResponse.from_dataclass(entity) for entity in entities]
 
 
