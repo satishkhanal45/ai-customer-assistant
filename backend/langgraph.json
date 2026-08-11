@@ -1,0 +1,11 @@
+{
+  "source": {
+    "kind": "uv",
+    "root": "."
+  },
+  "python_version": "3.12",
+  "graphs": {
+    "supervisor": "src/ai_customer_assistant/agents/supervisor/studio.py:build_supervisor_graph_for_studio"
+  },
+  "env": ".env"
+}

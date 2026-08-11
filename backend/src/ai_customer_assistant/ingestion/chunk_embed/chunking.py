@@ -59,8 +59,22 @@ from typing import Callable, Mapping
 
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from ingestion.chunk_embed.tokenizer import count_tokens, decode, encode, get_tokenizer
-from ingestion.chunk_embed.types import Chunk, ExtractedDocument, HeadingMarker
+# Absolute imports rooted at the installed package. The previous form
+# (`from ingestion.chunk_embed...`) only resolved because pyproject's
+# pytest `pythonpath` entry injects `src/ai_customer_assistant` onto
+# sys.path. Any entry point that is not pytest -- for example
+# `python backend/scripts/crawl_and_ingest.py` -- has no such injection and
+# fails with ModuleNotFoundError: No module named 'ingestion'.
+from ingestion.chunk_embed.tokenizer import (
+    count_tokens,
+    decode,
+    encode,
+)
+from ingestion.chunk_embed.types import (
+    Chunk,
+    ExtractedDocument,
+    HeadingMarker,
+)
 
 # A section is (text, start_offset, end_offset, owning_marker_or_None).
 _Section = tuple[str, int, int, HeadingMarker | None]
@@ -240,7 +254,16 @@ def _windows_for_section(
         return (section_text,)
 
     step = chunk_size_tokens - chunk_overlap_tokens  # > 0, enforced by config validation
-    window_starts = tuple(range(0, len(token_ids), step))
+
+    # Drop any window whose end is already covered by the previous window's
+    # end. Without this, range(0, len, step) emits a final start that yields a
+    # short tail window made up almost entirely of overlap tokens (e.g. 1032
+    # tokens at size=500/step=425 produced a redundant 182-token window).
+    window_starts = tuple(
+        start
+        for start in range(0, len(token_ids), step)
+        if start == 0 or start + chunk_overlap_tokens < len(token_ids)
+    )
 
     return tuple(
         decode(token_ids[start : start + chunk_size_tokens], tokenizer)
@@ -289,16 +312,28 @@ def _build_chunk(
 def _handle_structured(
     document: ExtractedDocument,
     tokenizer: PreTrainedTokenizerBase,
-    chunk_size_tokens: int,  # unused: structured sources are never split
-    chunk_overlap_tokens: int,  # unused: structured sources are never split
+    chunk_size_tokens: int,
+    chunk_overlap_tokens: int,
     resolve_page_range: PageRangeResolver | None,
 ) -> tuple[Chunk, ...]:
     """
-    Wrap document.text as exactly one Chunk, unconditionally.
+    "One row = one chunk" for structured sources -- but with a hard token
+    ceiling.
 
-    Per the confirmed pipeline diagram: "One row = one chunk, no
-    splitting applied." Whatever text arrives is the chunk's text,
-    regardless of its token count.
+    The original implementation emitted exactly one Chunk unconditionally,
+    regardless of token count. That is only safe when a "row" really is a
+    row. When an oversized record (or a mis-routed document) arrives, the
+    single chunk silently exceeds the embedding model's 512-token context
+    window and BGE truncates it -- everything past token 512 is dropped
+    from the vector with no error, only a transformers warning:
+
+        Token indices sequence length is longer than the specified maximum
+        sequence length for this model (1032 > 512).
+
+    Silent truncation is worse than splitting, so oversized records now
+    fall through to the same recursive token-window splitter used by the
+    long-form path. Rows that fit (the overwhelming majority) still yield
+    exactly one chunk, so the documented contract is preserved.
     """
     text = document.text
     if not text:
@@ -312,14 +347,20 @@ def _handle_structured(
         resolve_page_range(0, len(text)) if resolve_page_range is not None else {}
     )
 
-    chunk = Chunk(
-        source_id=document.source_id,
-        chunk_index=0,
-        text=text,
-        token_count=count_tokens(text, tokenizer),
-        metadata={**inherited_metadata, **page_metadata},
+    window_texts = _windows_for_section(
+        text, tokenizer, chunk_size_tokens, chunk_overlap_tokens
     )
-    return (chunk,)
+
+    return tuple(
+        Chunk(
+            source_id=document.source_id,
+            chunk_index=chunk_index,
+            text=window_text,
+            token_count=count_tokens(window_text, tokenizer),
+            metadata={**inherited_metadata, **page_metadata},
+        )
+        for chunk_index, window_text in enumerate(window_texts)
+    )
 
 
 _CATEGORY_HANDLERS: Mapping[
