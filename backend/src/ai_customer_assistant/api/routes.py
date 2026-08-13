@@ -23,7 +23,7 @@ router = APIRouter(tags=["chat"])
 async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
     service = request.app.state.chat_service
     trace_id = str(uuid.uuid4())
-    reply = await service.handle_message(
+    reply, citations = await service.handle_message_turn(
         payload.thread_id,
         payload.message,
         trace_id=trace_id,
@@ -32,4 +32,5 @@ async def chat(request: Request, payload: ChatRequest) -> ChatResponse:
         thread_id=payload.thread_id,
         reply=reply,
         trace_id=trace_id,
+        citations=citations,
     )

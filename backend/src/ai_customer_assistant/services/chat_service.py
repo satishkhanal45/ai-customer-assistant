@@ -53,6 +53,24 @@ _EMAIL_COLLECTION_QUESTION = (
 )
 
 
+def _citations_from_result(result: Mapping[str, Any]) -> list[dict]:
+    """Pull the ``ChunkProvenance`` list the Knowledge node attached to the
+    run (``knowledge_response.citations``) into plain serializable dicts."""
+    knowledge_response = result.get("knowledge_response") or {}
+    citations = knowledge_response.get("citations") or []
+    out: list[dict] = []
+    for c in citations:
+        out.append(
+            {
+                "source_name": getattr(c, "source_name", None),
+                "page": getattr(c, "page", None),
+                "version_number": getattr(c, "version_number", None),
+                "category_name": getattr(c, "category_name", None),
+            }
+        )
+    return out
+
+
 class ChatService:
     """Owns the compiled Supervisor graph and the checkpointer-backed
     conversation state for every thread."""
@@ -80,6 +98,22 @@ class ChatService:
     ) -> str:
         """Process one user message in ``thread_id`` and return the
         assistant's reply text."""
+        reply, _ = await self.handle_message_turn(
+            thread_id, user_message, trace_id=trace_id
+        )
+        return reply
+
+    async def handle_message_turn(
+        self,
+        thread_id: str,
+        user_message: str,
+        *,
+        trace_id: Optional[str] = None,
+    ) -> tuple[str, list[dict]]:
+        """Process one user message and return ``(reply, citations)`` where
+        ``citations`` lists the sources the reply is grounded on (each a
+        dict with ``source_name`` / ``page`` / ``version_number`` /
+        ``category_name``), empty when the turn produced no retrieval."""
         config = {"configurable": {"thread_id": thread_id}}
         if trace_id:
             config["configurable"]["trace_id"] = trace_id
@@ -108,6 +142,7 @@ class ChatService:
             # question as the reply and persist the exchange so the follow-up
             # resume sees the full transcript.
             reply = self._render_interrupt(result["__interrupt__"])
+            citations: list[dict] = []
         else:
             # A clarification short-circuits to END with the question in
             # ``clarification_question``; downstream paths land in
@@ -116,6 +151,7 @@ class ChatService:
             reply = result.get("final_response") or result.get(
                 "clarification_question"
             ) or ""
+            citations = _citations_from_result(result)
 
         await self.graph.aupdate_state(
             config,
@@ -127,7 +163,7 @@ class ChatService:
                 ]
             },
         )
-        return reply
+        return reply, citations
 
     @staticmethod
     def _render_interrupt(interrupts: Sequence[Any]) -> str:

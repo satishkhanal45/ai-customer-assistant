@@ -15,6 +15,7 @@ Uploaded-by defaults to the system service account
 
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from typing import Literal
@@ -87,7 +88,7 @@ async def _run_job(job_id: UUID) -> None:
             triggered_by=row.triggered_by,
         )
         try:
-            await run_ingestion(session, job)
+            outcome = await run_ingestion(session, job)
         except Exception as exc:  # noqa: BLE001
             await job_repo.complete_job(
                 session,
@@ -97,6 +98,16 @@ async def _run_job(job_id: UUID) -> None:
                 entities_created_count=0,
                 error_details=f"unhandled_exception: {exc}",
             )
+        else:
+            await job_repo.complete_job(
+                session,
+                job_id=outcome.job_id,
+                status=outcome.status,
+                chunks_created_count=outcome.chunks_created_count,
+                entities_created_count=outcome.entities_created_count,
+                error_details=outcome.error_details,
+            )
+        await session.commit()
 
 
 async def _register_and_run(
@@ -119,12 +130,28 @@ async def _register_and_run(
     )
     if job is None:
         return {"status": "duplicate_skipped"}
-    await _run_job(job.job_id)
+    asyncio.create_task(_run_job(job.job_id))
     return {
         "status": "submitted",
         "job_id": str(job.job_id),
         "source_id": str(job.source_id),
         "version_id": str(job.version_id),
+    }
+
+
+@router.get("/jobs/{job_id}")
+async def job_status(job_id: UUID, session: AsyncSession = Depends(get_session)) -> dict:
+    from db.models import KnowledgeInjectionJob
+
+    row = await session.get(KnowledgeInjectionJob, job_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {
+        "job_id": str(row.job_id),
+        "status": row.status,
+        "chunks_created_count": row.chunks_created_count,
+        "entities_created_count": row.entities_created_count,
+        "error_details": row.error_details,
     }
 
 
@@ -177,18 +204,22 @@ async def crawl(
     route = _classify_content_type(content_type)
 
     if route == "html":
-        from ingestion.crawler.config import CrawlConfig, CrawlMode
-        from ingestion.crawler.crawler import Crawler
+        # The page body was already fetched above — extract markdown from it
+        # directly instead of re-fetching through the Crawler (which used a
+        # stricter user-agent/timeout and double-fetched the URL).
+        from ingestion.crawler.exception import ExtractionError
+        from ingestion.crawler.extractor import extract_markdown
 
-        documents = await Crawler(CrawlConfig(mode=CrawlMode.PAGE)).crawl(req.url)
-        doc = documents[0] if documents else None
-        if doc is None or doc.error is not None:
-            detail = f"Crawl failed: {doc.error if doc else 'no document returned'}"
-            raise HTTPException(status_code=502, detail=detail)
+        final_url = str(response.url)
+        html = raw_bytes.decode("utf-8", errors="replace")
+        try:
+            markdown = extract_markdown(html, final_url)
+        except ExtractionError as exc:
+            raise HTTPException(status_code=502, detail=f"Crawl failed: {exc}") from exc
         return await _register_and_run(
             session,
-            url=doc.url,
-            raw_bytes=doc.markdown.encode("utf-8"),
+            url=final_url,
+            raw_bytes=markdown.encode("utf-8"),
             mime_type="text/markdown",
             file_type=FileType.MD,
             category_id=req.category_id,

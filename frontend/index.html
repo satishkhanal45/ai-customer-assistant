@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Customer Assistant</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="src/theme.css">
+<script>
+(function () {
+  var t = 'dark';
+  try { t = localStorage.getItem('aca.theme') || 'dark'; } catch (e) {}
+  if (t !== 'light') t = 'dark';
+  document.documentElement.setAttribute('data-theme', t);
+})();
+</script>
+</head>
+<body>
+<div id="app">
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo"></div>
+      <div>
+        <h1>AI Customer Assistant</h1>
+        <div class="sub">Knowledge Explorer</div>
+      </div>
+    </div>
+    <nav class="links"></nav>
+    <button id="themeToggle" class="action" type="button" title="Toggle light/dark theme"></button>
+  </header>
+  <div id="view"></div>
+</div>
+<div id="statusbar"></div>
+<div id="loading"><div class="spinner"></div></div>
+
+<script src="src/utils.js"></script>
+<script src="src/config.js"></script>
+<script src="src/api.js"></script>
+<script src="src/router.js"></script>
+<script src="src/pages/chat.js"></script>
+<script src="src/pages/graph.js"></script>
+<script src="src/pages/ingest.js"></script>
+<script src="src/pages/admin.js"></script>
+<script>window.ACA.router.init();</script>
+</body>
+</html>

@@ -6,7 +6,9 @@ checkpointer keyed by ``thread_id`` (see services/chat_service.py).
 """
 from __future__ import annotations
 
-from pydantic import BaseModel
+from typing import Optional
+
+from pydantic import BaseModel, Field
 
 
 class ChatRequest(BaseModel):
@@ -14,7 +16,17 @@ class ChatRequest(BaseModel):
     message: str
 
 
+class Citation(BaseModel):
+    """One source the assistant's reply is grounded on."""
+
+    source_name: str
+    page: Optional[int] = None
+    version_number: Optional[int] = None
+    category_name: Optional[str] = None
+
+
 class ChatResponse(BaseModel):
     thread_id: str
     reply: str
     trace_id: str
+    citations: list[Citation] = Field(default_factory=list)

@@ -2,9 +2,14 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from api.graph import router as graph_router
 from api.ingest import router as ingest_router
@@ -39,6 +44,29 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="AI Customer Assistant", lifespan=lifespan)
 
+# Cross-origin access for the frontend (opened from file:// or a dev static
+# server). Restrict allow_origins in production as needed.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class _NoCacheMiddleware(BaseHTTPMiddleware):
+    """Dev-friendly: force the browser to revalidate static assets every
+    request so frontend edits show up without a manual cache purge."""
+
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        if not response.headers.get("cache-control"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
+app.add_middleware(_NoCacheMiddleware)
+
 # Chat (registered first — owns POST /chat)
 app.include_router(router)
 # Read-only knowledge-graph browsing (powers frontend/graph_viewer*.html)
@@ -54,4 +82,15 @@ app.include_router(ingest_router)
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
+
+
+# Serve the frontend at the site root so the app runs same-origin:
+# http://<host>:<port>/#/chat (frontend/src/config.js uses location.origin).
+# Registered last so the API routers above take precedence. FRONTEND_DIR is
+# /app/frontend inside the docker image; defaults to the repo's frontend dir.
+_FRONTEND_DIR = os.environ.get("FRONTEND_DIR") or str(
+    Path(__file__).resolve().parents[3] / "frontend"
+)
+if os.path.isdir(_FRONTEND_DIR):
+    app.mount("/", StaticFiles(directory=_FRONTEND_DIR, html=True), name="frontend")
 
