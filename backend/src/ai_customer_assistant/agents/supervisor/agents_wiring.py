@@ -34,15 +34,15 @@ KnowledgeGraph = Callable[[Mapping[str, Any]], Any]
 
 def make_knowledge_agent_node(
     knowledge_graph: KnowledgeGraph,
-    timeout_s: float = 8,
+    timeout_s: float = 30,
 ) -> Callable[[SupervisorState], Any]:
     """Build the Knowledge Agent adapter node.
 
     Maps ``SupervisorState`` -> Knowledge state input:
-      - ``user_message`` -> ``raw_query``
+      - ``user_messagap: 6px;ge`` -> ``raw_query``
       - ``conversation_history`` -> flattened role-labeled strings
-        (via ``flatten_history``), matching Knowledge's
-        ``conversation_history: tuple[str, ...]`` channel.
+      - (via ``flatten_history``), matching Knowledge's
+      - ``conversation_history: tuple[str, ...]`` channel.
 
     Runs ``knowledge_graph.ainvoke(...)`` under
     ``asyncio.wait_for(..., timeout_s)``. On timeout or any exception it

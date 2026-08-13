@@ -104,7 +104,7 @@ def build_supervisor_graph(
     safety_gate_node: Optional[Callable[[SupervisorState], dict]] = None,
     knowledge_graph: Optional[Callable] = None,
     groundedness_check: Optional[Callable] = None,
-    knowledge_timeout_s: float = 8,
+    knowledge_timeout_s: float = 30,
     ticket_ops: Optional[Callable] = None,
     checkpointer: Optional[BaseCheckpointSaver] = None,
 ):

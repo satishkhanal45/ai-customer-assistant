@@ -23,6 +23,16 @@ session_factory = async_sessionmaker(bind=_engine, expire_on_commit=False)
 
 
 async def get_session() -> AsyncGenerator[AsyncSession, None]:
-    """FastAPI dependency yielding a request-scoped AsyncSession."""
+    """FastAPI dependency yielding a request-scoped AsyncSession.
+
+    Commits on success so pipeline work (chunks, entities, version
+    status) isn't silently rolled back at request end. If the request
+    raises, the session context manager rolls back on close.
+    """
     async with session_factory() as session:
-        yield session
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise

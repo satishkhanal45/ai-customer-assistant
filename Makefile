@@ -24,7 +24,10 @@ DEFAULT_URL ?= https://alpiniststudios.com/app-prototype-a-complete-guide/
 DEFAULT_USER_ID ?= 00000000-0000-0000-0000-000000000000
 PYTHONPATH := backend:backend/src:backend/src/ai_customer_assistant
 
-.PHONY: help up down status worker ingest verify logs clean
+# Browser opener: xdg-open on Linux, `open` on macOS.
+OPEN ?= $(shell command -v xdg-open >/dev/null 2>&1 && echo xdg-open || echo open)
+
+.PHONY: help up down status worker ingest verify logs clean frontend chat graph
 
 help: ## Show this help message
 	@echo "Usage: make [target]"
@@ -70,7 +73,13 @@ psql :
 	docker exec -it ai-customer-assistant-postgres psql -U ai_assistant -d ai_customer_assistant
 
 graph :
-	open frontend/graph_viewer.html
+	$(OPEN) "http://127.0.0.1:8002/#/graph"
+
+frontend: ## Open the AI Customer Assistant web app (chat) in your browser
+	$(OPEN) "http://127.0.0.1:8002/#/chat"
+
+chat: ## Alias for frontend — open the chat portal
+	$(OPEN) "http://127.0.0.1:8002/#/chat"
 
 backend:
 	cd backend/src/ai_customer_assistant && uvicorn main:app --reload --port 8002
