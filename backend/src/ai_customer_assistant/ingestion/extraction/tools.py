@@ -16,6 +16,11 @@ from __future__ import annotations
 from functools import reduce
 from typing import Any
 
+from ingestion.extraction.ontology import (
+    safe_canonicalize_attribute,
+    safe_canonicalize_entity_type,
+    safe_canonicalize_relation_type,
+)
 from ingestion.extraction.schema import (
     NoFactFound,
     RecordAttributeValueArgs,
@@ -59,9 +64,12 @@ _TOOL_NAMES = {
 
 
 def _apply_resolve_entity(acc: ChunkExtraction, args: ResolveEntityArgs) -> ChunkExtraction:
+    # Canonicalize the emitted type so the same real-world entity always
+    # resolves to one `entity_type` (see ontology.py). Falls back to the
+    # raw string for genuinely unknown types, so extraction stays total.
     return ChunkExtraction(
         chunk_index=acc.chunk_index,
-        entity=(args.entity_type, args.name),
+        entity=(safe_canonicalize_entity_type(args.entity_type), args.name),
         facts=acc.facts,
         relations=acc.relations,
     )
@@ -70,11 +78,13 @@ def _apply_resolve_entity(acc: ChunkExtraction, args: ResolveEntityArgs) -> Chun
 def _apply_attribute_value(
     acc: ChunkExtraction, args: RecordAttributeValueArgs
 ) -> ChunkExtraction:
+    entity_type = safe_canonicalize_entity_type(args.entity_type)
+    attribute_name = safe_canonicalize_attribute(entity_type, args.attribute_name)
     fact = ExtractedFact(
-        entity_type=args.entity_type,
+        entity_type=entity_type,
         entity_name=args.entity_name,
         namespace=args.namespace,
-        attribute_name=args.attribute_name,
+        attribute_name=attribute_name,
         value=args.value,
         value_type=args.value_type,
         multivalue=args.multivalue,
@@ -90,11 +100,11 @@ def _apply_attribute_value(
 
 def _apply_relation(acc: ChunkExtraction, args: RecordRelationArgs) -> ChunkExtraction:
     relation = ExtractedRelation(
-        source_entity_type=args.source_entity_type,
+        source_entity_type=safe_canonicalize_entity_type(args.source_entity_type),
         source_entity_name=args.source_entity_name,
-        target_entity_type=args.target_entity_type,
+        target_entity_type=safe_canonicalize_entity_type(args.target_entity_type),
         target_entity_name=args.target_entity_name,
-        relation_type=args.relation_type,
+        relation_type=safe_canonicalize_relation_type(args.relation_type),
     )
     return ChunkExtraction(
         chunk_index=acc.chunk_index,

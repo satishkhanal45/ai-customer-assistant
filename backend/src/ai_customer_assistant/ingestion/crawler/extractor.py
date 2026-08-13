@@ -10,7 +10,7 @@ def extract_markdown(html_text: str, url: str) -> str:
         output_format="markdown",
         include_tables=True,
         include_links=True,
-        include_images=True,
+        include_images=False,
         favor_precision=True,
     )
     if markdown is None:

@@ -135,30 +135,46 @@ def fetch_url(url: str, *, client: httpx.Client) -> FetchedUrl:
 
 
 async def _run_html_crawler_pipeline(
-    session: AsyncSession, fetched: FetchedUrl, *, uploaded_by: UUID, category_id: UUID | None
-) -> UUID | None:
-    from ingestion.crawler.config import CrawlConfig, CrawlMode
+    session: AsyncSession,
+    fetched: FetchedUrl,
+    *,
+    uploaded_by: UUID,
+    category_id: UUID | None,
+    mode,  # ingestion.crawler.config.CrawlMode
+) -> tuple[UUID, ...]:
+    from urllib.parse import urlsplit
+    from ingestion.crawler.config import CrawlConfig
     from ingestion.crawler.crawler import Crawler
 
-    config = CrawlConfig(mode=CrawlMode.PAGE)  # single page, not a recursive site crawl
+    # Constrain the crawl to the starting URL's own domain, same as
+    # crawler/__main__.py's _config_for -- otherwise CrawlMode.SITE will
+    # follow every external link it finds.
+    domain = urlsplit(fetched.url).netloc
+    config = CrawlConfig(mode=mode, allowed_domains=(domain,))
     documents = await Crawler(config).crawl(fetched.url)
 
-    doc = documents[0] if documents else None
-    if doc is None or doc.error is not None:
-        logger.error("crawl failed for %s: %s", fetched.url, doc.error if doc else "no document returned")
-        return None
+    if not documents:
+        logger.error("crawl failed for %s: no documents returned", fetched.url)
+        return ()
 
-    job = await register_document_version(
-        session,
-        url=doc.url,
-        raw_bytes=doc.markdown.encode("utf-8"),
-        mime_type="text/markdown",
-        file_type=FileType.MD,
-        uploaded_by=uploaded_by,
-        category_id=category_id,
-    )
-    return job.job_id if job is not None else None
+    job_ids: list[UUID] = []
+    for doc in documents:
+        if doc.error is not None:
+            logger.error("crawl failed for %s: %s", doc.url, doc.error)
+            continue
+        job = await register_document_version(
+            session,
+            url=doc.url,
+            raw_bytes=doc.markdown.encode("utf-8"),
+            mime_type="text/markdown",
+            file_type=FileType.MD,
+            uploaded_by=uploaded_by,
+            category_id=category_id,
+        )
+        if job is not None:
+            job_ids.append(job.job_id)
 
+    return tuple(job_ids)
 
 # ---------------------------------------------------------------------------
 # Document (PDF/Office) path -- new code, doesn't touch the crawler package.
@@ -166,8 +182,8 @@ async def _run_html_crawler_pipeline(
 
 
 async def _run_document_pipeline(
-    session: AsyncSession, fetched: FetchedUrl, *, uploaded_by: UUID, category_id: UUID | None
-) -> UUID | None:
+    session: AsyncSession, fetched: FetchedUrl, *, uploaded_by: UUID, category_id: UUID | None, mode
+) -> tuple[UUID, ...]:
     job = await register_document_version(
         session,
         url=fetched.url,
@@ -177,7 +193,7 @@ async def _run_document_pipeline(
         uploaded_by=uploaded_by,
         category_id=category_id,
     )
-    return job.job_id if job is not None else None
+    return (job.job_id,) if job is not None else ()
 
 
 # ---------------------------------------------------------------------------
@@ -192,69 +208,70 @@ _ROUTES = {
     "document": _run_document_pipeline,
 }
 
-
 async def crawl_and_ingest(
-    url: str, *, uploaded_by: UUID, category_id: UUID | None, session_factory: async_sessionmaker
+    url: str,
+    *,
+    uploaded_by: UUID,
+    category_id: UUID | None,
+    session_factory: async_sessionmaker,
+    site: bool = False,
 ) -> None:
+    from ingestion.crawler.config import CrawlMode
+
     with httpx.Client() as http_client:
         fetched = fetch_url(url, client=http_client)
 
     route = classify_content_type(fetched.content_type)
-    logger.info("routing %s as %s (content-type: %s)", url, route, fetched.content_type)
+    mode = CrawlMode.SITE if site else CrawlMode.PAGE
+    logger.info("routing %s as %s (content-type: %s, mode: %s)", url, route, fetched.content_type, mode)
 
     async with session_factory() as session:
-        job_id = await _ROUTES[route](session, fetched, uploaded_by=uploaded_by, category_id=category_id)
+        job_ids = await _ROUTES[route](session, fetched, uploaded_by=uploaded_by, category_id=category_id, mode=mode)
 
-    if job_id is None:
-        # The real reason was already logged at its source: either the ERROR
-        # from _run_html_crawler_pipeline (crawl/extraction failure), or the
-        # INFO below from register_document_version (genuine checksum dedup).
-        # No generic guess here -- that's what caused the misleading message.
+    if not job_ids:
         return
 
-    # Run the job immediately rather than waiting for the background
-    # worker, so this CLI call fully ingests before it exits.
     from db.models import KnowledgeInjectionJob
     from ingestion.pipeline import run_ingestion
     from ingestion.pipeline_types import JobRef, JobStatus
     from ingestion.queue import repository as job_repo
 
-    async with session_factory() as session:
-        job_row = await session.get(KnowledgeInjectionJob, job_id)
-        job = JobRef(
-            job_id=job_row.job_id,
-            source_id=job_row.source_id,
-            version_id=job_row.version_id,
-            job_type=JobType(job_row.job_type),
-            status=JobStatus(job_row.status),
-            triggered_by=job_row.triggered_by,
-        )
-        try:
-            outcome = await run_ingestion(session, job)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("ingestion crashed for %s", url)
-            await job_repo.complete_job(
-                session,
-                job_id=job.job_id,
-                status=JobStatus.FAILED,
-                chunks_created_count=0,
-                entities_created_count=0,
-                error_details=f"unhandled_exception: {exc}",
+    logger.info("%d page(s) queued from %s -- ingesting each now", len(job_ids), url)
+
+    for job_id in job_ids:
+        async with session_factory() as session:
+            job_row = await session.get(KnowledgeInjectionJob, job_id)
+            job = JobRef(
+                job_id=job_row.job_id,
+                source_id=job_row.source_id,
+                version_id=job_row.version_id,
+                job_type=JobType(job_row.job_type),
+                status=JobStatus(job_row.status),
+                triggered_by=job_row.triggered_by,
             )
-            return
+            try:
+                outcome = await run_ingestion(session, job)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("ingestion crashed for job %s", job_id)
+                await job_repo.complete_job(
+                    session,
+                    job_id=job.job_id,
+                    status=JobStatus.FAILED,
+                    chunks_created_count=0,
+                    entities_created_count=0,
+                    error_details=f"unhandled_exception: {exc}",
+                )
+                continue
 
-    logger.info(
-        "ingestion %s for %s: chunks=%d entities=%d %s",
-        outcome.status.value,
-        url,
-        outcome.chunks_created_count,
-        outcome.entities_created_count,
-        outcome.error_details or "",
-    )
-
+        logger.info(
+            "ingestion %s for job %s: chunks=%d entities=%d %s",
+            outcome.status.value, job_id, outcome.chunks_created_count,
+            outcome.entities_created_count, outcome.error_details or "",
+        )
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--site", action="store_true", help="crawl the entire site (CrawlMode.SITE), not just this one page",)
     parser.add_argument("url", help="URL to crawl and ingest")
     parser.add_argument("--uploaded-by", required=True, help="app_user.id (a UUID) of the service account")
     parser.add_argument("--category-id", default=None, help="knowledge_category.category_id, optional")
@@ -293,6 +310,7 @@ def main() -> None:
             uploaded_by=UUID(args.uploaded_by),
             category_id=UUID(args.category_id) if args.category_id else None,
             session_factory=session_factory,
+            site=args.site,
         )
     )
 

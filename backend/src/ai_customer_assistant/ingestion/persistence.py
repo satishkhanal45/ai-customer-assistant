@@ -15,7 +15,7 @@ from __future__ import annotations
 import hashlib
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,6 +27,7 @@ from db.models import (
     Relation,
     Value,
 )
+from ingestion.extraction.ontology import safe_canonicalize_entity_type
 from ingestion.pipeline_types import ChunkExtraction
 
 
@@ -66,10 +67,44 @@ async def persist_chunks(
 
 
 async def _resolve_entity(session: AsyncSession, entity_type: str, name: str) -> UUID:
+    """Resolve-or-create an entity, deduplicating as aggressively as the
+    schema allows without a migration:
+
+    1. Canonicalize ``entity_type`` through the ingestion ontology, so the
+       same real-world type always maps to one canonical string (e.g. both
+       ``company`` and ``organization`` -> ``Company``) — this is what stops
+       "Alpinist Studios" from being stored once per type label.
+    2. Reuse an existing row whose *canonical* type and case-insensitive
+       name match, so name-case variants also merge into one entity.
+    3. Fall back to the ``(entity_type, name)`` upsert — the DB unique
+       constraint remains the final guarantee.
+
+    Keeping the raw ``name`` as the display value means the merge never
+    changes what users see; only identity is normalized."""
+    canonical_type = safe_canonicalize_entity_type(entity_type)
+    normalized_name = name.strip()
+
+    existing = (
+        await session.execute(
+            select(Entity.id)
+            .where(
+                func.lower(Entity.name) == normalized_name.lower(),
+                Entity.entity_type == canonical_type,
+            )
+            .order_by(Entity.id)
+            .limit(2)
+        )
+    ).scalars().all()
+    if existing:
+        # Reuse the oldest row as the canonical identity (case-variant
+        # duplicates may still exist from pre-fix data; this stops the
+        # write path from creating any new ones).
+        return existing[0]
+
     stmt = (
         pg_insert(Entity)
-        .values(label=name, entity_type=entity_type, name=name)
-        .on_conflict_do_update(index_elements=[Entity.entity_type, Entity.name], set_={"name": name})
+        .values(label=normalized_name, entity_type=canonical_type, name=normalized_name)
+        .on_conflict_do_update(index_elements=[Entity.entity_type, Entity.name], set_={"name": normalized_name})
         .returning(Entity.id)
     )
     return (await session.execute(stmt)).scalar_one()
@@ -122,21 +157,45 @@ async def _persist_one_extraction(session: AsyncSession, version_id: UUID, extra
             session, fact.namespace, fact.attribute_name, fact.value_type, fact.multivalue
         )
         fact_entity_id = await resolve(fact.entity_type, fact.entity_name)
-        session.add(
-            Value(
+        # ON CONFLICT DO NOTHING (unique on entity+attribute+value) makes
+        # fact writes idempotent: re-extracting the same fact from another
+        # chunk or re-ingesting the document can't create duplicate rows.
+        stmt = (
+            pg_insert(Value)
+            .values(
                 entity_id=fact_entity_id,
                 attribute_id=attribute_id,
                 value=fact.value,
                 searchable=fact.searchable,
             )
+            .on_conflict_do_nothing(
+                index_elements=[Value.entity_id, Value.attribute_id, Value.value]
+            )
         )
+        await session.execute(stmt)
 
     for relation in extraction.relations:
         source_id = await resolve(relation.source_entity_type, relation.source_entity_name)
         target_id = await resolve(relation.target_entity_type, relation.target_entity_name)
-        session.add(
-            Relation(source_entity_id=source_id, target_entity_id=target_id, relation_type=relation.relation_type)
+        # Same idempotency guarantee as facts: a relation (source, target,
+        # type) is written at most once, so "Alpinist Studios employs Justin
+        # Flores" can't appear twice.
+        stmt = (
+            pg_insert(Relation)
+            .values(
+                source_entity_id=source_id,
+                target_entity_id=target_id,
+                relation_type=relation.relation_type,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[
+                    Relation.source_entity_id,
+                    Relation.target_entity_id,
+                    Relation.relation_type,
+                ]
+            )
         )
+        await session.execute(stmt)
 
     return entity_id
 

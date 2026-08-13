@@ -52,18 +52,28 @@ worker: ## 2. Start the ingestion worker process
 	PYTHONPATH=$(PYTHONPATH) \
 	uv run --project backend python backend/scripts/run_worker.py
 
-ingest: ## Crawl and ingest a URL (e.g. make ingest URL="https://...")
+ingest: ## Crawl and ingest a URL (prompts for URL and whether to crawl the whole site)
 	@if [ -z "$(URL)" ]; then \
 		read -p "Enter URL to ingest: " TARGET_URL; \
 	else \
 		TARGET_URL="$(URL)"; \
 	fi; \
+	if [ -z "$(SITE)" ]; then \
+		read -p "Crawl entire site? [Y/N]: " SITE_CHOICE; \
+	else \
+		SITE_CHOICE="$(SITE)"; \
+	fi; \
+	case "$$SITE_CHOICE" in \
+		y|Y|yes|YES) SITE_FLAG="--site" ;; \
+		*) SITE_FLAG="" ;; \
+	esac; \
 	POSTGRES_HOST=$(POSTGRES_HOST) \
 	POSTGRES_PORT=$(POSTGRES_PORT) \
 	PYTHONPATH=$(PYTHONPATH) \
 	uv run --env-file backend/.env --project backend python -m scripts.crawl_and_ingest \
 		"$$TARGET_URL" \
-		--uploaded-by "$(or $(USER_ID),$(DEFAULT_USER_ID))"
+		--uploaded-by "$(or $(USER_ID),$(DEFAULT_USER_ID))" \
+		$$SITE_FLAG
 
 verify: ## Check database records for knowledge sources
 	docker exec -it -e PAGER=cat ai-customer-assistant-postgres psql -U ai_assistant -d ai_customer_assistant -c \
@@ -83,3 +93,9 @@ chat: ## Alias for frontend — open the chat portal
 
 backend:
 	cd backend/src/ai_customer_assistant && uvicorn main:app --reload --port 8002
+
+trunc:
+	docker exec -i ai-customer-assistant-postgres psql -U ai_assistant -d ai_customer_assistant -c "TRUNCATE TABLE value, attribute, relation, entity, knowledge_source_entity_map, embedding_chunk, knowledge_injection_job, knowledge_source_version, knowledge_source, knowledge_category, app_user RESTART IDENTITY CASCADE;"
+
+make user:
+	docker exec -i ai-customer-assistant-postgres psql -U ai_assistant -d ai_customer_assistant -c "INSERT INTO app_user (id, email, is_service_account) VALUES ('00000000-0000-0000-0000-000000000000','admin@admin.com', True);"
