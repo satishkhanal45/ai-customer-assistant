@@ -3,7 +3,9 @@ Prompt text is data, not logic -- kept out of agent.py so it can be tuned
 independently of the orchestration code.
 """
 
-SYSTEM_PROMPT = """\
+from ingestion.extraction.ontology import formatted_ontology_reference
+
+_SYSTEM_PROMPT = """\
 You extract structured facts from a single chunk of a company knowledge-base
 document, using the tools provided. Follow ingestion_flow.md step 5.
 
@@ -27,7 +29,15 @@ stop. Do not invent facts to fill the tool schema, and do not call
 resolve_entity alone when the text also states attributes or relationships
 -- an entity with no attached facts is an incomplete extraction, not a
 successful one.
+
+ENTITY TYPES: always use the canonical entity type from this vocabulary
+(exactly as written) when calling the tools -- never invent a type, and do
+not use synonyms, abbreviations, or case variants:
+
+{ontology_reference}
 """
+
+SYSTEM_PROMPT = _SYSTEM_PROMPT.format(ontology_reference=formatted_ontology_reference())
 
 CHUNK_TASK_TEMPLATE = """\
 Document: {source_name}
