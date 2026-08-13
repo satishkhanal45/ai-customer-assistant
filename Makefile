@@ -10,7 +10,7 @@ uvicorn: ## Start the FastAPI local development server
 	POSTGRES_HOST=$(POSTGRES_HOST) \
 	POSTGRES_PORT=$(POSTGRES_PORT) \
 	PYTHONPATH=$(PYTHONPATH) \
-	uv run --env-file backend/.env --project backend uvicorn main:app --reload --app-dir backend/src/ai_customer_assistant
+	uv run --env-file backend/.env --project backend uvicorn main:app --reload --port 8002 --app-dir backend/src/ai_customer_assistant
 
 
 # Default environment variables. Use plain "=" (not "?=") so an ambient
@@ -71,3 +71,6 @@ psql :
 
 graph :
 	open frontend/graph_viewer.html
+
+backend:
+	cd backend/src/ai_customer_assistant && uvicorn main:app --reload --port 8002
