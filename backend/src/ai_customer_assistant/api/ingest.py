@@ -5,8 +5,14 @@ Both paths reuse the exact orchestration the CLI worker uses
 dedup, MinIO storage, queue row) then run ``run_ingestion`` immediately so
 the result is indexable without a separate worker process.
 
-  POST /ingest/upload   multipart file (PDF / DOCX / Markdown)
-  POST /ingest/crawl    JSON {"url": ...} (HTML page or PDF/Office URL)
+  POST /ingest/upload            multipart file (PDF / DOCX / Markdown)
+  POST /ingest/crawl             JSON {"url", "scope"} — single page by
+                                 default (scope=PAGE). scope=SITE returns a
+                                 discovery list for review instead of crawling.
+  POST /ingest/crawl/discover    JSON {"root_url"} — sitemap-first discovery,
+                                 returns a cached discovery_id for review.
+  POST /ingest/crawl/{id}/confirm  runs crawl_confirmed() against the cached
+                                 discovery and ingests each confirmed item.
 
 Uploaded-by defaults to the system service account
 (``00000000-0000-0000-0000-000000000000``); override with
@@ -17,22 +23,64 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 import uuid
+from dataclasses import dataclass
 from typing import Literal
 from uuid import UUID
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.async_session import get_session, session_factory
+from ingestion.crawler.config import CrawlConfig, CrawlMode
+from ingestion.crawler.models import DiscoveryResult
 from ingestion.pipeline_types import FileType, JobType, JobRef, JobStatus
 from ingestion.queue.document_producer import register_document_version
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 
 DEFAULT_USER_ID = UUID("00000000-0000-0000-0000-000000000000")
+
+# Review data is cached server-side (not persisted) just long enough for a
+# human/UI to look at the discovery list and then confirm it.
+_DISCOVERY_TTL_SECONDS = 600.0
+
+
+@dataclass(frozen=True)
+class _CachedDiscovery:
+    created_at: float
+    result: DiscoveryResult
+    config: CrawlConfig
+
+
+_discovery_cache: dict[str, _CachedDiscovery] = {}
+
+
+def _cache_discovery(result: DiscoveryResult, config: CrawlConfig) -> str:
+    discovery_id = uuid.uuid4().hex
+    _discovery_cache[discovery_id] = _CachedDiscovery(
+        created_at=time.monotonic(), result=result, config=config
+    )
+    return discovery_id
+
+
+def _evict_expired() -> None:
+    now = time.monotonic()
+    expired = [
+        key
+        for key, cached in _discovery_cache.items()
+        if now - cached.created_at > _DISCOVERY_TTL_SECONDS
+    ]
+    for key in expired:
+        _discovery_cache.pop(key, None)
+
+
+def _get_discovery(discovery_id: str) -> _CachedDiscovery | None:
+    _evict_expired()
+    return _discovery_cache.get(discovery_id)
 
 
 def _uploaded_by() -> UUID:
@@ -182,16 +230,113 @@ async def upload(
     )
 
 
-class CrawlRequest(BaseModel):
+class WaitFields(BaseModel):
+    # How long to wait for SPA/client-rendered pages to finish before
+    # capturing HTML (see ingestion.crawler.config.CrawlConfig.wait_strategy).
+    wait_strategy: Literal["fixed_timeout", "networkidle", "selector"] = "fixed_timeout"
+    wait_selector: str | None = None  # required only when wait_strategy == "selector"
+
+    @model_validator(mode="after")
+    def _validate_wait(self):
+        if self.wait_strategy == "selector" and not self.wait_selector:
+            raise ValueError(
+                "wait_selector is required when wait_strategy == 'selector'"
+            )
+        return self
+
+
+class CrawlRequest(WaitFields):
     url: str = Field(..., min_length=5, max_length=2048)
+    category_id: UUID | None = None
+    # PAGE (default) crawls only the given URL — no discovery, no review step.
+    # SITE returns a discovery list for review instead of crawling in the same
+    # request; the caller then POSTs /crawl/{discovery_id}/confirm.
+    scope: Literal["PAGE", "SITE"] = "PAGE"
+
+
+class DiscoverRequest(WaitFields):
+    root_url: str = Field(..., min_length=5, max_length=2048)
+
+
+class ConfirmRequest(BaseModel):
     category_id: UUID | None = None
 
 
-@router.post("/crawl")
-async def crawl(
-    req: CrawlRequest,
-    session: AsyncSession = Depends(get_session),
+# file_type strings produced by ingestion.crawler.documents.classify_url map
+# onto the schema's (limited) FileType enum and a real MIME type for storage.
+_FILE_TYPE_TO_ENUM: dict[str, FileType | None] = {
+    "PDF": FileType.PDF,
+    "DOCX": FileType.DOCX,
+}
+_FILE_TYPE_TO_MIME: dict[str, str] = {
+    "PDF": "application/pdf",
+    "DOCX": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
+
+
+def _crawl_file_type(file_type: str | None) -> FileType | None:
+    return _FILE_TYPE_TO_ENUM.get(file_type) if file_type else None
+
+
+def _crawl_mime(file_type: str | None) -> str:
+    return _FILE_TYPE_TO_MIME.get(file_type, "application/octet-stream") if file_type else "text/markdown"
+
+
+async def _run_discovery(
+    root_url: str, *, wait_strategy: str, wait_selector: str | None
+) -> tuple[DiscoveryResult, CrawlConfig]:
+    from urllib.parse import urlsplit
+
+    from ingestion.crawler.crawler import discover
+
+    host = urlsplit(root_url).netloc
+    config = CrawlConfig(
+        mode=CrawlMode.SITE,
+        allowed_domains=(host,),
+        wait_strategy=wait_strategy,
+        wait_selector=wait_selector,
+    )
+    result = await discover(root_url, config)
+    return result, config
+
+
+def _review_payload(discovery_id: str, result: DiscoveryResult) -> dict:
+    return {
+        "discovery_id": discovery_id,
+        "source": result.source,
+        "page_count": sum(1 for p in result.pages if p.kind == "PAGE"),
+        "document_count": sum(1 for p in result.pages if p.kind == "DOCUMENT"),
+        "pages": [
+            {"url": p.url, "kind": p.kind, "file_type": p.file_type}
+            for p in result.pages
+        ],
+    }
+
+
+async def _ingest_documents(
+    session: AsyncSession, documents, category_id: UUID | None
 ) -> dict:
+    """Register + run ingestion for every successfully crawled item."""
+    outcomes = []
+    for doc in documents:
+        if doc.error is not None:
+            outcomes.append({"url": doc.url, "status": "failed", "error": doc.error})
+            continue
+        outcome = await _register_and_run(
+            session,
+            url=doc.url,
+            raw_bytes=doc.content if doc.file_type else doc.markdown.encode("utf-8"),
+            mime_type=_crawl_mime(doc.file_type),
+            file_type=FileType.MD if not doc.file_type else _crawl_file_type(doc.file_type),
+            category_id=category_id,
+        )
+        outcome["url"] = doc.url
+        outcomes.append(outcome)
+    return {"status": "submitted", "results": outcomes}
+
+
+async def _crawl_single_page(req: CrawlRequest, session: AsyncSession) -> dict:
+    """PAGE scope: crawl exactly the given URL (v1 behavior), no discovery."""
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
             response = await client.get(req.url)
@@ -225,11 +370,64 @@ async def crawl(
             category_id=req.category_id,
         )
 
-    return await _register_and_run(
-        session,
-        url=req.url,
-        raw_bytes=raw_bytes,
-        mime_type=content_type,
-        file_type=_resolve_file_type(content_type),
-        category_id=req.category_id,
+    from urllib.parse import urlsplit
+
+    from ingestion.crawler.crawler import crawl_confirmed
+    from ingestion.crawler.documents import classify_url
+
+    host = urlsplit(req.url).netloc
+    config = CrawlConfig(
+        mode=CrawlMode.SITE,
+        allowed_domains=(host,),
+        wait_strategy=req.wait_strategy,
+        wait_selector=req.wait_selector,
     )
+    page = classify_url(req.url)
+    documents = await crawl_confirmed((page,), config)
+    return await _ingest_documents(session, documents, req.category_id)
+
+
+@router.post("/crawl")
+async def crawl(
+    req: CrawlRequest,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    if req.scope == "PAGE":
+        return await _crawl_single_page(req, session)
+
+    # SITE scope: discovery-first, always goes through a review step before any
+    # crawling happens. No same-request auto-crawl.
+    result, config = await _run_discovery(
+        req.url, wait_strategy=req.wait_strategy, wait_selector=req.wait_selector
+    )
+    discovery_id = _cache_discovery(result, config)
+    return _review_payload(discovery_id, result)
+
+
+@router.post("/crawl/discover")
+async def crawl_discover(
+    req: DiscoverRequest,
+) -> dict:
+    result, config = await _run_discovery(
+        req.root_url, wait_strategy=req.wait_strategy, wait_selector=req.wait_selector
+    )
+    discovery_id = _cache_discovery(result, config)
+    return _review_payload(discovery_id, result)
+
+
+@router.post("/crawl/{discovery_id}/confirm")
+async def crawl_confirm(
+    discovery_id: str,
+    req: ConfirmRequest,
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    from ingestion.crawler.crawler import crawl_confirmed
+
+    cached = _get_discovery(discovery_id)
+    if cached is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Unknown or expired discovery_id. Run /crawl/discover again.",
+        )
+    documents = await crawl_confirmed(cached.result.pages, cached.config)
+    return await _ingest_documents(session, documents, req.category_id)
