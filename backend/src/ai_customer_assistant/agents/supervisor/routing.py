@@ -33,19 +33,15 @@ class RoutingDecision:
 
 
 _GENERIC_CLARIFICATION = (
-    "I can help with creating a ticket, checking ticket status, or "
-    "answering questions from our knowledge base — which of these do you need?"
+    "Sorry, the question was not clear. Can you please rephrase your question or provide more details so I can assist you better?"
 )
 
 _DECLINE_RESPONSE = (
-    "I'm sorry, that's outside what I can help with here. I'm able to "
-    "assist with support tickets and questions about our products, "
-    "services, and policies."
+    "I'm sorry, I am only able to help with solving the problem you are facing on our platform. Please feel free to ask a question related to our platform."
 )
 
 _SAFE_FALLBACK_RESPONSE = (
-    "Sorry, something went wrong on my end. Let me connect you with a "
-    "human representative."
+    "Sorry, something went wrong on my end. Thank you for your patience, and please try again later."
 )
 
 
@@ -150,8 +146,7 @@ def _build_routed_decision(
 
 
 _CHECK_STATUS_UNAVAILABLE = (
-    "Ticket status lookups aren't available yet — I can help you answer "
-    "questions from our knowledge base or open a new support ticket."
+    "Ticket status lookups aren't available yet — I can help you answer questions from our knowledge base or open a new support ticket."
 )
 
 
