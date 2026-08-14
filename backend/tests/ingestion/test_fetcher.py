@@ -1,5 +1,7 @@
 from types import SimpleNamespace
+from dataclasses import replace
 
+import asyncio
 import pytest
 from pytest_asyncio import fixture as async_fixture
 from playwright.async_api import Error as PlaywrightError
@@ -123,3 +125,76 @@ async def test_fetch_bytes_gives_up_after_retries():
         await fetch_bytes(
             "https://example.com/dead", SimpleNamespace(request=client), CONFIG
         )
+
+
+# --- wait_strategy (decision 7) ---------------------------------------------
+# Simulate a client-rendered page: the shell loads immediately with "Loading",
+# and only after ~200ms does JS fetch /data and render "Ready Content". This
+# distinguishes the three strategies deterministically:
+#   * fixed_timeout captures the shell ("Loading"),
+#   * networkidle / selector wait long enough to see "Ready Content".
+
+_APP_HTML = """<!DOCTYPE html><html><body>
+<div id="content">Loading</div>
+<script>
+setTimeout(function () {
+  fetch('/data')
+    .then(function (r) { return r.text(); })
+    .then(function (t) { document.getElementById('content').textContent = t; });
+}, 200);
+</script>
+</body></html>"""
+
+
+async def _route_delayed_app(route):
+    await route.fulfill(status=200, content_type="text/html", body=_APP_HTML)
+
+
+async def _route_delayed_data(route):
+    await asyncio.sleep(0.2)
+    await route.fulfill(status=200, content_type="text/plain", body="Ready Content")
+
+
+async def _install_delayed_routes(context):
+    await context.route("**/app", _route_delayed_app)
+    await context.route("**/data", _route_delayed_data)
+
+
+@pytest.mark.asyncio
+async def test_config_rejects_selector_without_wait_selector():
+    with pytest.raises(ValueError, match="wait_selector is required"):
+        CrawlConfig(wait_strategy="selector")
+
+
+@pytest.mark.asyncio
+async def test_config_rejects_unknown_wait_strategy():
+    with pytest.raises(ValueError, match="Invalid wait_strategy"):
+        CrawlConfig(wait_strategy="bogus")  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_fixed_timeout_captures_loading_shell(context):
+    await _install_delayed_routes(context)
+    page = await fetch_page("https://example.com/app", context, CONFIG)
+    assert "Loading" in page.html
+    assert "Ready Content" not in page.html
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_networkidle_waits_for_delayed_content(context):
+    await _install_delayed_routes(context)
+    cfg = replace(CONFIG, wait_strategy="networkidle")
+    page = await fetch_page("https://example.com/app", context, cfg)
+    assert "Ready Content" in page.html
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_selector_waits_for_delayed_content(context):
+    await _install_delayed_routes(context)
+    cfg = replace(
+        CONFIG,
+        wait_strategy="selector",
+        wait_selector="#content:has-text('Ready Content')",
+    )
+    page = await fetch_page("https://example.com/app", context, cfg)
+    assert "Ready Content" in page.html

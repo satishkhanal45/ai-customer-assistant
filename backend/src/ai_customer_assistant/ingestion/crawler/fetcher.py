@@ -35,15 +35,46 @@ def _backoff_delay(attempt: int, config: CrawlConfig) -> float:
     return base * (2**attempt)
 
 
+async def _wait_fixed_timeout(page, url: str, config: CrawlConfig) -> None:
+    await page.goto(url, timeout=int(config.request_timeout * 1000))
+
+
+async def _wait_networkidle(page, url: str, config: CrawlConfig) -> None:
+    await page.goto(
+        url, wait_until="networkidle", timeout=int(config.request_timeout * 1000)
+    )
+
+
+async def _wait_selector(page, url: str, config: CrawlConfig) -> None:
+    await page.goto(url, timeout=int(config.request_timeout * 1000))
+    await page.wait_for_selector(
+        config.wait_selector, timeout=int(config.request_timeout * 1000)
+    )
+
+
+_WAIT_STRATEGIES = {
+    "fixed_timeout": _wait_fixed_timeout,
+    "networkidle": _wait_networkidle,
+    "selector": _wait_selector,
+}
+
+
 async def fetch_page(
     url: str, context, config: CrawlConfig
 ) -> FetchedPage:
-    """Navigate to ``url`` in a fresh page and return rendered HTML."""
+    """Navigate to ``url`` in a fresh page and return rendered HTML.
+
+    The wait condition is selected from ``config.wait_strategy`` (decision 7);
+    the retry/backoff handling below is identical for every strategy -- only
+    the wait step differs. Invalid strategies are rejected at config
+    construction, never here.
+    """
+    wait = _WAIT_STRATEGIES[config.wait_strategy]
 
     async def attempt(remaining: int) -> FetchedPage:
         page = await context.new_page()
         try:
-            await page.goto(url, timeout=int(config.request_timeout * 1000))
+            await wait(page, url, config)
             return FetchedPage(
                 url=url,
                 status_code=200,

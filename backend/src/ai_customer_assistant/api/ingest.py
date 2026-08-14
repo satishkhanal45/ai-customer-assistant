@@ -31,7 +31,7 @@ from uuid import UUID
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.async_session import get_session, session_factory
@@ -230,7 +230,22 @@ async def upload(
     )
 
 
-class CrawlRequest(BaseModel):
+class WaitFields(BaseModel):
+    # How long to wait for SPA/client-rendered pages to finish before
+    # capturing HTML (see ingestion.crawler.config.CrawlConfig.wait_strategy).
+    wait_strategy: Literal["fixed_timeout", "networkidle", "selector"] = "fixed_timeout"
+    wait_selector: str | None = None  # required only when wait_strategy == "selector"
+
+    @model_validator(mode="after")
+    def _validate_wait(self):
+        if self.wait_strategy == "selector" and not self.wait_selector:
+            raise ValueError(
+                "wait_selector is required when wait_strategy == 'selector'"
+            )
+        return self
+
+
+class CrawlRequest(WaitFields):
     url: str = Field(..., min_length=5, max_length=2048)
     category_id: UUID | None = None
     # PAGE (default) crawls only the given URL — no discovery, no review step.
@@ -239,7 +254,7 @@ class CrawlRequest(BaseModel):
     scope: Literal["PAGE", "SITE"] = "PAGE"
 
 
-class DiscoverRequest(BaseModel):
+class DiscoverRequest(WaitFields):
     root_url: str = Field(..., min_length=5, max_length=2048)
 
 
@@ -267,13 +282,20 @@ def _crawl_mime(file_type: str | None) -> str:
     return _FILE_TYPE_TO_MIME.get(file_type, "application/octet-stream") if file_type else "text/markdown"
 
 
-async def _run_discovery(root_url: str) -> tuple[DiscoveryResult, CrawlConfig]:
+async def _run_discovery(
+    root_url: str, *, wait_strategy: str, wait_selector: str | None
+) -> tuple[DiscoveryResult, CrawlConfig]:
     from urllib.parse import urlsplit
 
     from ingestion.crawler.crawler import discover
 
     host = urlsplit(root_url).netloc
-    config = CrawlConfig(mode=CrawlMode.SITE, allowed_domains=(host,))
+    config = CrawlConfig(
+        mode=CrawlMode.SITE,
+        allowed_domains=(host,),
+        wait_strategy=wait_strategy,
+        wait_selector=wait_selector,
+    )
     result = await discover(root_url, config)
     return result, config
 
@@ -354,7 +376,12 @@ async def _crawl_single_page(req: CrawlRequest, session: AsyncSession) -> dict:
     from ingestion.crawler.documents import classify_url
 
     host = urlsplit(req.url).netloc
-    config = CrawlConfig(mode=CrawlMode.SITE, allowed_domains=(host,))
+    config = CrawlConfig(
+        mode=CrawlMode.SITE,
+        allowed_domains=(host,),
+        wait_strategy=req.wait_strategy,
+        wait_selector=req.wait_selector,
+    )
     page = classify_url(req.url)
     documents = await crawl_confirmed((page,), config)
     return await _ingest_documents(session, documents, req.category_id)
@@ -370,7 +397,9 @@ async def crawl(
 
     # SITE scope: discovery-first, always goes through a review step before any
     # crawling happens. No same-request auto-crawl.
-    result, config = await _run_discovery(req.url)
+    result, config = await _run_discovery(
+        req.url, wait_strategy=req.wait_strategy, wait_selector=req.wait_selector
+    )
     discovery_id = _cache_discovery(result, config)
     return _review_payload(discovery_id, result)
 
@@ -379,7 +408,9 @@ async def crawl(
 async def crawl_discover(
     req: DiscoverRequest,
 ) -> dict:
-    result, config = await _run_discovery(req.root_url)
+    result, config = await _run_discovery(
+        req.root_url, wait_strategy=req.wait_strategy, wait_selector=req.wait_selector
+    )
     discovery_id = _cache_discovery(result, config)
     return _review_payload(discovery_id, result)
 
