@@ -10,6 +10,10 @@
 
   var roots = {}; // container element refs
 
+  var ICON_USER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 4-6 8-6s8 2 8 6"/></svg>';
+  var ICON_BOT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a4 4 0 0 1 4 4c0 1.5-.8 2.7-2 3.4V11h2a4 4 0 0 1 4 4v1a4 4 0 0 1-4 4h-.5a2.5 2.5 0 0 1-5 0H10a2.5 2.5 0 0 1-5 0H4a4 4 0 0 1-4-4v-1a4 4 0 0 1 4-4h2V9.4C4.8 8.7 4 7.5 4 6a4 4 0 0 1 8-4z"/></svg>';
+  var ICON_COPY = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+
   function load() {
     try { threads = JSON.parse(localStorage.getItem(LS_KEY)) || []; }
     catch (e) { threads = []; }
@@ -49,6 +53,19 @@
     return 'New conversation';
   }
 
+  function relTime(ts) {
+    if (!ts) return '';
+    var s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+    if (s < 60) return 'Just now';
+    var m = Math.floor(s / 60);
+    if (m < 60) return m + 'm ago';
+    var h = Math.floor(m / 60);
+    if (h < 24) return h + 'h ago';
+    var d = Math.floor(h / 24);
+    if (d < 7) return d + 'd ago';
+    return NS.utils.formatDate(ts);
+  }
+
   function init(container) {
     load();
     var current = null;
@@ -68,46 +85,51 @@
 
   function renderShell(container) {
     container.innerHTML = '';
-    container.style.display = 'flex';
-    container.style.minHeight = '0';
+    container.style.padding = '0';
 
-    var side = NS.utils.el('aside', { class: 'sidebar' });
-    var main = NS.utils.el('div', { class: 'chat-main' });
-    container.appendChild(side);
-    container.appendChild(main);
+    var shell = NS.utils.el('div', { class: 'chat-shell' });
+    container.appendChild(shell);
 
-    roots.side = side;
-    roots.main = main;
-    roots.messages = NS.utils.el('div', { class: 'chat-scroll' });
-    roots.composerBar = NS.utils.el('div', { class: 'composer' });
+    var convPanel = NS.utils.el('aside', { class: 'conv-panel' });
+    var chatMain = NS.utils.el('div', { class: 'chat-main' });
+    shell.appendChild(convPanel);
+    shell.appendChild(chatMain);
 
-    var newBtn = NS.utils.el('button', { class: 'action primary' }, 'New conversation');
+    var head = NS.utils.el('div', { class: 'conv-panel-head' });
+    var newBtn = NS.utils.el('button', { class: 'new-chat-btn' },
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>New Chat');
     newBtn.addEventListener('click', function () { activeId = newThread().id; renderThreadList(); renderMessages(); focusComposer(); });
-    side.appendChild(newBtn);
+    head.appendChild(newBtn);
+    convPanel.appendChild(head);
 
-    roots.threadList = NS.utils.el('div', { class: 'thread-list' });
-    side.appendChild(roots.threadList);
+    roots.threadList = NS.utils.el('div', { class: 'conv-list' });
+    convPanel.appendChild(roots.threadList);
 
-    var hint = NS.utils.el('div', { class: 'hint' }, 'History is stored on your device. The backend keeps the conversation state per thread id.');
-    side.appendChild(hint);
+    convPanel.appendChild(NS.utils.el('div', { class: 'conv-hint' },
+      'History is stored on your device. The backend keeps the conversation state per thread id.'));
 
-    main.appendChild(roots.messages);
+    var chatHead = NS.utils.el('div', { class: 'chat-head' });
+    chatHead.innerHTML = '<h3 id="chatHeadTitle">New conversation</h3><span class="chat-head-badge">AI Assistant</span>';
+    chatMain.appendChild(chatHead);
 
-    var input = NS.utils.el('input', { class: 'text' });
+    roots.messages = NS.utils.el('div', { class: 'chat-messages' });
+    chatMain.appendChild(roots.messages);
+
+    var inputBar = NS.utils.el('div', { class: 'chat-input-bar' });
+    var input = NS.utils.el('input');
     input.placeholder = 'Type a message…';
     input.setAttribute('autocomplete', 'off');
-    var send = NS.utils.el('button', { class: 'action primary' }, 'Send');
+    var send = NS.utils.el('button', { class: 'send-btn', title: 'Send' },
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>');
     send.addEventListener('click', sendMessage);
     input.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); sendMessage(); } });
-
-    var inner = NS.utils.el('div', { class: 'composer-inner' });
-    inner.appendChild(input);
-    inner.appendChild(send);
-    roots.composerBar.appendChild(inner);
-    main.appendChild(roots.composerBar);
+    inputBar.appendChild(input);
+    inputBar.appendChild(send);
+    chatMain.appendChild(inputBar);
 
     roots.input = input;
     roots.sendBtn = send;
+    roots.headTitle = chatHead.querySelector('#chatHeadTitle');
   }
 
   function renderThreadList() {
@@ -115,15 +137,20 @@
     if (!list) return;
     list.innerHTML = '';
     if (!threads.length) {
-      list.innerHTML = '<div class="hint" style="padding:8px">No conversations yet.</div>';
+      list.innerHTML = '<div class="hint" style="padding:10px">No conversations yet.</div>';
       return;
     }
     threads.forEach(function (t) {
-      var item = NS.utils.el('div', { class: 'thread-item' + (t.id === activeId ? ' active' : '') });
-      item.innerHTML = '<div class="ti-title">' + NS.utils.esc(titleFor(t)) + '</div>' +
-        '<div class="ti-meta">' + NS.utils.esc(NS.utils.formatDate(t.updatedAt)) + '</div>';
+      var item = NS.utils.el('div', { class: 'conv-item' + (t.id === activeId ? ' active' : '') });
+      item.innerHTML = '<div class="conv-main">' +
+        '<div class="conv-title">' + NS.utils.esc(titleFor(t)) + '</div>' +
+        '<div class="conv-time">' + NS.utils.esc(relTime(t.updatedAt)) + '</div>' +
+        '</div>' +
+        '<div class="conv-menu" title="Delete">' +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg>' +
+        '</div>';
       item.addEventListener('click', function () { activeId = t.id; renderThreadList(); renderMessages(); focusComposer(); });
-      var del = NS.utils.el('span', { class: 'ti-del', title: 'Delete' }, '×');
+      var del = item.querySelector('.conv-menu');
       del.addEventListener('click', function (e) {
         e.stopPropagation();
         threads = threads.filter(function (x) { return x.id !== t.id; });
@@ -132,7 +159,6 @@
         renderThreadList();
         renderMessages();
       });
-      item.appendChild(del);
       list.appendChild(item);
     });
   }
@@ -141,15 +167,17 @@
     var area = roots.messages;
     if (!area) return;
     var t = thread(activeId);
+    if (roots.headTitle) roots.headTitle.textContent = titleFor(t || {});
     area.innerHTML = '';
     if (!t || !t.messages.length) {
       area.appendChild(NS.utils.el('div', { class: 'welcome' },
+        '<div class="welcome-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>' +
         '<div class="welcome-title">How can I help you?</div>' +
         '<div class="hint">Ask about our knowledge base, or say "create a ticket" to open a support request.</div>' +
         '<div class="welcome-prompts">' +
-        '<button class="action" data-p="What support plans do you offer?">What support plans do you offer?</button>' +
-        '<button class="action" data-p="How do I request a refund?">How do I request a refund?</button>' +
-        '<button class="action" data-p="Create a ticket">Create a ticket</button>' +
+        '<button class="btn btn-ghost" data-p="What support plans do you offer?">What support plans do you offer?</button>' +
+        '<button class="btn btn-ghost" data-p="How do I request a refund?">How do I request a refund?</button>' +
+        '<button class="btn btn-ghost" data-p="Create a ticket">Create a ticket</button>' +
         '</div>'));
       var prompBtns = area.querySelectorAll('.welcome-prompts button');
       Array.prototype.forEach.call(prompBtns, function (b) {
@@ -158,37 +186,57 @@
       return;
     }
     t.messages.forEach(function (m) {
-      var bubble = NS.utils.el('div', { class: 'msg ' + (m.role === 'user' ? 'msg-user' : 'msg-assistant') });
-      if (m.role === 'user') {
-        bubble.innerHTML = '<div class="bubble">' + NS.utils.esc(m.content).replace(/\n/g, '<br>') + '</div>';
-      } else if (m.error) {
-        bubble.innerHTML = '<div class="bubble bubble-error">' + NS.utils.esc(m.content) + '</div>' +
-          (m.retriable ? '<button class="action retry">Retry</button>' : '');
-        var rb = bubble.querySelector('.retry');
-        if (rb) rb.addEventListener('click', function () {
-          pendingRetry = { threadId: activeId, message: m.resendMessage || m.content };
-          sendMessage();
-        });
-      } else {
-        var html = '<div class="bubble">' + renderAssistant(m.content) + '</div>';
-        if (m.citations && m.citations.length) {
-          var cites = m.citations.map(function (c) {
-            var parts = [];
-            if (c.source_name) parts.push('<b>' + NS.utils.esc(c.source_name) + '</b>');
-            if (c.page != null) parts.push('p.' + NS.utils.esc(String(c.page)));
-            if (c.version_number != null) parts.push('v' + NS.utils.esc(String(c.version_number)));
-            return '<div class="citation">' + parts.join(' · ') + '</div>';
-          }).join('');
-          html += '<div class="citations">' + cites + '</div>';
-        }
-        if (m.traceId) {
-          html += '<div class="debug"><span class="trace" title="trace_id">' + NS.utils.esc(m.traceId) + '</span></div>';
-        }
-        bubble.innerHTML = html;
-      }
-      area.appendChild(bubble);
+      area.appendChild(buildMessage(m));
     });
     area.scrollTop = area.scrollHeight;
+  }
+
+  function buildMessage(m) {
+    var row = NS.utils.el('div', { class: 'msg-row ' + (m.role === 'user' ? 'user' : 'assistant') });
+    row.innerHTML = '<div class="msg-avatar">' + (m.role === 'user' ? ICON_USER : ICON_BOT) + '</div><div class="msg-col"></div>';
+    var col = row.querySelector('.msg-col');
+
+    if (m.role === 'user') {
+      col.innerHTML = '<div class="msg-bubble">' + NS.utils.esc(m.content).replace(/\n/g, '<br>') + '</div>';
+    } else if (m.error) {
+      col.innerHTML = '<div class="msg-bubble msg-bubble-error">' + NS.utils.esc(m.content) + '</div>' +
+        (m.retriable ? '<button class="btn btn-ghost btn-sm retry">Retry</button>' : '');
+      var rb = col.querySelector('.retry');
+      if (rb) rb.addEventListener('click', function () {
+        pendingRetry = { threadId: activeId, message: m.resendMessage || m.content };
+        sendMessage();
+      });
+    } else {
+      var html = '<div class="msg-bubble">' + renderAssistant(m.content) + '</div>';
+      if (m.citations && m.citations.length) {
+        var cites = m.citations.map(function (c) {
+          var parts = [];
+          if (c.source_name) parts.push('<b>' + NS.utils.esc(c.source_name) + '</b>');
+          if (c.page != null) parts.push('p.' + NS.utils.esc(String(c.page)));
+          if (c.version_number != null) parts.push('v' + NS.utils.esc(String(c.version_number)));
+          return '<div class="citation">' + parts.join(' · ') + '</div>';
+        }).join('');
+        html += '<div class="citations">' + cites + '</div>';
+      }
+      if (m.traceId) {
+        html += '<div class="debug"><span class="trace" title="trace_id">' + NS.utils.esc(m.traceId) + '</span></div>';
+      }
+      html += '<div class="msg-actions">' +
+        '<button class="msg-action-btn" title="Copy" data-text="' + NS.utils.esc(m.content).replace(/"/g, '&quot;') + '">' + ICON_COPY + '</button>' +
+        '</div>';
+      col.innerHTML = html;
+      var copy = col.querySelector('.msg-action-btn');
+      if (copy) copy.addEventListener('click', function () { copyMessage(copy); });
+    }
+    return row;
+  }
+
+  function copyMessage(btn) {
+    var text = btn.getAttribute('data-text');
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).catch(function () {});
+    var original = btn.innerHTML;
+    btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 12 2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg>';
+    setTimeout(function () { btn.innerHTML = original; }, 1200);
   }
 
   function linkify(text) {
@@ -217,7 +265,9 @@
     roots.input.disabled = busy;
     var typing = roots.messages.querySelector('.msg-typing');
     if (busy && !typing) {
-      roots.messages.appendChild(NS.utils.el('div', { class: 'msg msg-assistant msg-typing' }, '<div class="bubble typing">thinking…</div>'));
+      roots.messages.appendChild(NS.utils.el('div', { class: 'msg-row assistant msg-typing' },
+        '<div class="msg-avatar">' + ICON_BOT + '</div>' +
+        '<div class="msg-col"><div class="msg-bubble"><div class="typing-indicator"><span></span><span></span><span></span></div></div></div>'));
       roots.messages.scrollTop = roots.messages.scrollHeight;
     }
     if (!busy && typing) typing.remove();
@@ -264,51 +314,8 @@
   }
 
   function focusComposer() {
-    if (roots.input) { roots.input.focus(); }
+    if (roots.input) roots.input.focus();
   }
-
-  // Inline styles for the chat page (kept separate from the global theme).
-  var STYLE = document.createElement('style');
-  STYLE.textContent = [
-    '.chat-main { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }',
-    '.chat-scroll { flex: 1; overflow-y: auto; padding: 24px 28px 32px; display: flex; flex-direction: column; gap: 14px; max-width: 900px; width: 100%; margin: 0 auto; }',
-    '.composer { display: flex; padding: 22px; border-top: 4px solid var(--border); background: var(--panel-solid); margin: 0;}',
-    '.composer-inner { display: flex; align-items: center; gap: 6px; width: 100%; max-width: 800px; margin: 0 auto; }',
-    '.composer-inner input { flex: 0 1 700px; min-width: 0; }',
-    '.composer-inner button { flex-shrink: 0; margin-left: auto; }',
-    '.thread-list { display: flex; flex-direction: column; gap: 6px; }',
-    '.thread-item { position: relative; padding: 10px 32px 10px 12px; border: 1px solid var(--border); border-radius: var(--r-md); cursor: pointer; transition: all .15s ease; background: transparent; }',
-    '.thread-item:hover { border-color: var(--accent); background: var(--accent-soft); }',
-    '.thread-item.active { border-color: var(--accent); background: var(--accent-soft); }',
-    '.ti-title { font-size: 12.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }',
-    '.ti-meta { font-size: 10px; color: var(--muted); margin-top: 3px; }',
-    '.ti-del { position: absolute; right: 9px; top: 50%; transform: translateY(-50%); color: var(--muted); cursor: pointer; font-size: 16px; line-height: 1; opacity: 0; transition: opacity .15s ease; }',
-    '.thread-item:hover .ti-del { opacity: 1; }',
-    '.ti-del:hover { color: var(--accent); }',
-    '.msg { display: flex; flex-direction: column; max-width: 78%; }',
-    '.msg-user { align-self: flex-end; align-items: flex-end; }',
-    '.msg-assistant { align-self: flex-start; align-items: flex-start; }',
-    '.bubble { padding: 10px 16px; border-radius: 14px; font-size: 13.5px; line-height: 1.6; word-break: break-word; box-shadow: var(--shadow-sm); }',
-    '.msg-user .bubble { background: var(--panel-2); border: 1px solid var(--accent-dim); border-bottom-right-radius: 6px; }',
-    '.msg-assistant .bubble { background: var(--panel); border: 1px solid var(--border); border-bottom-left-radius: 6px; }',
-    '.bubble-error { border-color: var(--accent) !important; color: var(--text); font-weight: 600; }',
-    '.citations { margin-top: 8px; display: flex; flex-direction: column; gap: 4px; max-width: 78%; }',
-    '.citation { font-size: 11px; color: var(--muted); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 5px 9px; line-height: 1.5; }',
-    '.citation b { color: var(--accent); font-weight: 600; }',
-    '.bubble p { margin: 0 0 6px; } .bubble p:last-child { margin-bottom: 0; }',
-    '.bubble a { color: var(--accent); }',
-    '.md-h { font-weight: 700; margin: 6px 0 4px; font-size: 14px; }',
-    '.md-li { padding-left: 4px; }',
-    '.typing { color: var(--muted); font-style: italic; }',
-    '.retry { margin-top: 6px; align-self: flex-start; }',
-    '.debug { margin-top: 5px; } .trace { font-family: var(--mono); font-size: 10px; color: var(--muted); }',
-    '.welcome { text-align: center; margin: auto; max-width: 560px; }',
-    '.welcome-title { font-size: 20px; font-weight: 650; margin-bottom: 8px; }',
-    '.welcome .hint { font-size: 13px; }',
-    '.welcome-prompts { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; margin-top: 20px; }',
-    '@media (max-width: 1080px) { .msg { max-width: 94%; } .chat-scroll, .composer { padding-left: 16px; padding-right: 16px; } }'
-  ].join('\n');
-  document.head.appendChild(STYLE);
 
   NS.pages = NS.pages || {};
   NS.pages.chat = { init: init, destroy: destroy };

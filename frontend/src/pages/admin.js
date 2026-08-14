@@ -165,41 +165,6 @@
     roots.body.innerHTML = table(['ID', 'Email', 'Query', 'Priority', 'Status', 'Created'], rows);
   }
 
-  var STYLE = document.createElement('style');
-  STYLE.textContent = [
-    '.admin-wrap { flex: 1; overflow-y: auto; padding: 24px; max-width: 1120px; width: 100%; margin: 0 auto; }',
-    '.admin-tabs { margin-bottom: 20px; }',
-    '.admin-body { display: flex; flex-direction: column; gap: 16px; }',
-    '.admin-empty { text-align: center; padding: 40px; }',
-    '.admin-empty-title { font-size: 15px; font-weight: 600; margin-bottom: 8px; }',
-    '.admin-empty .hint { margin-bottom: 6px; }',
-    '.admin-empty .action { margin-top: 12px; }',
-    '.tbl { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--panel); box-shadow: var(--shadow-sm); }',
-    '.tbl table { width: 100%; border-collapse: collapse; font-size: 12.5px; }',
-    '.tbl th { text-align: left; font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: .1em; color: var(--muted); padding: 12px 16px; border-bottom: 1px solid var(--border); white-space: nowrap; }',
-    '.tbl td { padding: 11px 16px; border-bottom: 1px solid var(--border); white-space: nowrap; }',
-    '.tbl tbody tr:last-child td { border-bottom: 0; }',
-    '.tbl tbody tr:hover { background: var(--accent-soft); }',
-    '.tbl td:last-child, .tbl th:last-child { white-space: normal; }',
-    '.badge { display: inline-block; font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; font-weight: 700; padding: 2px 8px; border-radius: 999px; }',
-    '.badge-ok { color: var(--on-accent); background: var(--accent); }',
-    '.badge-accent { color: var(--on-accent); background: var(--accent); }',
-    '.badge-warn { color: var(--on-accent); background: var(--accent-dim); }',
-    '.badge-bad { color: var(--text); background: transparent; border: 1px solid var(--accent); }',
-    '.badge-muted { color: var(--muted); background: var(--border); }',
-    '.err-detail { color: var(--accent); cursor: help; }',
-    '.stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 16px; }',
-    '.stat-card { text-align: center; padding: 24px; }',
-    '.stat-num { font-size: 28px; font-weight: 700; letter-spacing: -.02em; }',
-    '.stat-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .1em; margin-top: 6px; }',
-    '.stats-grid .card h3 { margin: 0 0 10px; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }',
-    '.stats-grid .card { grid-column: 1 / -1; }',
-    '.bar-row { display: grid; grid-template-columns: 160px 1fr 40px; align-items: center; gap: 12px; font-size: 12px; padding: 6px 0; }',
-    '.bar { background: var(--border); border-radius: 999px; height: 8px; overflow: hidden; }',
-    '.bar i { display: block; height: 100%; background: var(--accent); border-radius: 999px; }'
-  ].join('\n');
-  document.head.appendChild(STYLE);
-
   NS.pages = NS.pages || {};
   NS.pages.admin = { init: init, destroy: destroy };
 })(window.ACA);
