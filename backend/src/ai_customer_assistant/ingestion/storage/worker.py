@@ -47,7 +47,13 @@ async def run_crawl_and_ingest(
 ) -> list[uploader.UploadOutcome]:
     """Convenience wrapper for a scheduler entry point:
 
-        documents = Crawler(crawl_config).crawl(url)
+        from ingestion.crawler.config import CrawlConfig
+        from ingestion.crawler.crawler import crawl_confirmed, discover
+
+        config = CrawlConfig(...)
+        result = await discover(url, config)      # sitemap-first discovery
+        documents = await crawl_confirmed(result.pages, config)  # confirmed list
+
         outcomes = await run_crawl_and_ingest(
             documents, session=session, client=client, config=config
         )
