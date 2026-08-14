@@ -7,27 +7,52 @@
 
   function init(container) {
     container.innerHTML = '';
-    container.style.display = 'flex';
     container.style.minHeight = '0';
 
     var wrap = NS.utils.el('div', { class: 'ingest-wrap' });
     container.appendChild(wrap);
 
     wrap.innerHTML =
+      '<h1 class="page-title">Knowledge Ingestion</h1>' +
+      '<p class="page-sub">Add documents and web content to the AI Customer Assistant knowledge base.</p>' +
+
       '<div class="ingest-grid">' +
-      '  <div class="card">' +
-      '    <h2>Upload file</h2>' +
-      '    <p class="hint">PDF, DOCX or Markdown. The file is chunked, embedded and extracted into the knowledge graph.</p>' +
-      '    <div id="dropzone" class="dropzone"><div class="dz-label">Drop a file here, or click to browse</div></div>' +
+
+      '  <div class="ingest-card">' +
+      '    <h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-3M17 8l-5-5-5 5M12 3v12"/></svg> Upload File</h3>' +
+      '    <p class="desc">Add documents directly from your device. PDF, DOCX or Markdown — chunked, embedded and extracted into the knowledge graph.</p>' +
+      '    <div class="dropzone" id="dropzone">' +
+      '      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-3M17 8l-5-5-5 5M12 3v12"/></svg>' +
+      '      <h4>Drag &amp; drop your file here</h4>' +
+      '      <p>or <span class="browse">browse files</span></p>' +
+      '    </div>' +
       '    <input type="file" id="fileInput" accept=".pdf,.docx,.md,application/pdf,text/markdown" hidden>' +
-      '    <div id="fileMeta" class="file-meta"></div>' +
-      '    <button id="btnUpload" class="action primary" disabled>Upload &amp; ingest</button>' +
+      '    <div class="formats-row">' +
+      '      <span class="format-chip">PDF</span>' +
+      '      <span class="format-chip">DOCX</span>' +
+      '      <span class="format-chip">MD</span>' +
+      '    </div>' +
+      '    <div class="file-meta" id="fileMeta"></div>' +
+      '    <button id="btnUpload" class="btn btn-primary btn-full" disabled>Upload &amp; ingest</button>' +
       '  </div>' +
-      '  <div class="card">' +
-      '    <h2>Crawl URL</h2>' +
-      '    <p class="hint">Fetch an HTML page, PDF or Office document from a public URL and ingest it.</p>' +
-      '    <div class="field"><input id="crawlUrl" class="text" type="text" placeholder="https://example.com/page" style="width:100%"></div>' +
-      '    <button id="btnCrawl" class="action primary">Crawl &amp; ingest</button>' +
+
+      '  <div class="ingest-card">' +
+      '    <h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15 15 0 0 1 0 20 15 15 0 0 1 0-20Z"/></svg> Crawl URL</h3>' +
+      '    <p class="desc">Extract knowledge from a public webpage, PDF or Office document and ingest it.</p>' +
+      '    <div class="crawl-input-row">' +
+      '      <input type="text" id="crawlUrl" placeholder="https://example.com/page">' +
+      '      <button id="btnCrawl" class="btn btn-primary">Start Crawl</button>' +
+      '    </div>' +
+      '    <div class="crawl-status" id="crawlStatus">' +
+      '      <div class="label" id="crawlLabel">' +
+      '        <svg class="spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>' +
+      '        <span id="crawlLabelText">Working…</span>' +
+      '      </div>' +
+      '      <div class="crawl-stats" id="crawlStats" style="display:none;">' +
+      '        <div class="crawl-stat"><div class="n" id="statChunks">0</div><div class="l">Chunks created</div></div>' +
+      '        <div class="crawl-stat"><div class="n" id="statEntities">0</div><div class="l">Entities indexed</div></div>' +
+      '      </div>' +
+      '    </div>' +
       '  </div>' +
       '</div>' +
       '<div id="result" class="card result" hidden></div>';
@@ -52,8 +77,6 @@
     roots.fileInput.addEventListener('change', function () {
       if (roots.fileInput.files.length) selectFile(roots.fileInput.files[0]);
     });
-    roots.btnUpload.dataset.label = 'Upload & ingest';
-    roots.btnCrawl.dataset.label = 'Crawl & ingest';
     roots.btnUpload.addEventListener('click', uploadFile);
     roots.btnCrawl.addEventListener('click', crawlUrl);
   }
@@ -76,7 +99,7 @@
 
   function setBusy(busy, btn) {
     btn.disabled = busy;
-    btn.textContent = busy ? 'Working…' : btn.getAttribute('data-label');
+    btn.textContent = busy ? 'Working…' : 'Ingest';
     if (busy) showLoading();
     else hideLoading();
   }
@@ -103,11 +126,11 @@
       html = '<div class="result-ok"><b>Ingestion complete.</b></div>' +
         '<div class="hint">' + NS.utils.esc(String(data.chunks_created_count || 0)) + ' chunks, ' +
         NS.utils.esc(String(data.entities_created_count || 0)) + ' entities indexed.</div>' +
-        '<div class="result-actions"><button class="action" data-copy="job_id">Copy job id</button></div>';
+        '<div class="result-actions"><button class="btn btn-ghost btn-sm" data-copy="job_id">Copy job id</button></div>';
     } else if (data.status === 'pending') {
       html = '<div class="result-ok"><b>Submitted for ingestion.</b></div>' +
         '<div class="hint">Still processing in the background (embeddings + graph extraction). Check the admin tab or retry in a moment.</div>' +
-        '<div class="result-actions"><button class="action" data-copy="job_id">Copy job id</button></div>';
+        '<div class="result-actions"><button class="btn btn-ghost btn-sm" data-copy="job_id">Copy job id</button></div>';
     } else if (data.status === 'submitted') {
       html = '<div class="result-ok"><b>Submitted for ingestion.</b></div>' +
         '<pre class="code">' + NS.utils.esc(JSON.stringify({
@@ -116,9 +139,9 @@
           source_id: data.source_id,
           version_id: data.version_id
         }, null, 2)) + '</pre>' +
-        '<div class="result-actions"><button class="action" data-copy="job_id">Copy job id</button>' +
-        '<button class="action" data-copy="source_id">Copy source id</button>' +
-        '<button class="action" data-copy="version_id">Copy version id</button></div>';
+        '<div class="result-actions"><button class="btn btn-ghost btn-sm" data-copy="job_id">Copy job id</button>' +
+        '<button class="btn btn-ghost btn-sm" data-copy="source_id">Copy source id</button>' +
+        '<button class="btn btn-ghost btn-sm" data-copy="version_id">Copy version id</button></div>';
     } else {
       html = '<pre class="code">' + NS.utils.esc(JSON.stringify(data, null, 2)) + '</pre>';
     }
@@ -201,7 +224,7 @@
         setBusy(false, roots.btnCrawl);
         return;
       }
-      NS.utils.status('Submitted — ingesting in background…');
+      showCrawlLabel('Submitted — ingesting in background…', false);
       pollJob(data.job_id, function (result) {
         setBusy(false, roots.btnCrawl);
         if (result.status === 'succeeded') {
@@ -211,20 +234,50 @@
             chunks_created_count: result.chunks,
             entities_created_count: result.entities
           });
+          showCrawlDone(result.chunks, result.entities);
           NS.utils.status('Ingestion complete.');
         } else if (result.status === 'error') {
           renderResult({ status: 'error', error: result.error });
+          showCrawlLabel('Crawl failed', true);
           NS.utils.status('Ingestion failed', true);
         } else {
           renderResult({ status: 'pending', job_id: data.job_id });
+          showCrawlLabel('Still processing in the background.', false);
           NS.utils.status('Still processing in the background.');
         }
       });
     }).catch(function (err) {
       renderResult({ status: 'error', error: err.message });
+      showCrawlLabel('Crawl failed', true);
       NS.utils.status('Crawl failed', true);
       setBusy(false, roots.btnCrawl);
     });
+  }
+
+  function showCrawlLabel(text, error) {
+    var label = document.getElementById('crawlLabel');
+    var wrap = document.getElementById('crawlStatus');
+    if (!label) return;
+    wrap.classList.add('show');
+    document.getElementById('crawlStats').style.display = 'none';
+    label.classList.toggle('done', !error);
+    label.innerHTML = (error ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg>' :
+      '<svg class="spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>') +
+      '<span>' + NS.utils.esc(text) + '</span>';
+  }
+
+  function showCrawlDone(chunks, entities) {
+    var label = document.getElementById('crawlLabel');
+    if (label) {
+      label.classList.add('done');
+      label.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 12 2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg><span>Crawl completed</span>';
+    }
+    var stats = document.getElementById('crawlStats');
+    if (stats) {
+      document.getElementById('statChunks').textContent = chunks == null ? '0' : chunks;
+      document.getElementById('statEntities').textContent = entities == null ? '0' : entities;
+      stats.style.display = 'grid';
+    }
   }
 
   function crawlUrl() {
@@ -234,24 +287,6 @@
       return NS.api.post('/ingest/crawl', { url: url }, { timeout: 180000 });
     });
   }
-
-  var STYLE = document.createElement('style');
-  STYLE.textContent = [
-    '.ingest-wrap { flex: 1; overflow-y: auto; padding: 24px; max-width: 1020px; width: 100%; margin: 0 auto; }',
-    '.ingest-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; align-items: start; }',
-    '.ingest-wrap h2 { margin: 0 0 6px; font-size: 14px; }',
-    '.ingest-wrap .hint { margin: 0; }',
-    '.dropzone { border: 1.5px dashed var(--border); border-radius: var(--r-lg); padding: 40px 24px; text-align: center; cursor: pointer; color: var(--muted); font-size: 13px; transition: all .15s ease; margin: 16px 0 12px; }',
-    '.dropzone:hover, .dropzone.drag { border-color: var(--accent); background: var(--accent-soft); color: var(--text); }',
-    '.file-meta { font-size: 12px; min-height: 20px; margin-bottom: 12px; }',
-    '.file-meta .err { color: var(--accent); font-weight: 600; }',
-    '.result { margin-top: 20px; } .result[hidden] { display: none; }',
-    '.result-ok { color: var(--accent); font-size: 13px; margin-bottom: 10px; font-weight: 600; }',
-    '.result-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }',
-    '.result-actions .action { font-size: 11.5px; height: 30px; padding: 0 12px; }',
-    '@media (max-width: 1080px) { .ingest-grid { grid-template-columns: 1fr; } }'
-  ].join('\n');
-  document.head.appendChild(STYLE);
 
   NS.pages = NS.pages || {};
   NS.pages.ingest = { init: init, destroy: destroy };

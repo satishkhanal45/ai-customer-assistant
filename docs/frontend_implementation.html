@@ -1,0 +1,1688 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Customer Assistant</title>
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+<style>
+/* ============================================================
+   DESIGN TOKENS
+   Direction: "Signal Field" — the product is a live knowledge
+   graph, so a drifting, pulsing node-and-edge field (the
+   "graph-field") is the one signature device threaded through
+   header, hero and buttons as a violet→cyan "signal" gradient.
+   Data (stats, IDs, timestamps, badges) always sits in mono type,
+   everything else in humanist Inter/Space Grotesk — a deliberate
+   split between "what the system extracted" and "what it says".
+   ============================================================ */
+:root{
+  --bg: #eef1f6;
+  --panel: #ffffff;
+  --panel-alt: #f4f6fb;
+  --border: #dde2ee;
+  --text: #161a24;
+  --text-dim: #626b82;
+  --text-faint: #98a1b6;
+
+  --blue: #3b5bfd;
+  --blue-dim: #e5e9ff;
+  --purple: #a13bf0;
+  --purple-dim: #f4e6fd;
+  --green: #17945f;
+  --green-dim: #e0f5ec;
+  --red: #e0483a;
+
+  --shadow: 0 1px 2px rgba(20,25,45,0.05), 0 2px 14px rgba(20,25,45,0.06);
+  --shadow-lg: 0 18px 40px rgba(20,25,45,0.14);
+  --radius: 14px;
+  --radius-sm: 9px;
+  --font-display: 'Space Grotesk', 'Inter', sans-serif;
+  --font-body: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: 'JetBrains Mono', 'SFMono-Regular', Consolas, monospace;
+  --lattice-opacity: 0.45;
+}
+
+html[data-theme="dark"]{
+  --bg: #0a0d15;
+  --panel: #12151f;
+  --panel-alt: #171b27;
+  --border: #262c3d;
+  --text: #eef1f8;
+  --text-dim: #98a1b8;
+  --text-faint: #575f76;
+
+  --blue: #7c93ff;
+  --blue-dim: #1d2554;
+  --purple: #c99bfa;
+  --purple-dim: #2c1f4c;
+  --green: #4ade95;
+  --green-dim: #123527;
+  --red: #ff7a68;
+
+  --shadow: 0 1px 2px rgba(0,0,0,0.35), 0 4px 20px rgba(0,0,0,0.4);
+  --shadow-lg: 0 22px 48px rgba(0,0,0,0.55);
+  --lattice-opacity: 0.7;
+}
+
+*{ box-sizing: border-box; }
+html,body{ height:100%; }
+body{
+  margin:0;
+  font-family: var(--font-body);
+  background: var(--bg);
+  color: var(--text);
+  transition: background .25s ease, color .25s ease;
+  font-size: 14px;
+}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap');
+
+button{ font-family: inherit; }
+input{ font-family: inherit; }
+
+::-webkit-scrollbar{ width:8px; height:8px; }
+::-webkit-scrollbar-thumb{ background: var(--border); border-radius: 8px; }
+::-webkit-scrollbar-track{ background: transparent; }
+
+a{ color: inherit; text-decoration:none; }
+
+/* ============================================================
+   SIGNATURE: GRAPH FIELD (ambient drifting node/edge motif)
+   ============================================================ */
+.graph-field{ position:absolute; inset:0; overflow:hidden; pointer-events:none; opacity: var(--lattice-opacity); z-index:0; }
+.graph-field svg{ width:100%; height:100%; display:block; }
+.gf-edge{ stroke: var(--text-faint); stroke-width:1; opacity:.4; }
+.gf-node{ fill: var(--blue); }
+.gf-node.alt{ fill: var(--purple); }
+.gf-drift{ animation: gf-drift 24s ease-in-out infinite; transform-origin: 50% 50%; }
+@keyframes gf-drift{
+  0%,100%{ transform: translate(0,0); }
+  50%{ transform: translate(-16px, 10px); }
+}
+.gf-pulse{ animation: gf-pulse 3.6s ease-in-out infinite; }
+@keyframes gf-pulse{
+  0%,100%{ opacity:.3; }
+  50%{ opacity:1; }
+}
+.hero-band > .graph-field{ position:absolute; inset:0; z-index:0;
+  mask-image: linear-gradient(120deg, black, transparent 72%);
+  -webkit-mask-image: linear-gradient(120deg, black, transparent 72%);
+}
+
+/* ============================================================
+   APP SHELL
+   ============================================================ */
+.app{
+  display:grid;
+  grid-template-columns: 232px 1fr;
+  grid-template-rows: 60px 1fr;
+  grid-template-areas:
+    "header header"
+    "sidebar main";
+  height:100vh;
+  overflow:hidden;
+  --sidebar-w: 232px;
+  transition: grid-template-columns .2s ease;
+}
+.app.sidebar-collapsed{ grid-template-columns: 72px 1fr; }
+
+/* ---------- HEADER ---------- */
+.header{
+  grid-area: header;
+  display:flex;
+  align-items:center;
+  gap: 18px;
+  justify-content: space-between;
+  padding: 0 20px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  z-index: 20;
+  position:relative;
+  overflow:hidden;
+}
+/* ambient signal line — the graph "pulsing" across the whole app */
+.header::after{
+  content:'';
+  position:absolute; left:0; right:0; bottom:-1px; height:2px;
+  background: linear-gradient(90deg, var(--blue), var(--purple), var(--blue));
+  background-size: 200% 100%;
+  animation: signal-flow 9s linear infinite;
+  opacity:.7;
+}
+@keyframes signal-flow{ to{ background-position: -200% 0; } }
+
+.header-left{ display:flex; align-items:center; gap:12px; position:relative; z-index:1; }
+.logo{
+  width:34px; height:34px; border-radius:10px;
+  background: linear-gradient(135deg, var(--blue), var(--purple));
+  display:flex; align-items:center; justify-content:center;
+  color:#fff;
+  flex-shrink:0;
+  box-shadow: 0 3px 12px color-mix(in srgb, var(--blue) 45%, transparent);
+}
+.logo svg{ width:20px; height:20px; }
+.brand{
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 15.5px;
+  letter-spacing: -0.01em;
+}
+.status-pill{
+  display:flex; align-items:center; gap:6px;
+  font-size:11.5px; font-family: var(--font-mono); font-weight:600;
+  color: var(--text-dim);
+  padding: 5px 10px;
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  margin-left: 6px;
+}
+.dot{
+  width:7px; height:7px; border-radius:50%; background: var(--green);
+  box-shadow: 0 0 0 3px var(--green-dim);
+  position:relative;
+}
+.dot::after{
+  content:'';
+  position:absolute; inset:-4px;
+  border-radius:50%;
+  border: 1.4px solid var(--green);
+  opacity:.55;
+  animation: pulse-ring 2.2s ease-out infinite;
+}
+@keyframes pulse-ring{
+  0%{ transform:scale(.5); opacity:.6; }
+  75%{ transform:scale(1.6); opacity:0; }
+  100%{ opacity:0; }
+}
+
+.header-right{ display:flex; align-items:center; gap:10px; position:relative; z-index:1; }
+.header-center{ flex:1; display:flex; justify-content:center; position:relative; z-index:1; }
+.cmdk-trigger{
+  display:flex; align-items:center; gap:9px;
+  width: 100%; max-width: 360px;
+  padding: 7px 12px;
+  border-radius: 20px;
+  border: 1px solid var(--border);
+  background: var(--panel-alt);
+  color: var(--text-faint);
+  font-size: 12.5px;
+  cursor:pointer;
+  transition: all .15s ease;
+}
+.cmdk-trigger:hover{ border-color: var(--blue); color: var(--text-dim); box-shadow: 0 0 0 3px color-mix(in srgb, var(--blue) 12%, transparent); }
+.cmdk-trigger svg{ width:14px; height:14px; flex-shrink:0; }
+.cmdk-trigger span:nth-child(2){ flex:1; text-align:left; }
+.cmdk-kbd{
+  font-family: var(--font-mono);
+  font-size: 10.5px; font-weight:700; color: var(--text-faint);
+  background: var(--panel); border:1px solid var(--border);
+  padding: 1px 6px; border-radius: 5px;
+}
+.cmdk-overlay{
+  display:none; position:fixed; inset:0; z-index:100;
+  background: rgba(10,12,20,0.55);
+  align-items:flex-start; justify-content:center;
+  padding-top: 12vh;
+  backdrop-filter: blur(3px);
+}
+.cmdk-overlay.show{ display:flex; }
+.cmdk-modal{
+  width: 560px; max-width: 90vw;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg), 0 0 0 1px color-mix(in srgb, var(--blue) 14%, transparent);
+  overflow:hidden;
+  animation: cmdk-in .15s ease;
+}
+@keyframes cmdk-in{ from{ opacity:0; transform: translateY(-6px); } to{ opacity:1; transform:none; } }
+.cmdk-input-row{ display:flex; align-items:center; gap:10px; padding: 14px 16px; border-bottom:1px solid var(--border); }
+.cmdk-input-row svg{ width:16px; height:16px; color: var(--text-faint); flex-shrink:0; }
+.cmdk-input-row input{ flex:1; border:none; outline:none; background:transparent; font-size:14px; color: var(--text); }
+.cmdk-results{ max-height: 320px; overflow-y:auto; padding: 8px; }
+.cmdk-result-item{
+  display:flex; align-items:center; gap:10px;
+  padding: 9px 10px; border-radius: var(--radius-sm);
+  cursor:pointer; font-size:13px; color: var(--text);
+}
+.cmdk-result-item:hover, .cmdk-result-item.hi{ background: var(--panel-alt); }
+.cmdk-result-item svg{ width:15px; height:15px; color: var(--blue); flex-shrink:0; }
+.cmdk-result-item .cr-sub{ margin-left:auto; font-size:11px; color: var(--text-faint); font-family: var(--font-mono); }
+.cmdk-empty{ padding: 20px; text-align:center; font-size:12.5px; color: var(--text-faint); }
+
+.notif-wrap{ position:relative; }
+.notif-badge{
+  position:absolute; top:-3px; right:-3px;
+  background: var(--red); color:#fff;
+  font-size:9.5px; font-weight:700; font-family: var(--font-mono);
+  width:15px; height:15px; border-radius:50%;
+  display:flex; align-items:center; justify-content:center;
+  border: 2px solid var(--panel);
+}
+.notif-dropdown{
+  display:none; position:absolute; top: 42px; right:0;
+  width: 300px; background: var(--panel);
+  border:1px solid var(--border); border-radius: var(--radius);
+  box-shadow: var(--shadow-lg); overflow:hidden; z-index:60;
+}
+.notif-dropdown.show{ display:block; animation: cmdk-in .15s ease; }
+.notif-dropdown-head{ font-family: var(--font-display); font-weight:700; font-size:13px; padding: 12px 14px; border-bottom:1px solid var(--border); }
+.notif-item{ display:flex; gap:10px; padding: 11px 14px; border-bottom:1px solid var(--border); }
+.notif-item:last-child{ border-bottom:none; }
+.notif-dot{ width:7px; height:7px; border-radius:50%; margin-top:5px; flex-shrink:0; }
+.notif-dot.blue{ background: var(--blue); }
+.notif-dot.purple{ background: var(--purple); }
+.notif-dot.green{ background: var(--green); }
+.notif-text{ font-size:12px; line-height:1.4; color: var(--text); }
+.notif-time{ font-size:10.5px; font-family: var(--font-mono); color: var(--text-faint); margin-top:2px; }
+
+.icon-btn{
+  width:34px; height:34px;
+  display:flex; align-items:center; justify-content:center;
+  border-radius: var(--radius-sm);
+  border:1px solid var(--border);
+  background: var(--panel);
+  color: var(--text-dim);
+  cursor:pointer;
+  transition: all .15s ease;
+}
+.icon-btn:hover{ background: var(--panel-alt); color: var(--text); border-color: var(--blue); }
+.icon-btn svg{ width:16px; height:16px; }
+.avatar{
+  width:34px; height:34px; border-radius:50%;
+  background: linear-gradient(135deg, var(--purple-dim), var(--blue-dim));
+  color: var(--purple);
+  display:flex; align-items:center; justify-content:center;
+  font-weight:700; font-size:13px; font-family: var(--font-mono);
+  border: 1px solid var(--border);
+}
+
+/* ---------- SIDEBAR ---------- */
+.sidebar{
+  grid-area: sidebar;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+  padding: 16px 12px;
+  display:flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow-y:auto;
+}
+.nav-label{
+  font-family: var(--font-display);
+  font-size:11px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--text-faint);
+  padding: 8px 10px 6px;
+  font-weight:600;
+}
+.nav-item{
+  display:flex; align-items:center; gap:10px;
+  padding: 9px 12px 9px 14px;
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  cursor:pointer;
+  font-size: 13.5px;
+  font-weight: 500;
+  border: 1px solid transparent;
+  border-left: 2px solid transparent;
+  transition: all .15s ease;
+  background: transparent;
+  width:100%;
+  text-align:left;
+  position:relative;
+}
+.nav-item svg{ width:17px; height:17px; flex-shrink:0; }
+.nav-item:hover{ background: var(--panel-alt); color: var(--text); }
+.nav-item.active{
+  background: var(--blue-dim);
+  color: var(--blue);
+  font-weight:600;
+  border-left: 2px solid var(--blue);
+}
+/* the active item's icon becomes a lit "node"; a short edge-line
+   ties it back to the sidebar rail, reinforcing the graph motif */
+.nav-item.active::before{
+  content:'';
+  position:absolute; left:-2px; top:50%; width:2px; height:2px;
+  background: var(--blue);
+  border-radius:50%;
+  box-shadow: 0 0 0 3px var(--blue-dim), 0 0 10px var(--blue);
+  transform: translateY(-50%);
+}
+.sidebar-footer{
+  margin-top:auto;
+  padding: 12px 10px;
+  border-top:1px solid var(--border);
+  font-size:11px;
+  font-family: var(--font-mono);
+  color: var(--text-faint);
+}
+.sidebar-collapse-btn{
+  display:flex; align-items:center; gap:10px;
+  padding: 9px 12px 9px 14px;
+  border-radius: var(--radius-sm);
+  color: var(--text-faint);
+  cursor:pointer;
+  font-size: 12.5px;
+  font-weight: 500;
+  border: 1px dashed var(--border);
+  background: transparent;
+  width:100%;
+  text-align:left;
+  margin-top: 10px;
+}
+.sidebar-collapse-btn:hover{ background: var(--panel-alt); color: var(--text-dim); border-color: var(--blue); }
+.sidebar-collapse-btn svg{ width:16px; height:16px; flex-shrink:0; }
+
+/* collapsed state: icon-only rail */
+.app.sidebar-collapsed .sidebar{ padding: 16px 10px; }
+.app.sidebar-collapsed .nav-item,
+.app.sidebar-collapsed .sidebar-collapse-btn{ justify-content:center; padding: 10px; border-left:none; }
+.app.sidebar-collapsed .nav-item.active{ border-left:none; box-shadow: inset 3px 0 0 var(--blue); }
+.app.sidebar-collapsed .nav-item span,
+.app.sidebar-collapsed .sidebar-collapse-btn span,
+.app.sidebar-collapsed .nav-label,
+.app.sidebar-collapsed .sidebar-footer{ display:none; }
+.app.sidebar-collapsed #collapseArrow{ transform-origin:12px 12px; transform: rotate(180deg); }
+
+/* ---------- MAIN ---------- */
+.main{
+  grid-area: main;
+  overflow-y:auto;
+  padding: 24px 28px 40px;
+}
+.page{ display:none; animation: fadein .2s ease; }
+.page.active{ display:block; }
+@keyframes fadein{ from{opacity:0; transform: translateY(4px);} to{opacity:1; transform:none;} }
+
+.page-title{
+  font-family: var(--font-display); font-size: 24px; font-weight: 700; letter-spacing:-0.01em; margin: 0 0 4px;
+  background: linear-gradient(120deg, var(--text) 45%, var(--blue) 120%);
+  -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; color: var(--text);
+}
+.page-sub{ color: var(--text-dim); font-size:13.5px; margin: 0 0 22px; }
+
+/* ============================================================
+   OVERVIEW PAGE
+   ============================================================ */
+/* Hero band: carries the graph-field signature at full strength —
+   the first thing you see echoes the knowledge graph the product
+   is built around. */
+.hero-band{
+  position:relative;
+  overflow:hidden;
+  border-radius: var(--radius);
+  padding: 22px;
+  margin-bottom: 28px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+}
+.hero-band > *:not(.graph-field){ position:relative; z-index:1; }
+
+.stat-grid{
+  display:grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 14px;
+  margin-bottom: 16px;
+}
+.card{
+  background: var(--panel);
+  border:1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  box-shadow: var(--shadow);
+}
+.stat-card{
+  display:flex; flex-direction:column; gap:6px;
+  position:relative;
+  border-top: 2.5px solid var(--stat-accent, var(--blue));
+  transition: transform .16s ease, box-shadow .16s ease;
+  animation: stat-in .4s ease backwards;
+}
+.stat-card:nth-child(1){ animation-delay: 0s; }
+.stat-card:nth-child(2){ animation-delay: .05s; }
+.stat-card:nth-child(3){ animation-delay: .1s; }
+.stat-card:nth-child(4){ animation-delay: .15s; }
+@keyframes stat-in{ from{ opacity:0; transform: translateY(6px); } to{ opacity:1; transform:none; } }
+.stat-card:hover{ transform: translateY(-3px); box-shadow: var(--shadow-lg), 0 0 0 1px color-mix(in srgb, var(--stat-accent, var(--blue)) 30%, transparent); }
+.stat-top{ display:flex; align-items:center; justify-content:space-between; }
+.stat-icon{
+  width:32px; height:32px; border-radius:8px;
+  display:flex; align-items:center; justify-content:center;
+}
+.stat-icon svg{ width:16px; height:16px; }
+.stat-icon.blue{ background: var(--blue-dim); color: var(--blue); }
+.stat-icon.purple{ background: var(--purple-dim); color: var(--purple); }
+.stat-icon.green{ background: var(--green-dim); color: var(--green); }
+.stat-value{ font-family: var(--font-mono); font-size: 27px; font-weight: 700; letter-spacing: -0.02em; }
+.stat-label{ font-size:12.5px; color: var(--text-dim); }
+
+.status-banner{
+  display:flex; align-items:center; gap:10px;
+  background: var(--green-dim);
+  border: 1px solid color-mix(in srgb, var(--green) 30%, transparent);
+  color: var(--green);
+  padding: 11px 16px;
+  border-radius: var(--radius-sm);
+  font-weight:600;
+  font-size: 13px;
+}
+.status-banner svg{ width:16px; height:16px; }
+
+.section-title{ font-family: var(--font-display); font-size:15.5px; font-weight:700; margin: 0 0 14px; }
+.module-grid{
+  display:grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+}
+.module-card{
+  background: var(--panel);
+  border:1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+  box-shadow: var(--shadow);
+  display:flex; flex-direction:column; gap:10px;
+  position:relative; overflow:hidden;
+  transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease;
+}
+.module-card::after{
+  content:''; position:absolute; left:0; right:0; bottom:0; height:3px;
+  background: linear-gradient(90deg, var(--blue), var(--purple));
+  transform: scaleX(0); transform-origin:left; transition: transform .25s ease;
+}
+.module-card:hover{ transform: translateY(-2px); border-color: var(--blue); box-shadow: var(--shadow-lg), 0 0 0 1px var(--blue-dim); }
+.module-card:hover::after{ transform: scaleX(1); }
+.module-icon{
+  width:38px; height:38px; border-radius:10px;
+  display:flex; align-items:center; justify-content:center;
+  background: linear-gradient(135deg, var(--blue-dim), var(--purple-dim)); color: var(--blue);
+  margin-bottom: 4px;
+}
+.module-icon svg{ width:19px; height:19px; }
+.module-card h3{ font-family: var(--font-display); margin:0; font-size:15px; font-weight:700; }
+.module-card p{ margin:0; font-size:12.5px; color: var(--text-dim); line-height:1.5; flex:1; }
+.btn{
+  border:none; cursor:pointer;
+  font-weight:600; font-size:13px;
+  border-radius: var(--radius-sm);
+  padding: 8px 14px;
+  transition: all .15s ease;
+  display:inline-flex; align-items:center; justify-content:center; gap:6px;
+}
+.btn svg{ width:14px; height:14px; }
+.btn-primary{
+  background: linear-gradient(135deg, var(--blue), var(--purple));
+  color:#fff;
+  box-shadow: 0 4px 14px color-mix(in srgb, var(--blue) 35%, transparent);
+}
+.btn-primary:hover{ filter: brightness(1.08); transform: translateY(-1px); }
+.btn-ghost{ background: var(--panel-alt); color: var(--text); border:1px solid var(--border); }
+.btn-ghost:hover{ background: var(--border); }
+.btn-sm{ padding:6px 11px; font-size:12px; }
+.btn-full{ width:100%; }
+
+/* ============================================================
+   CHAT PAGE
+   ============================================================ */
+.chat-shell{
+  display:grid;
+  grid-template-columns: 260px 1fr;
+  gap: 16px;
+  height: calc(100vh - 60px - 48px);
+}
+.conv-panel{
+  background: var(--panel);
+  border:1px solid var(--border);
+  border-radius: var(--radius);
+  display:flex; flex-direction:column;
+  overflow:hidden;
+}
+.conv-panel-head{ padding: 14px; border-bottom:1px solid var(--border); }
+.new-chat-btn{
+  width:100%; padding:9px 12px; border-radius: var(--radius-sm);
+  background: linear-gradient(135deg, var(--blue), var(--purple)); color:#fff; border:none; cursor:pointer;
+  font-weight:600; font-size:13px; display:flex; align-items:center; gap:7px; justify-content:center;
+  box-shadow: 0 4px 14px color-mix(in srgb, var(--blue) 30%, transparent);
+}
+.new-chat-btn svg{ width:15px; height:15px; }
+.new-chat-btn:hover{ filter:brightness(1.08); }
+.conv-list{ overflow-y:auto; padding: 8px; flex:1; }
+.conv-item{
+  padding: 10px 11px;
+  border-radius: var(--radius-sm);
+  cursor:pointer;
+  margin-bottom: 3px;
+  display:flex; align-items:flex-start; justify-content:space-between;
+  gap:6px;
+  border: 1px solid transparent;
+  transition: background .15s ease;
+}
+.conv-item:hover{ background: var(--panel-alt); }
+.conv-item.active{ background: var(--blue-dim); border-color: color-mix(in srgb, var(--blue) 25%, transparent); }
+.conv-item.active .conv-title{ color: var(--blue); }
+.conv-main{ min-width:0; }
+.conv-title{ font-size:13px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.conv-time{ font-size:11px; font-family: var(--font-mono); color: var(--text-faint); margin-top:2px; }
+.conv-menu{ color: var(--text-faint); cursor:pointer; padding:2px; flex-shrink:0; }
+.conv-menu svg{ width:14px; height:14px; }
+
+.chat-main{
+  background: var(--panel);
+  border:1px solid var(--border);
+  border-radius: var(--radius);
+  display:flex; flex-direction:column;
+  overflow:hidden;
+}
+.chat-head{
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+  display:flex; align-items:center; justify-content:space-between;
+}
+.chat-head h3{ font-family: var(--font-display); margin:0; font-size:15px; font-weight:700; }
+.chat-head-badge{
+  font-size:11px; font-weight:600; font-family: var(--font-mono); color: var(--purple);
+  background: var(--purple-dim); padding:4px 9px; border-radius:20px;
+}
+.chat-messages{ flex:1; overflow-y:auto; padding: 20px 22px; display:flex; flex-direction:column; gap:16px; }
+.msg-row{ display:flex; gap:10px; max-width: 78%; }
+.msg-row.user{ align-self:flex-end; flex-direction:row-reverse; }
+.msg-avatar{
+  width:28px; height:28px; border-radius:8px; flex-shrink:0;
+  display:flex; align-items:center; justify-content:center;
+  background: var(--blue-dim); color: var(--blue);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--blue) 25%, transparent);
+}
+.msg-row.user .msg-avatar{ background: var(--purple-dim); color: var(--purple); box-shadow: 0 0 0 1px color-mix(in srgb, var(--purple) 25%, transparent); }
+.msg-avatar svg{ width:15px; height:15px; }
+.msg-bubble{
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+  padding: 11px 14px;
+  border-radius: var(--radius);
+  font-size: 13.5px;
+  line-height: 1.55;
+}
+.msg-row.user .msg-bubble{ background: linear-gradient(135deg, var(--blue), var(--purple)); color:#fff; border-color: transparent; }
+.msg-source{
+  display:flex; align-items:center; gap:5px;
+  font-size:11px; font-family: var(--font-mono); color: var(--text-faint); margin-top:6px;
+}
+.msg-source svg{ width:11px; height:11px; }
+.msg-actions{
+  display:flex; gap:4px; margin-top:6px;
+  opacity:0; transition: opacity .15s ease;
+}
+.msg-row:hover .msg-actions{ opacity:1; }
+.msg-action-btn{
+  width:24px; height:24px; border-radius:6px;
+  display:flex; align-items:center; justify-content:center;
+  border:1px solid var(--border); background: var(--panel);
+  color: var(--text-faint); cursor:pointer;
+}
+.msg-action-btn:hover{ color: var(--blue); border-color: var(--blue); }
+.msg-action-btn svg{ width:12px; height:12px; }
+.typing-indicator{ display:flex; gap:4px; align-items:center; padding: 4px 0; }
+.typing-indicator span{
+  width:6px; height:6px; border-radius:50%; background: var(--text-faint);
+  animation: blink 1.2s infinite ease-in-out;
+}
+.typing-indicator span:nth-child(2){ animation-delay: .2s; }
+.typing-indicator span:nth-child(3){ animation-delay: .4s; }
+@keyframes blink{ 0%,80%,100%{ opacity:.25; } 40%{ opacity:1; } }
+
+.chat-input-bar{
+  padding: 14px 18px;
+  border-top: 1px solid var(--border);
+  display:flex; gap:10px; align-items:center;
+}
+.chat-input-bar input{
+  flex:1;
+  border: 1px solid var(--border);
+  background: var(--panel-alt);
+  border-radius: 24px;
+  padding: 11px 18px;
+  font-size: 13.5px;
+  color: var(--text);
+  outline:none;
+}
+.chat-input-bar input:focus{ border-color: var(--blue); box-shadow: 0 0 0 3px color-mix(in srgb, var(--blue) 14%, transparent); }
+.send-btn{
+  width:40px; height:40px; border-radius:50%;
+  background: linear-gradient(135deg, var(--blue), var(--purple)); color:#fff; border:none; cursor:pointer;
+  display:flex; align-items:center; justify-content:center; flex-shrink:0;
+  box-shadow: 0 4px 14px color-mix(in srgb, var(--blue) 35%, transparent);
+}
+.send-btn svg{ width:17px; height:17px; }
+.send-btn:hover{ filter:brightness(1.08); }
+
+/* ============================================================
+   GRAPH PAGE
+   ============================================================ */
+.graph-controls{
+  display:flex; flex-wrap:wrap; gap:12px; align-items:center;
+  background: var(--panel); border:1px solid var(--border); border-radius: var(--radius);
+  padding: 12px 16px; margin-bottom:16px;
+}
+.view-toggle{ display:flex; border:1px solid var(--border); border-radius: var(--radius-sm); overflow:hidden; }
+.view-toggle button{
+  border:none; background: var(--panel); color: var(--text-dim);
+  padding: 7px 14px; font-size:12.5px; font-weight:600; cursor:pointer;
+}
+.view-toggle button.active{ background: linear-gradient(135deg, var(--blue), var(--purple)); color:#fff; }
+.gc-input{
+  border:1px solid var(--border); background: var(--panel-alt); border-radius: var(--radius-sm);
+  padding: 7px 12px; font-size:12.5px; color: var(--text); outline:none; width:150px;
+}
+.gc-input:focus{ border-color: var(--blue); box-shadow: 0 0 0 3px color-mix(in srgb, var(--blue) 14%, transparent); }
+.gc-divider{ width:1px; height:22px; background: var(--border); }
+.gc-group{ display:flex; align-items:center; gap:6px; }
+
+.graph-shell{ display:grid; grid-template-columns: 280px 1fr; gap:16px; height: calc(100vh - 60px - 48px - 66px); }
+.entity-panel{
+  background: var(--panel); border:1px solid var(--border); border-radius: var(--radius);
+  padding: 18px; overflow-y:auto;
+}
+.entity-panel h4{ margin:0 0 4px; font-size:11px; text-transform:uppercase; letter-spacing:.05em; color: var(--text-faint); font-weight:700; }
+.entity-name{ font-family: var(--font-display); font-size:18px; font-weight:700; margin: 6px 0 2px; }
+.entity-type-badge{
+  display:inline-block; font-size:11px; font-weight:600; font-family: var(--font-mono); color: var(--purple);
+  background: var(--purple-dim); padding:3px 9px; border-radius:20px; margin-bottom:10px;
+}
+.entity-desc{ font-size:12.5px; color: var(--text-dim); line-height:1.5; margin-bottom:18px; }
+.rel-row{
+  display:flex; align-items:center; gap:6px; font-size:12px; padding: 9px 0;
+  border-top: 1px solid var(--border);
+  cursor:pointer;
+  color: var(--text-dim);
+}
+.rel-row:hover{ color: var(--blue); }
+.rel-row svg{ width:12px; height:12px; flex-shrink:0; color: var(--text-faint); }
+.rel-arrow{ color: var(--blue); font-weight:600; font-size:10.5px; font-family: var(--font-mono); }
+
+.graph-canvas-wrap{
+  background: var(--panel); border:1px solid var(--border); border-radius: var(--radius);
+  position:relative; overflow:hidden;
+  background-image: radial-gradient(circle at 1px 1px, var(--border) 1.2px, transparent 1.6px);
+  background-size: 24px 24px;
+}
+.graph-canvas-wrap svg{ width:100%; height:100%; position:relative; z-index:1; }
+.graph-node-circle{ fill: var(--panel-alt); stroke: var(--border); stroke-width:1.6; cursor:pointer; transition: all .15s ease; }
+.graph-node-circle:hover{ stroke: var(--blue); }
+.graph-node-circle.selected{ fill: var(--blue-dim); stroke: var(--blue); stroke-width:2.4; filter: drop-shadow(0 0 7px color-mix(in srgb, var(--blue) 60%, transparent)); }
+.graph-node-circle.dim{ opacity: .25; }
+.graph-node-circle.path{ fill: var(--green-dim); stroke: var(--green); stroke-width:2.4; filter: drop-shadow(0 0 7px color-mix(in srgb, var(--green) 60%, transparent)); }
+.graph-node-label{ font-size:11.5px; font-weight:600; fill: var(--text); pointer-events:none; user-select:none; }
+.graph-node-label.dim{ opacity:.25; }
+.graph-edge{ stroke: var(--border); stroke-width:1.4; }
+.graph-edge.dim{ opacity:.15; }
+.graph-edge.path{ stroke: var(--green); stroke-width:2.6; }
+.graph-edge-label{ font-size:9.5px; font-family: var(--font-mono); fill: var(--text-faint); pointer-events:none; user-select:none; }
+.graph-badge{
+  position:absolute; top:14px; left:14px;
+  font-size:11px; font-weight:600; font-family: var(--font-mono); color: var(--text-dim);
+  background: var(--panel-alt); border:1px solid var(--border);
+  padding: 5px 10px; border-radius:20px;
+}
+.graph-legend{
+  position:absolute; top:14px; right:14px;
+  display:flex; flex-wrap:wrap; gap:6px; justify-content:flex-end;
+  max-width: 55%;
+}
+.legend-chip{
+  display:flex; align-items:center; gap:5px;
+  font-size:10.5px; font-weight:600; color: var(--text-dim);
+  background: var(--panel-alt); border:1px solid var(--border);
+  padding: 3px 8px; border-radius:20px;
+}
+.legend-chip .dot{ width:6px; height:6px; box-shadow:none; }
+.legend-chip .dot::after{ display:none; }
+.graph-toast{
+  position:absolute; bottom:16px; left:50%; transform: translateX(-50%);
+  background: var(--panel-alt); border:1px solid var(--border);
+  padding: 8px 16px; border-radius:20px; font-size:12px; font-weight:600; font-family: var(--font-mono);
+  color: var(--green); display:none; align-items:center; gap:6px;
+  box-shadow: var(--shadow-lg);
+}
+.graph-toast.show{ display:flex; }
+.graph-toast svg{ width:13px; height:13px; }
+.graph-3d-note{
+  position:absolute; inset:0; display:none; align-items:center; justify-content:center;
+  flex-direction:column; gap:10px; background: var(--panel);
+  text-align:center;
+}
+.graph-3d-note.show{ display:flex; }
+.graph-3d-note svg{ width:34px; height:34px; color: var(--purple); }
+.graph-3d-note p{ font-size:13px; color: var(--text-dim); max-width:260px; margin:0; }
+
+/* ============================================================
+   INGEST PAGE
+   ============================================================ */
+.ingest-grid{ display:grid; grid-template-columns: 1fr 1fr; gap:18px; align-items:start; }
+.ingest-card{
+  background: var(--panel); border:1px solid var(--border); border-radius: var(--radius);
+  padding: 22px; box-shadow: var(--shadow);
+}
+.ingest-card h3{ display:flex; align-items:center; gap:9px; margin:0 0 6px; font-size:15px; }
+.ingest-card h3 svg{ width:18px; height:18px; color: var(--blue); }
+.ingest-card > p.desc{ margin:0 0 16px; font-size:12.5px; color: var(--text-dim); }
+
+.dropzone{
+  border: 1.6px dashed var(--border);
+  border-radius: var(--radius);
+  padding: 34px 20px;
+  text-align:center;
+  cursor:pointer;
+  transition: all .15s ease;
+  background: var(--panel-alt);
+}
+.dropzone:hover{ border-color: var(--blue); background: var(--blue-dim); }
+.dropzone svg{ width:30px; height:30px; color: var(--blue); margin-bottom: 8px; }
+.dropzone h4{ margin: 4px 0 2px; font-size:13.5px; font-weight:700; }
+.dropzone p{ margin: 0; font-size:12px; color: var(--text-dim); }
+.dropzone .browse{ color: var(--blue); font-weight:600; }
+.formats-row{ display:flex; gap:6px; flex-wrap:wrap; margin-top:14px; }
+.format-chip{
+  font-size:11px; font-weight:600; font-family: var(--font-mono); color: var(--text-dim);
+  background: var(--panel-alt); border:1px solid var(--border);
+  padding: 4px 9px; border-radius: 6px;
+}
+.upload-progress-wrap{ display:none; margin-top:16px; }
+.upload-progress-wrap.show{ display:block; }
+.upload-file-row{ display:flex; align-items:center; gap:8px; font-size:12.5px; font-weight:600; margin-bottom:8px; }
+.upload-file-row svg{ width:15px; height:15px; color: var(--blue); flex-shrink:0; }
+.progress-track{ height:7px; background: var(--panel-alt); border-radius:10px; overflow:hidden; border:1px solid var(--border); }
+.progress-fill{ height:100%; width:0%; background: linear-gradient(90deg, var(--blue), var(--purple)); transition: width .18s ease; border-radius:10px; }
+.progress-status{ font-size:11.5px; font-family: var(--font-mono); color: var(--text-dim); margin-top:6px; display:flex; align-items:center; gap:5px; }
+.progress-status.done{ color: var(--green); font-weight:600; }
+.progress-status svg{ width:13px; height:13px; }
+
+.crawl-tabs{ display:flex; gap:8px; margin-bottom:14px; }
+.crawl-tab{
+  flex:1; padding: 9px 12px; border-radius: var(--radius-sm);
+  border:1px solid var(--border); background: var(--panel-alt);
+  cursor:pointer; font-size:12.5px; font-weight:600; color: var(--text-dim);
+  text-align:center; transition: all .15s ease;
+}
+.crawl-tab.active{ background: var(--blue-dim); color: var(--blue); border-color: color-mix(in srgb, var(--blue) 35%, transparent); }
+.crawl-panel{ display:none; }
+.crawl-panel.active{ display:block; }
+.crawl-panel p{ font-size:12px; color: var(--text-dim); margin: 0 0 10px; }
+.crawl-input-row{ display:flex; gap:8px; }
+.crawl-input-row input{
+  flex:1; border:1px solid var(--border); background: var(--panel-alt);
+  border-radius: var(--radius-sm); padding: 9px 12px; font-size:12.5px; color: var(--text); outline:none;
+}
+.crawl-input-row input:focus{ border-color: var(--blue); box-shadow: 0 0 0 3px color-mix(in srgb, var(--blue) 14%, transparent); }
+.crawl-status{ margin-top:14px; font-size:12.5px; display:none; }
+.crawl-status.show{ display:block; }
+.crawl-status .label{ display:flex; align-items:center; gap:6px; font-weight:600; color: var(--purple); }
+.crawl-status .label.done{ color: var(--green); }
+.crawl-status .label svg{ width:14px; height:14px; }
+.crawl-stats{ display:grid; grid-template-columns: 1fr 1fr; gap:8px; margin-top:10px; }
+.crawl-stat{ background: var(--panel-alt); border:1px solid var(--border); border-radius:8px; padding:8px 10px; }
+.crawl-stat .n{ font-family: var(--font-mono); font-weight:700; font-size:16px; }
+.crawl-stat .l{ font-size:10.5px; color: var(--text-faint); }
+.spin{ animation: spin 0.9s linear infinite; }
+@keyframes spin{ to{ transform: rotate(360deg); } }
+
+/* ============================================================
+   RESPONSIVE
+   ============================================================ */
+@media (max-width: 1100px){
+  .stat-grid{ grid-template-columns: repeat(2,1fr); }
+  .module-grid{ grid-template-columns: 1fr; }
+  .ingest-grid{ grid-template-columns: 1fr; }
+  .graph-shell{ grid-template-columns: 220px 1fr; }
+}
+@media (max-width: 860px){
+  .app{ grid-template-columns: 72px 1fr; }
+  .nav-item span{ display:none; }
+  .nav-item{ justify-content:center; }
+  .nav-label{ display:none; }
+  .brand{ display:none; }
+  .chat-shell{ grid-template-columns: 1fr; }
+  .conv-panel{ display:none; }
+  .graph-shell{ grid-template-columns: 1fr; height:auto; }
+  .entity-panel{ max-height: 260px; }
+  .graph-canvas-wrap{ height:420px; }
+}
+</style>
+</head>
+<body>
+
+<div class="app">
+
+  <!-- ================= HEADER ================= -->
+  <header class="header">
+    <div class="graph-field" aria-hidden="true">
+      <svg viewBox="0 0 800 60" preserveAspectRatio="none">
+        <g class="gf-drift">
+          <line class="gf-edge" x1="40" y1="20" x2="120" y2="42"/>
+          <line class="gf-edge" x1="120" y1="42" x2="210" y2="15"/>
+          <line class="gf-edge" x1="210" y1="15" x2="300" y2="38"/>
+          <line class="gf-edge" x1="300" y1="38" x2="400" y2="12"/>
+          <line class="gf-edge" x1="400" y1="12" x2="480" y2="45"/>
+          <line class="gf-edge" x1="480" y1="45" x2="570" y2="20"/>
+          <line class="gf-edge" x1="570" y1="20" x2="660" y2="40"/>
+          <line class="gf-edge" x1="660" y1="40" x2="740" y2="15"/>
+          <circle class="gf-node gf-pulse" cx="40" cy="20" r="3"/>
+          <circle class="gf-node alt gf-pulse" cx="120" cy="42" r="3" style="animation-delay:.4s"/>
+          <circle class="gf-node gf-pulse" cx="210" cy="15" r="3" style="animation-delay:.8s"/>
+          <circle class="gf-node alt gf-pulse" cx="300" cy="38" r="3" style="animation-delay:1.2s"/>
+          <circle class="gf-node gf-pulse" cx="400" cy="12" r="3" style="animation-delay:1.6s"/>
+          <circle class="gf-node alt gf-pulse" cx="480" cy="45" r="3" style="animation-delay:2s"/>
+          <circle class="gf-node gf-pulse" cx="570" cy="20" r="3" style="animation-delay:2.4s"/>
+          <circle class="gf-node alt gf-pulse" cx="660" cy="40" r="3" style="animation-delay:2.8s"/>
+          <circle class="gf-node gf-pulse" cx="740" cy="15" r="3" style="animation-delay:3.2s"/>
+        </g>
+      </svg>
+    </div>
+    <div class="header-left">
+      <div class="logo">
+        <svg viewBox="0 0 24 24" fill="none"><circle cx="6" cy="6" r="2.3" fill="currentColor"/><circle cx="18" cy="7" r="2.3" fill="currentColor"/><circle cx="12" cy="18" r="2.3" fill="currentColor"/><circle cx="18" cy="17" r="1.6" fill="currentColor" opacity=".7"/><path d="M7.8 7.2 10.2 16 M16.2 8.2 13 16.3 M8.2 6 16 6.8 M13.5 17.5 16.5 17" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" opacity=".85"/></svg>
+      </div>
+      <div class="brand">AI Customer Assistant</div>
+      <div class="status-pill"><span class="dot"></span> System Online</div>
+    </div>
+    <div class="header-right">
+      <button class="icon-btn" id="themeToggle" title="Toggle theme"></button>
+      <div class="avatar">JS</div>
+    </div>
+  </header>
+
+  <!-- ================= SIDEBAR ================= -->
+  <nav class="sidebar" id="sidebar">
+    <div class="nav-label">Workspace</div>
+    <button class="nav-item active" data-page="overview" onclick="showPage('overview')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>
+      <span>Overview</span>
+    </button>
+    <button class="nav-item" data-page="chat" onclick="showPage('chat')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      <span>Chat</span>
+    </button>
+    <button class="nav-item" data-page="graph" onclick="showPage('graph')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="6" r="2.5"/><circle cx="19" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M7 7.3 10.3 16 M17 7.3 13.7 16 M7.5 6h9"/></svg>
+      <span>Graph</span>
+    </button>
+    <button class="nav-item" data-page="ingest" onclick="showPage('ingest')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-3M17 8l-5-5-5 5M12 3v12"/></svg>
+      <span>Ingest</span>
+    </button>
+    <button class="sidebar-collapse-btn" id="sidebarCollapseBtn" onclick="toggleSidebar()" title="Collapse sidebar">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/><path d="m14 10-2 2 2 2" id="collapseArrow"/></svg>
+      <span>Collapse</span>
+    </button>
+    <div class="sidebar-footer">v1.0 · Prototype</div>
+  </nav>
+
+  <!-- ================= MAIN CONTENT ================= -->
+  <main class="main">
+
+    <!-- ========================================================
+         OVERVIEW PAGE
+         ======================================================== -->
+    <section class="page active" id="page-overview">
+      <h1 class="page-title">Overview</h1>
+      <p class="page-sub">A high-level summary of your AI Customer Assistant workspace.</p>
+
+      <div class="hero-band">
+        <div class="graph-field" aria-hidden="true">
+          <svg viewBox="0 0 900 260" preserveAspectRatio="none">
+            <g class="gf-drift">
+              <line class="gf-edge" x1="60" y1="40" x2="180" y2="90"/>
+              <line class="gf-edge" x1="180" y1="90" x2="120" y2="180"/>
+              <line class="gf-edge" x1="180" y1="90" x2="320" y2="60"/>
+              <line class="gf-edge" x1="320" y1="60" x2="420" y2="150"/>
+              <line class="gf-edge" x1="420" y1="150" x2="300" y2="220"/>
+              <line class="gf-edge" x1="320" y1="60" x2="480" y2="30"/>
+              <line class="gf-edge" x1="480" y1="30" x2="600" y2="100"/>
+              <line class="gf-edge" x1="600" y1="100" x2="560" y2="210"/>
+              <line class="gf-edge" x1="600" y1="100" x2="740" y2="70"/>
+              <line class="gf-edge" x1="740" y1="70" x2="820" y2="160"/>
+              <circle class="gf-node gf-pulse" cx="60" cy="40" r="4"/>
+              <circle class="gf-node alt gf-pulse" cx="180" cy="90" r="5" style="animation-delay:.3s"/>
+              <circle class="gf-node gf-pulse" cx="120" cy="180" r="4" style="animation-delay:.6s"/>
+              <circle class="gf-node alt gf-pulse" cx="320" cy="60" r="5" style="animation-delay:.9s"/>
+              <circle class="gf-node gf-pulse" cx="420" cy="150" r="4" style="animation-delay:1.2s"/>
+              <circle class="gf-node alt gf-pulse" cx="300" cy="220" r="4" style="animation-delay:1.5s"/>
+              <circle class="gf-node gf-pulse" cx="480" cy="30" r="4" style="animation-delay:1.8s"/>
+              <circle class="gf-node alt gf-pulse" cx="600" cy="100" r="5" style="animation-delay:2.1s"/>
+              <circle class="gf-node gf-pulse" cx="560" cy="210" r="4" style="animation-delay:2.4s"/>
+              <circle class="gf-node alt gf-pulse" cx="740" cy="70" r="4" style="animation-delay:2.7s"/>
+              <circle class="gf-node gf-pulse" cx="820" cy="160" r="4" style="animation-delay:3s"/>
+            </g>
+          </svg>
+        </div>
+        <div class="stat-grid">
+          <div class="card stat-card" style="--stat-accent: var(--blue);">
+            <div class="stat-top">
+              <span class="stat-label">Knowledge Sources</span>
+              <div class="stat-icon blue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg></div>
+            </div>
+            <div class="stat-value">124</div>
+            <div class="stat-label">Documents indexed</div>
+          </div>
+          <div class="card stat-card" style="--stat-accent: var(--purple);">
+            <div class="stat-top">
+              <span class="stat-label">Entities</span>
+              <div class="stat-icon purple"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="6" r="3"/><circle cx="5" cy="18" r="3"/><circle cx="19" cy="18" r="3"/><path d="M12 9v4M9 15.5 10.5 13M15 15.5 13.5 13"/></svg></div>
+            </div>
+            <div class="stat-value">2845</div>
+            <div class="stat-label">Entities in knowledge graph</div>
+          </div>
+          <div class="card stat-card" style="--stat-accent: var(--blue);">
+            <div class="stat-top">
+              <span class="stat-label">Relationships</span>
+              <div class="stat-icon blue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M8 8l8 8"/></svg></div>
+            </div>
+            <div class="stat-value">6721</div>
+            <div class="stat-label">Graph relationships</div>
+          </div>
+          <div class="card stat-card" style="--stat-accent: var(--green);">
+            <div class="stat-top">
+              <span class="stat-label">Conversations</span>
+              <div class="stat-icon purple"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+            </div>
+            <div class="stat-value">348</div>
+            <div class="stat-label">Total conversations</div>
+          </div>
+        </div>
+
+        <div class="status-banner">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 12 2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg>
+          All systems operational
+        </div>
+      </div>
+
+      <h2 class="section-title">Modules</h2>
+      <div class="module-grid">
+        <div class="module-card">
+          <div class="module-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+          <h3>Chat</h3>
+          <p>Ask questions and interact with the AI Customer Assistant.</p>
+          <button class="btn btn-primary btn-full" onclick="showPage('chat')">Open</button>
+        </div>
+        <div class="module-card">
+          <div class="module-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="6" r="2.5"/><circle cx="19" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M7 7.3 10.3 16 M17 7.3 13.7 16 M7.5 6h9"/></svg></div>
+          <h3>Knowledge Graph</h3>
+          <p>Explore entities and relationships visually.</p>
+          <button class="btn btn-primary btn-full" onclick="showPage('graph')">Open</button>
+        </div>
+        <div class="module-card">
+          <div class="module-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-3M17 8l-5-5-5 5M12 3v12"/></svg></div>
+          <h3>Data Ingestion</h3>
+          <p>Upload documents or crawl web content into the knowledge base.</p>
+          <button class="btn btn-primary btn-full" onclick="showPage('ingest')">Open</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========================================================
+         CHAT PAGE
+         ======================================================== -->
+    <section class="page" id="page-chat">
+      <h1 class="page-title">Chat</h1>
+      <p class="page-sub">Interact with the AI Customer Assistant across your conversations.</p>
+
+      <div class="chat-shell">
+        <!-- Conversation list -->
+        <div class="conv-panel">
+          <div class="conv-panel-head">
+            <button class="new-chat-btn" onclick="newChat()">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+              New Chat
+            </button>
+          </div>
+          <div class="conv-list" id="convList"></div>
+        </div>
+
+        <!-- Active chat -->
+        <div class="chat-main">
+          <div class="chat-head">
+            <h3 id="chatHeadTitle">Project Alpha Status</h3>
+            <span class="chat-head-badge">AI Assistant</span>
+          </div>
+          <div class="chat-messages" id="chatMessages"></div>
+          <div class="chat-input-bar">
+            <input type="text" id="chatInput" placeholder="Type a message..." onkeydown="if(event.key==='Enter')sendMessage();">
+            <button class="send-btn" onclick="sendMessage()">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========================================================
+         GRAPH PAGE
+         ======================================================== -->
+    <section class="page" id="page-graph">
+      <h1 class="page-title">Knowledge Graph</h1>
+      <p class="page-sub">Explore entities and relationships in the knowledge base.</p>
+
+      <div class="graph-controls">
+        <div class="view-toggle">
+          <button class="active" id="view2d" onclick="setGraphView('2d')">2D</button>
+          <button id="view3d" onclick="setGraphView('3d')">3D</button>
+        </div>
+        <div class="gc-divider"></div>
+        <input class="gc-input" id="entitySearch" placeholder="Search entities..." oninput="searchEntities()">
+        <div class="gc-divider"></div>
+        <div class="gc-group">
+          <input class="gc-input" id="fromEntity" placeholder="From entity">
+          <input class="gc-input" id="toEntity" placeholder="To entity">
+          <button class="btn btn-primary btn-sm" onclick="findPath()">Find Path</button>
+        </div>
+        <div class="gc-divider"></div>
+        <button class="btn btn-ghost btn-sm" onclick="clearGraph()">Clear</button>
+      </div>
+
+      <div class="graph-shell">
+        <div class="entity-panel">
+          <h4>Entity Details</h4>
+          <div class="entity-name" id="entityName">Project Alpha</div>
+          <div class="entity-type-badge" id="entityType">Project</div>
+          <div class="entity-desc" id="entityDesc">Customer onboarding automation project.</div>
+          <h4>Connected Entities</h4>
+          <div id="relList"></div>
+        </div>
+        <div class="graph-canvas-wrap">
+          <div class="graph-badge" id="graphBadge">7 entities · 8 relationships</div>
+          <div class="graph-legend" id="graphLegend"></div>
+          <svg id="graphSvg" viewBox="0 0 640 480" preserveAspectRatio="xMidYMid meet"></svg>
+          <div class="graph-toast" id="graphToast">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 12 2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg>
+            <span id="graphToastText">Path found</span>
+          </div>
+          <div class="graph-3d-note" id="graph3dNote">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5M12 22V12"/></svg>
+            <strong>3D graph visualization enabled</strong>
+            <p>Rotate, zoom and pan through the knowledge graph in three dimensions. (Simulated preview)</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========================================================
+         INGEST PAGE
+         ======================================================== -->
+    <section class="page" id="page-ingest">
+      <h1 class="page-title">Knowledge Ingestion</h1>
+      <p class="page-sub">Add documents and web content to the AI Customer Assistant knowledge base.</p>
+
+      <div class="ingest-grid">
+        <!-- Upload -->
+        <div class="ingest-card">
+          <h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-3M17 8l-5-5-5 5M12 3v12"/></svg> Upload File</h3>
+          <p class="desc">Add documents directly from your device.</p>
+          <div class="dropzone" onclick="document.getElementById('fileInput').click()">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-3M17 8l-5-5-5 5M12 3v12"/></svg>
+            <h4>Drag &amp; drop your file here</h4>
+            <p>or <span class="browse">browse files</span></p>
+          </div>
+          <input type="file" id="fileInput" style="display:none" onchange="simulateUpload(this.files[0])">
+          <div class="formats-row">
+            <span class="format-chip">PDF</span>
+            <span class="format-chip">DOCX</span>
+            <span class="format-chip">TXT</span>
+            <span class="format-chip">CSV</span>
+            <span class="format-chip">JSON</span>
+          </div>
+          <div class="upload-progress-wrap" id="uploadProgressWrap">
+            <div class="upload-file-row">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
+              <span id="uploadFileName">project_document.pdf</span>
+            </div>
+            <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+            <div class="progress-status" id="progressStatus">Uploading... 0%</div>
+          </div>
+        </div>
+
+        <!-- Crawl -->
+        <div class="ingest-card">
+          <h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15 15 0 0 1 0 20 15 15 0 0 1 0-20Z"/></svg> Crawl URL</h3>
+          <p class="desc">Extract knowledge from web pages and websites.</p>
+
+          <div class="crawl-tabs">
+            <div class="crawl-tab active" id="tabWebpage" onclick="setCrawlTab('webpage')">Webpage</div>
+            <div class="crawl-tab" id="tabWebsite" onclick="setCrawlTab('website')">Website</div>
+          </div>
+
+          <div class="crawl-panel active" id="panelWebpage">
+            <p>Crawl a single webpage and extract its content.</p>
+            <div class="crawl-input-row">
+              <input type="text" id="urlWebpage" placeholder="https://example.com/page">
+              <button class="btn btn-primary" onclick="simulateCrawl('webpage')">Start Crawl</button>
+            </div>
+          </div>
+
+          <div class="crawl-panel" id="panelWebsite">
+            <p>Discover and crawl multiple pages from a website.</p>
+            <div class="crawl-input-row">
+              <input type="text" id="urlWebsite" placeholder="https://example.com">
+              <button class="btn btn-primary" onclick="simulateCrawl('website')">Start Website Crawl</button>
+            </div>
+          </div>
+
+          <div class="crawl-status" id="crawlStatus">
+            <div class="label" id="crawlLabel">
+              <svg class="spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+              <span id="crawlLabelText">Crawling...</span>
+            </div>
+            <div class="crawl-stats" id="crawlStats" style="display:none;">
+              <div class="crawl-stat"><div class="n" id="statPages">0</div><div class="l">Pages processed</div></div>
+              <div class="crawl-stat"><div class="n" id="statDocs">0</div><div class="l">Documents created</div></div>
+              <div class="crawl-stat"><div class="n" id="statChunks">0</div><div class="l">Chunks generated</div></div>
+              <div class="crawl-stat"><div class="n" id="statEntities">0</div><div class="l">Entities extracted</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<script>
+/* ============================================================
+   ICONS
+   ============================================================ */
+lucide.createIcons();
+
+/* ============================================================
+   THEME
+   ============================================================ */
+function themeIcon(theme){
+  return theme === 'dark'
+    ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>'
+    : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8Z"/></svg>';
+}
+function applyTheme(theme){
+  document.documentElement.setAttribute('data-theme', theme);
+  document.getElementById('themeToggle').innerHTML = themeIcon(theme);
+  localStorage.setItem('aica-theme', theme);
+}
+function switchTheme(){
+  const current = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
+  applyTheme(current === 'dark' ? 'light' : 'dark');
+}
+document.getElementById('themeToggle').addEventListener('click', switchTheme);
+applyTheme(localStorage.getItem('aica-theme') || 'light');
+
+/* ============================================================
+   PAGE NAVIGATION
+   ============================================================ */
+function showPage(name){
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.getElementById('page-' + name).classList.add('active');
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.page === name));
+}
+
+/* ============================================================
+   SIDEBAR COLLAPSE
+   ============================================================ */
+function toggleSidebar(){
+  const collapsed = document.querySelector('.app').classList.toggle('sidebar-collapsed');
+  localStorage.setItem('aica-sidebar-collapsed', collapsed ? '1' : '0');
+}
+if(localStorage.getItem('aica-sidebar-collapsed') === '1'){
+  document.querySelector('.app').classList.add('sidebar-collapsed');
+}
+
+/* ============================================================
+   NOTIFICATIONS
+   ============================================================ */
+function toggleNotifications(){
+  document.getElementById('notifDropdown').classList.toggle('show');
+}
+document.addEventListener('click', (e) => {
+  const wrap = document.querySelector('.notif-wrap');
+  if(wrap && !wrap.contains(e.target)) document.getElementById('notifDropdown').classList.remove('show');
+});
+
+/* ============================================================
+   CHAT PAGE LOGIC
+   ============================================================ */
+const conversations = [
+  { id: 1, title: 'Project Alpha Status', time: '2m ago', messages: [
+      { role:'user', text:'What is the current status of Project Alpha?' },
+      { role:'assistant', text:'Project Alpha is currently in progress. The latest knowledge base information indicates that the project is approximately 75% complete.', source:'Source: Project Alpha — Status Report' }
+  ]},
+  { id: 2, title: 'Customer Support Query', time: '1h ago', messages: [
+      { role:'user', text:'A customer is asking about refund policy timelines.' },
+      { role:'assistant', text:'Refunds are typically processed within 5-7 business days after the request is approved, based on our support documentation.', source:'Source: Support Policy Handbook' }
+  ]},
+  { id: 3, title: 'Product Information', time: '3h ago', messages: [
+      { role:'user', text:'Can you summarize the key features of the API Service?' },
+      { role:'assistant', text:'The API Service provides authentication, data synchronization, and webhook support for connected applications.', source:'Source: API Service Overview' }
+  ]},
+  { id: 4, title: 'Knowledge Base Search', time: 'Yesterday', messages: [
+      { role:'user', text:'Search the knowledge base for onboarding documentation.' },
+      { role:'assistant', text:'I found three relevant documents covering onboarding steps, account setup, and integration checklists.', source:'Source: Knowledge Base Index' }
+  ]},
+  { id: 5, title: 'Recent Conversation', time: '2 days ago', messages: [
+      { role:'user', text:'What entities are linked to the Development Team?' },
+      { role:'assistant', text:'The Development Team is connected to Project Alpha, the API Service, and related Documentation entities.', source:'Source: Knowledge Graph' }
+  ]}
+];
+let activeConvId = 1;
+let newChatCounter = 0;
+
+function renderConvList(){
+  const list = document.getElementById('convList');
+  list.innerHTML = '';
+  conversations.forEach(c => {
+    const div = document.createElement('div');
+    div.className = 'conv-item' + (c.id === activeConvId ? ' active' : '');
+    div.onclick = () => selectConversation(c.id);
+    div.innerHTML = `
+      <div class="conv-main">
+        <div class="conv-title">${c.title}</div>
+        <div class="conv-time">${c.time}</div>
+      </div>
+      <div class="conv-menu">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/></svg>
+      </div>`;
+    list.appendChild(div);
+  });
+}
+
+function selectConversation(id){
+  activeConvId = id;
+  renderConvList();
+  renderChatMessages();
+  const conv = conversations.find(c => c.id === id);
+  document.getElementById('chatHeadTitle').textContent = conv.title;
+}
+
+function renderChatMessages(){
+  const conv = conversations.find(c => c.id === activeConvId);
+  const wrap = document.getElementById('chatMessages');
+  wrap.innerHTML = '';
+  conv.messages.forEach(m => wrap.appendChild(buildMessageEl(m)));
+  wrap.scrollTop = wrap.scrollHeight;
+}
+
+function buildMessageEl(m){
+  const row = document.createElement('div');
+  row.className = 'msg-row ' + (m.role === 'user' ? 'user' : 'assistant');
+  const avatarIcon = m.role === 'user'
+    ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 4-6 8-6s8 2 8 6"/></svg>'
+    : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a4 4 0 0 1 4 4c0 1.5-.8 2.7-2 3.4V11h2a4 4 0 0 1 4 4v1a4 4 0 0 1-4 4h-.5a2.5 2.5 0 0 1-5 0H10a2.5 2.5 0 0 1-5 0H4a4 4 0 0 1-4-4v-1a4 4 0 0 1 4-4h2V9.4C4.8 8.7 4 7.5 4 6a4 4 0 0 1 8-4z"/></svg>';
+  const actions = m.role === 'assistant'
+    ? `<div class="msg-actions">
+        <button class="msg-action-btn" title="Copy" onclick="copyMessage(this)" data-text="${m.text.replace(/"/g,'&quot;')}">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+        </button>
+        <button class="msg-action-btn" title="Regenerate" onclick="regenerateMessage(this)">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6"/></svg>
+        </button>
+      </div>`
+    : '';
+  row.innerHTML = `
+    <div class="msg-avatar">${avatarIcon}</div>
+    <div>
+      <div class="msg-bubble">${m.text}</div>
+      ${m.source ? `<div class="msg-source"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg> ${m.source}</div>` : ''}
+      ${actions}
+    </div>`;
+  return row;
+}
+
+function copyMessage(btn){
+  const text = btn.getAttribute('data-text');
+  navigator.clipboard?.writeText(text).catch(()=>{});
+  const original = btn.innerHTML;
+  btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 12 2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg>';
+  setTimeout(() => btn.innerHTML = original, 1200);
+}
+function regenerateMessage(btn){
+  const bubble = btn.closest('div').previousElementSibling;
+  if(bubble) bubble.innerHTML = '<div class="typing-indicator"><span></span><span></span><span></span></div>';
+  setTimeout(() => {
+    if(bubble) bubble.textContent = 'Here is an alternative response based on the same knowledge sources, rephrased for clarity.';
+  }, 900);
+}
+
+function newChat(){
+  newChatCounter++;
+  const id = 100 + newChatCounter;
+  const conv = { id, title: 'New Chat ' + newChatCounter, time: 'Just now', messages: [] };
+  conversations.unshift(conv);
+  selectConversation(id);
+}
+
+function sendMessage(){
+  const input = document.getElementById('chatInput');
+  const text = input.value.trim();
+  if(!text) return;
+  const conv = conversations.find(c => c.id === activeConvId);
+  conv.messages.push({ role:'user', text });
+  input.value = '';
+  renderChatMessages();
+
+  // typing indicator
+  const wrap = document.getElementById('chatMessages');
+  const typingRow = document.createElement('div');
+  typingRow.className = 'msg-row assistant';
+  typingRow.id = 'typingRow';
+  typingRow.innerHTML = `
+    <div class="msg-avatar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a4 4 0 0 1 4 4c0 1.5-.8 2.7-2 3.4V11h2a4 4 0 0 1 4 4v1a4 4 0 0 1-4 4h-.5a2.5 2.5 0 0 1-5 0H10a2.5 2.5 0 0 1-5 0H4a4 4 0 0 1-4-4v-1a4 4 0 0 1 4-4h2V9.4C4.8 8.7 4 7.5 4 6a4 4 0 0 1 8-4z"/></svg></div>
+    <div class="msg-bubble"><div class="typing-indicator"><span></span><span></span><span></span></div></div>`;
+  wrap.appendChild(typingRow);
+  wrap.scrollTop = wrap.scrollHeight;
+
+  setTimeout(() => {
+    const row = document.getElementById('typingRow');
+    if(row) row.querySelector('.msg-bubble').innerHTML = "I'm analyzing the available knowledge sources to find the most relevant information.";
+  }, 700);
+
+  setTimeout(() => {
+    const row = document.getElementById('typingRow');
+    if(row) row.remove();
+    conv.messages.push({ role:'assistant', text:'Based on the current knowledge base, here is the relevant information...', source:'Source: Knowledge Base' });
+    renderChatMessages();
+  }, 1900);
+}
+
+renderConvList();
+renderChatMessages();
+
+/* ============================================================
+   GRAPH PAGE LOGIC
+   ============================================================ */
+const graphNodes = {
+  'Project Alpha':      { x: 320, y: 240, type:'Project',      desc:'Customer onboarding automation project.' },
+  'Customer Portal':    { x: 130, y: 120, type:'Application',  desc:'Self-service portal used by customers to manage their accounts.' },
+  'API Service':        { x: 500, y: 120, type:'Service',      desc:'Core service providing authentication and data sync via API.' },
+  'Development Team':   { x: 500, y: 360, type:'Team',         desc:'Engineering team responsible for building and maintaining Project Alpha.' },
+  'Project Manager':    { x: 130, y: 360, type:'Person',       desc:'Oversees planning, scheduling and delivery of Project Alpha.' },
+  'Documentation':      { x: 320, y: 420, type:'Resource',     desc:'Reference documentation describing the system and its workflows.' },
+  'Customer':           { x: 320, y: 60,  type:'Person',       desc:'End user interacting with the Customer Portal and support channels.' }
+};
+const graphEdges = [
+  { from:'Project Alpha', to:'Project Manager', label:'managed_by' },
+  { from:'Project Alpha', to:'API Service', label:'uses' },
+  { from:'Project Alpha', to:'Documentation', label:'documented_in' },
+  { from:'Project Alpha', to:'Development Team', label:'built_by' },
+  { from:'Project Alpha', to:'Customer Portal', label:'includes' },
+  { from:'Customer Portal', to:'Customer', label:'used_by' },
+  { from:'Development Team', to:'API Service', label:'maintains' },
+  { from:'Project Manager', to:'Development Team', label:'leads' }
+];
+
+let selectedEntity = 'Project Alpha';
+let pathHighlight = null;
+
+// Each entity type gets a consistent accent color, used both as a small
+// dot on every node and in the legend — turns the graph from a plain
+// node map into something that communicates structure at a glance.
+const typeColors = {
+  'Project':     'var(--blue)',
+  'Application': 'var(--purple)',
+  'Service':     'var(--green)',
+  'Team':        '#8a6fd8',
+  'Person':      '#c85a7a',
+  'Resource':    '#5a8fc8'
+};
+
+function renderLegend(){
+  const usedTypes = [...new Set(Object.values(graphNodes).map(n => n.type))];
+  const legend = document.getElementById('graphLegend');
+  legend.innerHTML = usedTypes.map(t =>
+    `<span class="legend-chip"><span class="dot" style="background:${typeColors[t] || 'var(--text-faint)'}"></span>${t}</span>`
+  ).join('');
+}
+
+function renderGraph(){
+  const svg = document.getElementById('graphSvg');
+  svg.innerHTML = '';
+  const searchTerm = document.getElementById('entitySearch').value.trim().toLowerCase();
+  const hasSearch = searchTerm.length > 0;
+
+  // edges
+  graphEdges.forEach(e => {
+    const a = graphNodes[e.from], b = graphNodes[e.to];
+    const inPath = pathHighlight && isEdgeInPath(e);
+    const dim = hasSearch && !(e.from.toLowerCase().includes(searchTerm) || e.to.toLowerCase().includes(searchTerm));
+    const line = document.createElementNS('http://www.w3.org/2000/svg','line');
+    line.setAttribute('x1', a.x); line.setAttribute('y1', a.y);
+    line.setAttribute('x2', b.x); line.setAttribute('y2', b.y);
+    line.setAttribute('class', 'graph-edge' + (inPath ? ' path' : '') + (dim && !inPath ? ' dim' : ''));
+    svg.appendChild(line);
+
+    const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+    const text = document.createElementNS('http://www.w3.org/2000/svg','text');
+    text.setAttribute('x', mx); text.setAttribute('y', my - 4);
+    text.setAttribute('text-anchor','middle');
+    text.setAttribute('class','graph-edge-label');
+    text.textContent = e.label;
+    svg.appendChild(text);
+  });
+
+  // nodes
+  Object.keys(graphNodes).forEach(name => {
+    const n = graphNodes[name];
+    const isSelected = name === selectedEntity;
+    const inPath = pathHighlight && pathHighlight.includes(name);
+    const dim = hasSearch && !name.toLowerCase().includes(searchTerm);
+
+    const g = document.createElementNS('http://www.w3.org/2000/svg','g');
+    g.style.cursor = 'pointer';
+    g.onclick = () => selectEntity(name);
+
+    const circle = document.createElementNS('http://www.w3.org/2000/svg','circle');
+    circle.setAttribute('cx', n.x); circle.setAttribute('cy', n.y); circle.setAttribute('r', 30);
+    let cls = 'graph-node-circle';
+    if(inPath) cls += ' path'; else if(isSelected) cls += ' selected';
+    if(dim && !inPath) cls += ' dim';
+    circle.setAttribute('class', cls);
+    g.appendChild(circle);
+
+    // small type-color dot pinned to the node, tying it to the legend
+    const typeDot = document.createElementNS('http://www.w3.org/2000/svg','circle');
+    typeDot.setAttribute('cx', n.x + 21); typeDot.setAttribute('cy', n.y - 21); typeDot.setAttribute('r', 5);
+    typeDot.setAttribute('fill', typeColors[n.type] || 'var(--text-faint)');
+    typeDot.setAttribute('stroke', 'var(--panel)');
+    typeDot.setAttribute('stroke-width', '2');
+    if(dim && !inPath) typeDot.setAttribute('opacity', '.25');
+    g.appendChild(typeDot);
+
+    const label = document.createElementNS('http://www.w3.org/2000/svg','text');
+    label.setAttribute('x', n.x); label.setAttribute('y', n.y + 46);
+    label.setAttribute('text-anchor','middle');
+    label.setAttribute('class', 'graph-node-label' + (dim && !inPath ? ' dim' : ''));
+    label.textContent = name;
+    g.appendChild(label);
+
+    svg.appendChild(g);
+  });
+
+  document.getElementById('graphBadge').textContent = Object.keys(graphNodes).length + ' entities · ' + graphEdges.length + ' relationships';
+  renderLegend();
+}
+
+function isEdgeInPath(e){
+  if(!pathHighlight) return false;
+  for(let i=0;i<pathHighlight.length-1;i++){
+    if((pathHighlight[i]===e.from && pathHighlight[i+1]===e.to) || (pathHighlight[i]===e.to && pathHighlight[i+1]===e.from)) return true;
+  }
+  return false;
+}
+
+function selectEntity(name){
+  selectedEntity = name;
+  pathHighlight = null;
+  updateEntityPanel(name);
+  renderGraph();
+}
+
+function updateEntityPanel(name){
+  const n = graphNodes[name];
+  document.getElementById('entityName').textContent = name;
+  const typeEl = document.getElementById('entityType');
+  typeEl.textContent = n.type;
+  const c = typeColors[n.type] || 'var(--text-faint)';
+  typeEl.style.color = c;
+  typeEl.style.background = 'color-mix(in srgb, ' + c + ' 16%, transparent)';
+  document.getElementById('entityDesc').textContent = n.desc;
+
+  const rels = graphEdges.filter(e => e.from === name || e.to === name);
+  const relList = document.getElementById('relList');
+  relList.innerHTML = '';
+  rels.forEach(e => {
+    const other = e.from === name ? e.to : e.from;
+    const row = document.createElement('div');
+    row.className = 'rel-row';
+    row.onclick = () => selectEntity(other);
+    row.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="M8 8l8 8"/></svg>
+      <span>${name}</span> <span class="rel-arrow">→ ${e.label} →</span> <span>${other}</span>`;
+    relList.appendChild(row);
+  });
+  if(rels.length === 0){
+    relList.innerHTML = '<div class="rel-row" style="cursor:default;">No connected entities.</div>';
+  }
+}
+
+function searchEntities(){
+  renderGraph();
+}
+
+function findPath(){
+  const from = document.getElementById('fromEntity').value.trim();
+  const to = document.getElementById('toEntity').value.trim();
+  const toast = document.getElementById('graphToast');
+  const toastText = document.getElementById('graphToastText');
+
+  const matchName = (val) => Object.keys(graphNodes).find(n => n.toLowerCase() === val.toLowerCase());
+  let fromNode = matchName(from) || 'Customer';
+  let toNode = matchName(to) || 'API Service';
+
+  // simple simulated path through Project Alpha as hub
+  let path;
+  if(fromNode === toNode){
+    path = [fromNode];
+  } else if(fromNode === 'Project Alpha' || toNode === 'Project Alpha'){
+    path = [fromNode, 'Project Alpha', toNode].filter((v,i,a)=>a.indexOf(v)===i);
+  } else {
+    path = [fromNode, 'Project Alpha', toNode];
+  }
+  pathHighlight = path;
+  renderGraph();
+
+  toastText.textContent = 'Path found: ' + path.join(' → ');
+  toast.classList.add('show');
+  clearTimeout(window._toastTimer);
+  window._toastTimer = setTimeout(() => toast.classList.remove('show'), 3500);
+}
+
+function clearGraph(){
+  document.getElementById('entitySearch').value = '';
+  document.getElementById('fromEntity').value = '';
+  document.getElementById('toEntity').value = '';
+  pathHighlight = null;
+  selectedEntity = 'Project Alpha';
+  updateEntityPanel(selectedEntity);
+  renderGraph();
+  document.getElementById('graphToast').classList.remove('show');
+}
+
+function setGraphView(mode){
+  document.getElementById('view2d').classList.toggle('active', mode === '2d');
+  document.getElementById('view3d').classList.toggle('active', mode === '3d');
+  document.getElementById('graph3dNote').classList.toggle('show', mode === '3d');
+}
+
+updateEntityPanel(selectedEntity);
+renderGraph();
+
+/* ============================================================
+   INGEST PAGE LOGIC
+   ============================================================ */
+function simulateUpload(file){
+  const name = file ? file.name : 'project_document.pdf';
+  document.getElementById('uploadFileName').textContent = name;
+  document.getElementById('uploadProgressWrap').classList.add('show');
+  const fill = document.getElementById('progressFill');
+  const status = document.getElementById('progressStatus');
+  status.classList.remove('done');
+  fill.style.width = '0%';
+
+  let progress = 0;
+  const interval = setInterval(() => {
+    progress += Math.random() * 18 + 8;
+    if(progress >= 100){
+      progress = 100;
+      clearInterval(interval);
+      fill.style.width = '100%';
+      status.classList.add('done');
+      status.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 12 2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg> Successfully uploaded';
+      return;
+    }
+    fill.style.width = progress + '%';
+    status.textContent = 'Uploading... ' + Math.round(progress) + '%';
+  }, 260);
+}
+
+function setCrawlTab(tab){
+  document.getElementById('tabWebpage').classList.toggle('active', tab === 'webpage');
+  document.getElementById('tabWebsite').classList.toggle('active', tab === 'website');
+  document.getElementById('panelWebpage').classList.toggle('active', tab === 'webpage');
+  document.getElementById('panelWebsite').classList.toggle('active', tab === 'website');
+  document.getElementById('crawlStatus').classList.remove('show');
+}
+
+function simulateCrawl(mode){
+  const statusWrap = document.getElementById('crawlStatus');
+  const label = document.getElementById('crawlLabel');
+  const labelText = document.getElementById('crawlLabelText');
+  const statsWrap = document.getElementById('crawlStats');
+
+  statusWrap.classList.add('show');
+  statsWrap.style.display = 'none';
+  label.classList.remove('done');
+  label.innerHTML = '<svg class="spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg><span>Crawling...</span>';
+
+  setTimeout(() => {
+    label.classList.add('done');
+    label.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m9 12 2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg><span>Crawl completed</span>';
+
+    const pages = mode === 'website' ? Math.floor(Math.random()*30+12) : 1;
+    const docs = mode === 'website' ? pages : 1;
+    const chunks = docs * Math.floor(Math.random()*14+6);
+    const entities = Math.floor(chunks * (Math.random()*1.4+0.6));
+
+    document.getElementById('statPages').textContent = pages;
+    document.getElementById('statDocs').textContent = docs;
+    document.getElementById('statChunks').textContent = chunks;
+    document.getElementById('statEntities').textContent = entities;
+    statsWrap.style.display = 'grid';
+  }, 1800);
+}
+
+/* ============================================================
+   STAT COUNT-UP (one-time entrance motion on the Overview hero)
+   ============================================================ */
+function animateStatValues(){
+  document.querySelectorAll('.stat-value').forEach(el => {
+    const target = parseInt(el.textContent.replace(/[^0-9]/g,''), 10);
+    if(isNaN(target)) return;
+    const start = performance.now();
+    const dur = 900;
+    function tick(t){
+      const p = Math.min((t - start) / dur, 1);
+      const eased = 1 - Math.pow(1 - p, 3);
+      el.textContent = Math.round(target * eased).toLocaleString();
+      if(p < 1) requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  });
+}
+animateStatValues();
+</script>
+</body>
+</html>

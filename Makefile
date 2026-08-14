@@ -97,5 +97,5 @@ backend:
 trunc:
 	docker exec -i ai-customer-assistant-postgres psql -U ai_assistant -d ai_customer_assistant -c "TRUNCATE TABLE value, attribute, relation, entity, knowledge_source_entity_map, embedding_chunk, knowledge_injection_job, knowledge_source_version, knowledge_source, knowledge_category, app_user RESTART IDENTITY CASCADE;"
 
-make user:
+user:
 	docker exec -i ai-customer-assistant-postgres psql -U ai_assistant -d ai_customer_assistant -c "INSERT INTO app_user (id, email, is_service_account) VALUES ('00000000-0000-0000-0000-000000000000','admin@admin.com', True);"

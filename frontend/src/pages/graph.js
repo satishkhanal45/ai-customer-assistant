@@ -1,6 +1,5 @@
-/* Unified knowledge-graph explorer — 2D/3D force-graph, ported from
-   graph_viewer_3d.html into the app shell, with value search, type filters,
-   export, deep-linking, stats and shortcuts. */
+/* Unified knowledge-graph explorer — 2D/3D force-graph, with value search,
+   type filters, export, deep-linking, stats and shortcuts. */
 (function (NS) {
   'use strict';
 
@@ -14,7 +13,7 @@
   var roots = {};
 
   function cssVar(name, fb) { return NS.utils.cssVar(name, fb); }
-  function highlightColor() { return cssVar('--accent', '#5b8def'); }
+  function highlightColor() { return cssVar('--accent', '#3b5bfd'); }
   function textColor() { return cssVar('--text', '#e8eaed'); }
   function borderColor() { return cssVar('--border', 'rgba(255,255,255,.2)'); }
 
@@ -30,16 +29,23 @@
 
   function init(container) {
     container.innerHTML = '';
-    container.style.display = 'flex';
-    container.style.minHeight = '0';
+    container.style.padding = '0';
+
+    var toolbar = NS.utils.el('div', { class: 'graph-controls' });
+    container.appendChild(toolbar);
+    buildToolbar(toolbar);
+
+    var shell = NS.utils.el('div', { class: 'graph-shell' });
+    container.appendChild(shell);
+
+    var sidePanel = NS.utils.el('aside', { class: 'side-panel' });
+    var canvasWrap = NS.utils.el('div', { class: 'graph-canvas-wrap' });
+    shell.appendChild(sidePanel);
+    shell.appendChild(canvasWrap);
 
     var viewport = NS.utils.el('div', { class: 'graph-viewport' });
-    var sidebar = NS.utils.el('aside', { class: 'sidebar' });
-    container.appendChild(viewport);
-    container.appendChild(sidebar);
+    canvasWrap.appendChild(viewport);
 
-    var toolbar = NS.utils.el('div', { class: 'graph-toolbar' });
-    viewport.appendChild(toolbar);
     var views = NS.utils.el('div', { class: 'graph-views' });
     var view2d = NS.utils.el('div', { class: 'gv', id: 'view2d' });
     var view3d = NS.utils.el('div', { class: 'gv hidden', id: 'view3d' });
@@ -61,14 +67,12 @@
     roots.banner = NS.utils.el('div', { class: 'graph-banner' });
     viewport.appendChild(roots.banner);
 
-    roots.sidebar = sidebar;
-    sidebar.innerHTML =
-      '<section><h2>Entity detail</h2><div class="card" id="detail"><div class="hint">Click a node to inspect it.</div></div></section>' +
-      '<section><h2>Legend / filters</h2><div class="card" id="legend"><div class="hint">Load a graph to see types.</div></div></section>' +
-      '<section><h2>Stats</h2><div class="card" id="stats"><div class="hint">—</div></div></section>' +
-      '<section><h2>Interactions</h2><div class="hint">• Search a node to seed the graph.<br>• <b>Click</b> a node: details + expand.<br>• 2D: drag nodes, scroll zoom.<br>• 3D: drag orbit, scroll zoom.<br>• Path A/B → Find path (gold).<br>• <b>e</b> export · <b>f</b> fit · <b>Esc</b> deselect.</div></section>';
-
-    buildToolbar(toolbar);
+    roots.sidebar = sidePanel;
+    sidePanel.innerHTML =
+      '<section><h4>Entity Details</h4><div id="detail"><div class="hint">Click a node to inspect it.</div></div></section>' +
+      '<section><h4>Legend / Filters</h4><div id="legend"><div class="hint">Load a graph to see types.</div></div></section>' +
+      '<section><h4>Stats</h4><div id="stats"><div class="hint">—</div></div></section>' +
+      '<section><div class="hint">• Search a node to seed the graph.<br>• <b>Click</b> a node: details + expand.<br>• 2D: drag nodes, scroll zoom.<br>• 3D: drag orbit, scroll zoom.<br>• Path A/B → Find path.<br>• <b>e</b> export · <b>f</b> fit · <b>Esc</b> deselect.</div></section>';
 
     loadEngines().then(function () {
       if (!window._FG2D && !window._FG3D) { showBanner('Graph engines failed to load — check internet access to unpkg.com.'); return; }
@@ -136,20 +140,25 @@
 
   function buildToolbar(toolbar) {
     var html =
-      '<div class="seg" id="seg"><button id="btn2d" class="on">2D</button><button id="btn3d">3D</button></div>' +
-      '<div class="field"><input id="search" type="text" placeholder="Search entities…" autocomplete="off" spellcheck="false"><div class="suggest" id="suggest-search"></div></div>' +
-      '<select id="searchMode" title="Search mode"><option value="name">by name</option><option value="value">by value</option></select>' +
-      '<div class="field small"><input id="pathA" type="text" placeholder="Path A…" autocomplete="off" spellcheck="false"><div class="suggest" id="suggest-A"></div></div>' +
-      '<div class="field small"><input id="pathB" type="text" placeholder="Path B…" autocomplete="off" spellcheck="false"><div class="suggest" id="suggest-B"></div></div>' +
-      '<button id="btnPath" class="action primary">Find path</button>' +
-      '<button id="btnExpand" class="action">Expand all</button>' +
-      '<button id="btnClear" class="action">Clear</button>' +
-      '<button id="btnRotate" class="action toggle">Auto-rotate</button>' +
-      '<button id="btnExport" class="action">Export</button>' +
-      '<button id="btnShare" class="action">Share</button>' +
-      '<button id="btnStats" class="action">Stats</button>' +
-      '<div id="ctlDepth"><label>DEPTH</label><select id="depth"><option value="1">1</option><option value="2" selected>2</option><option value="3">3</option></select></div>' +
-      '<div id="ctlForce"><label>CHARGE</label><input id="fCharge" type="range" min="-120" max="0" value="-40">' +
+      '<div class="view-toggle"><button id="btn2d" class="active">2D</button><button id="btn3d">3D</button></div>' +
+      '<div class="gc-divider"></div>' +
+      '<div class="field"><input class="gc-input" id="search" type="text" placeholder="Search entities…" autocomplete="off" spellcheck="false"><div class="suggest" id="suggest-search"></div></div>' +
+      '<select id="searchMode" class="gc-select" title="Search mode"><option value="name">by name</option><option value="value">by value</option></select>' +
+      '<div class="gc-divider"></div>' +
+      '<div class="gc-group"><div class="field"><input class="gc-input" id="pathA" type="text" placeholder="Path A…" autocomplete="off" spellcheck="false"><div class="suggest" id="suggest-A"></div></div></div>' +
+      '<div class="gc-group"><div class="field"><input class="gc-input" id="pathB" type="text" placeholder="Path B…" autocomplete="off" spellcheck="false"><div class="suggest" id="suggest-B"></div></div></div>' +
+      '<button id="btnPath" class="btn btn-primary btn-sm">Find Path</button>' +
+      '<div class="gc-divider"></div>' +
+      '<div class="gc-group">' +
+      '<button id="btnExpand" class="btn btn-ghost btn-sm">Expand all</button>' +
+      '<button id="btnClear" class="btn btn-ghost btn-sm">Clear</button>' +
+      '<button id="btnRotate" class="btn btn-ghost btn-sm">Auto-rotate</button>' +
+      '<button id="btnExport" class="btn btn-ghost btn-sm">Export</button>' +
+      '<button id="btnShare" class="btn btn-ghost btn-sm">Share</button>' +
+      '<button id="btnStats" class="btn btn-ghost btn-sm">Stats</button>' +
+      '</div>' +
+      '<div class="gc-group" id="ctlDepth"><label>DEPTH</label><select class="gc-select" id="depth"><option value="1">1</option><option value="2" selected>2</option><option value="3">3</option></select></div>' +
+      '<div class="gc-group" id="ctlForce"><label>CHARGE</label><input id="fCharge" type="range" min="-120" max="0" value="-40">' +
       '<label>DIST</label><input id="fDist" type="range" min="20" max="140" value="50"></div>';
     toolbar.innerHTML = html;
   }
@@ -393,7 +402,7 @@
       new window.THREE.MeshBasicMaterial({ color: c }));
     var wire = new window.THREE.Mesh(
       new window.THREE.SphereGeometry(6.01, 16, 16),
-      new window.THREE.MeshBasicMaterial({ color: cssVar('--bg', '#0f1115'), wireframe: true, transparent: true, opacity: 0.5 }));
+      new window.THREE.MeshBasicMaterial({ color: cssVar('--bg', '#0a0d15'), wireframe: true, transparent: true, opacity: 0.5 }));
     group.add(halo); group.add(core); group.add(wire);
     var label = textSprite(node.name);
     label.position.y = 17;
@@ -434,8 +443,8 @@
     if (m === '2d' && !window._FG2D) { flash('2D engine unavailable.', true); return; }
     if (m === '3d' && !window._FG3D) { flash('3D engine unavailable.', true); return; }
     mode = m;
-    document.getElementById('btn2d').classList.toggle('on', m === '2d');
-    document.getElementById('btn3d').classList.toggle('on', m === '3d');
+    document.getElementById('btn2d').classList.toggle('active', m === '2d');
+    document.getElementById('btn3d').classList.toggle('active', m === '3d');
     document.getElementById('btnRotate').style.display = m === '3d' ? '' : 'none';
     roots.view2d.classList.toggle('hidden', m !== '2d');
     roots.view3d.classList.toggle('hidden', m !== '3d');
@@ -461,9 +470,9 @@
   function showDetail(n) {
     var d = roots.detail;
     if (!d) return;
-    d.innerHTML = '<div class="name">' + NS.utils.esc(n.name) + '</div>' +
-      '<span class="chip" style="background:' + colorFor(n.entity_type) + '">' + NS.utils.esc(n.entity_type) + '</span>' +
-      '<div class="facts" id="facts-' + n.id + '"></div>';
+    d.innerHTML = '<div class="entity-name">' + NS.utils.esc(n.name) + '</div>' +
+      '<span class="entity-type-badge">' + NS.utils.esc(n.entity_type) + '</span>' +
+      '<div class="entity-facts" id="facts-' + n.id + '"></div>';
     NS.api.get('/graph/entities/' + n.id).then(function (body) {
       var f = document.getElementById('facts-' + n.id);
       if (!f) return;
@@ -674,46 +683,6 @@
     if (e.key === 'e' || e.key === 'E') exportGraph();
     if (e.key === 'f' || e.key === 'F') { if (mode === '2d' && g2) g2.zoomToFit(600, 60); if (mode === '3d' && g3) g3.cameraPosition({ x: 240, y: 180, z: 300 }, { x: 0, y: 0, z: 0 }, 400); }
   }
-
-  var STYLE = document.createElement('style');
-  STYLE.textContent = [
-    '.graph-viewport { position: relative; flex: 1; min-width: 0; display: flex; flex-direction: column; }',
-    '.graph-toolbar { display: flex; align-items: center; gap: 10px; padding: 12px 20px; flex-wrap: wrap; flex-shrink: 0; background: var(--panel-solid); border-bottom: 1px solid var(--border); }',
-    '.graph-toolbar .field input { width: 200px; } .graph-toolbar .field.small input { width: 150px; }',
-    '.graph-toolbar select { height: 34px; }',
-    '.graph-views { position: relative; flex: 1; min-height: 0; }',
-    '.gv { position: absolute; inset: 0; } .gv.hidden { display: none; }',
-    '.graph-statusbar { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); z-index: 12; max-width: 70%; padding: 6px 14px; border-radius: 999px; font-size: 12px; color: var(--text); background: var(--panel-solid); border: 1px solid var(--border); box-shadow: var(--shadow-md); opacity: 0; transition: opacity .25s ease; pointer-events: none; text-align: center; }',
-    '.graph-statusbar.show { opacity: 1; }',
-    '.graph-statusbar.error { border-color: var(--accent); color: var(--text); font-weight: 600; }',
-    '.graph-banner { position: absolute; top: 56px; left: 50%; transform: translateX(-50%); z-index: 30; display: none; padding: 10px 18px; border-radius: var(--r-lg); font-size: 12.5px; max-width: 80%; text-align: center; background: var(--panel-solid); border: 1px solid var(--accent); color: var(--text); box-shadow: var(--shadow-md); }',
-    '.graph-banner.show { display: block; }',
-    '.hud { position: absolute; bottom: 20px; left: 20px; z-index: 10; display: flex; gap: 8px; pointer-events: none; }',
-    '.hud-chip { font-family: var(--mono); font-size: 11px; color: var(--muted); padding: 6px 11px; border-radius: 999px; border: 1px solid var(--border); background: var(--panel-solid); box-shadow: var(--shadow-sm); }',
-    '.hud-chip b { color: var(--accent); font-weight: 500; }',
-    '#detail .name { font-size: 15px; font-weight: 600; }',
-    '#detail .chip { display: inline-block; font-size: 10px; text-transform: uppercase; letter-spacing: .08em; padding: 3px 9px; border-radius: 999px; margin: 6px 0; color: var(--on-accent); font-weight: 700; box-shadow: var(--shadow-sm); }',
-    '#detail .facts { margin-top: 10px; }',
-    '#detail .fact { border-top: 1px solid var(--border); padding: 10px 0; font-size: 12.5px; }',
-    '#detail .fact .k { color: var(--muted); text-transform: capitalize; font-size: 11px; }',
-    '#detail .fact .v { margin-top: 4px; word-break: break-word; }',
-    '.legend-group { font-family: var(--mono); font-size: 9px; text-transform: uppercase; letter-spacing: .14em; color: var(--muted); margin: 10px 0 6px; }',
-    '.legend-group:first-child { margin-top: 0; }',
-    '.legend-row { display: flex; align-items: center; gap: 9px; font-size: 12px; padding: 4px 0; cursor: pointer; color: var(--muted); }',
-    '.legend-row:hover { color: var(--text); }',
-    '.legend-row .dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; box-shadow: 0 0 9px currentColor; }',
-    '.edge-line { width: 16px; height: 2px; background: var(--border); flex-shrink: 0; border-radius: 2px; }',
-    '.stat-line { font-size: 12px; color: var(--muted); padding-bottom: 8px; border-bottom: 1px solid var(--border); }',
-    '.stat-line b { color: var(--text); }',
-    '.stat-section { margin-top: 8px; max-height: 140px; overflow: auto; }',
-    '.stat-row { display: flex; justify-content: space-between; font-size: 11.5px; padding: 3px 0; color: var(--muted); }',
-    '.stat-row b { color: var(--text); }',
-    '#ctlForce { display: flex; align-items: center; gap: 8px; }',
-    '#ctlForce label { margin: 0 2px 0 6px; }',
-    '#ctlForce input[type=range] { width: 90px; }',
-    '@media (max-width: 1080px) { .graph-toolbar .field input { width: 150px; } }'
-  ].join('\n');
-  document.head.appendChild(STYLE);
 
   NS.pages = NS.pages || {};
   NS.pages.graph = { init: init, destroy: destroy };
