@@ -4,20 +4,27 @@ Crawl a single URL and ingest it end-to-end.
 
     uv run --project backend python scripts/crawl_and_ingest.py https://example.com/handbook
     uv run --project backend python scripts/crawl_and_ingest.py https://example.com/handbook.pdf
+    uv run --project backend python scripts/crawl_and_ingest.py https://example.com --scope site
 
 Routing is decided purely by the fetched Content-Type (a pure function,
 `classify_content_type`, see below) -- not by file extension:
 
-  * text/html                          -> ingestion.crawler.Crawler (mode=PAGE)
-                                           fetches + converts to markdown via
-                                           trafilatura; the markdown is then
-                                           registered as an MD version and
-                                           flows through the SAME pipeline as
-                                           everything else (Tika passes
-                                           markdown through essentially
-                                           unparsed, per the Tika reference
-                                           doc section 6 -- no separate
-                                           no-Tika code path needed).
+  * text/html  with --scope page (default) -> crawl ONLY the given URL (no
+                                            discovery), convert to markdown via
+                                            trafilatura, register as MD, and
+                                            flow through the SAME pipeline as
+                                            everything else (Tika passes
+                                            markdown through essentially
+                                            unparsed, per the Tika reference
+                                            doc section 6).
+              with --scope site            -> ingestion.crawler.discover()
+                                            then crawl_confirmed(): sitemap-
+                                            first discovery, then renders each
+                                            confirmed page to markdown; any
+                                            non-HTML artifacts discovery turns
+                                            up (e.g. a linked PDF) are
+                                            downloaded and registered as
+                                            documents, same as an upload.
   * pdf / doc / docx / ppt / pptx /
     xls / xlsx (any Office or PDF type) -> raw bytes are registered as-is;
                                            Tika extracts the text during
@@ -42,9 +49,10 @@ sensible defaults for concurrent_requests/max_pages/max_depth/
 allowed_domains (unused in PAGE mode, but may still need defaults at
 construction time).
 
-NOTE: CrawlMode.PAGE returns exactly one CrawlDocument. CrawlMode.SITE
-would return many (a full site crawl) -- ingesting all of them as separate
-sources isn't handled here; ask if you want a --mode site option added.
+NOTE: with --scope site, discovery can return many pages for a single root
+URL (a full site crawl via sitemap or BFS fallback) -- this script ingests
+every successfully crawled item as a separate source. The default --scope
+page crawls only the given URL.
 """
 
 from __future__ import annotations
@@ -128,10 +136,31 @@ def fetch_url(url: str, *, client: httpx.Client) -> FetchedUrl:
 
 
 # ---------------------------------------------------------------------------
-# HTML path -- real Crawler API confirmed: Crawler(config).crawl(url) ->
-# tuple[CrawlDocument, ...]. io_output.py only saves to local disk, so the
-# MinIO + queue step happens here, reusing document_producer with file_type=MD.
+# HTML path -- two-phase crawler API: discover() then crawl_confirmed().
+# io_output.py only saves to local disk, so the MinIO + queue step happens
+# here, reusing document_producer with file_type=MD for pages and the
+# document's own file_type for any non-HTML artifact discovery returns.
 # ---------------------------------------------------------------------------
+
+# file_type strings from ingestion.crawler.documents.classify_url map onto the
+# schema's (limited) enum; unsupported ones stay None (nullable, like the
+# document-upload path) and keep their real type in mime_type.
+_CRAWL_FILE_TYPE_TO_ENUM: dict[str, FileType | None] = {
+    "PDF": FileType.PDF,
+    "DOCX": FileType.DOCX,
+}
+_CRAWL_FILE_TYPE_TO_MIME: dict[str, str] = {
+    "PDF": "application/pdf",
+    "DOCX": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
+
+
+def _crawl_file_type(file_type: str | None) -> FileType | None:
+    return _CRAWL_FILE_TYPE_TO_ENUM.get(file_type) if file_type else None
+
+
+def _crawl_mime(file_type: str | None) -> str:
+    return _CRAWL_FILE_TYPE_TO_MIME.get(file_type, "application/octet-stream") if file_type else "text/markdown"
 
 
 async def _run_html_crawler_pipeline(
@@ -165,14 +194,15 @@ async def _run_html_crawler_pipeline(
         job = await register_document_version(
             session,
             url=doc.url,
-            raw_bytes=doc.markdown.encode("utf-8"),
-            mime_type="text/markdown",
-            file_type=FileType.MD,
+            raw_bytes=doc.content if doc.file_type else doc.markdown.encode("utf-8"),
+            mime_type=_crawl_mime(doc.file_type),
+            file_type=FileType.MD if not doc.file_type else _crawl_file_type(doc.file_type),
             uploaded_by=uploaded_by,
             category_id=category_id,
         )
         if job is not None:
             job_ids.append(job.job_id)
+    return job_ids
 
     return tuple(job_ids)
 
@@ -200,9 +230,9 @@ async def _run_document_pipeline(
 # Orchestration
 # ---------------------------------------------------------------------------
 
-# route -> handler. Both now share the same signature (session, fetched, *,
-# uploaded_by, category_id) -> UUID | None, since both end up going through
-# register_document_version -- replaces an if/elif on `route`.
+# route -> handler. Both share the same signature (session, fetched, *,
+# uploaded_by, category_id) -> list[UUID] (job ids to run), since both end up
+# going through register_document_version -- replaces an if/elif on `route`.
 _ROUTES = {
     "html": _run_html_crawler_pipeline,
     "document": _run_document_pipeline,
@@ -231,6 +261,11 @@ async def crawl_and_ingest(
     if not job_ids:
         return
 
+
+async def _run_job(
+    session_factory: async_sessionmaker, job_id: UUID, url: str
+) -> None:
+    """Run one queued job immediately (mirrors the background worker)."""
     from db.models import KnowledgeInjectionJob
     from ingestion.pipeline import run_ingestion
     from ingestion.pipeline_types import JobRef, JobStatus
@@ -269,10 +304,44 @@ async def crawl_and_ingest(
             outcome.entities_created_count, outcome.error_details or "",
         )
 
+async def crawl_and_ingest(
+    url: str,
+    *,
+    uploaded_by: UUID,
+    category_id: UUID | None,
+    session_factory: async_sessionmaker,
+    scope: str = "page",
+) -> None:
+    with httpx.Client() as http_client:
+        fetched = fetch_url(url, client=http_client)
+
+    route = classify_content_type(fetched.content_type)
+    logger.info("routing %s as %s (content-type: %s, scope: %s)", url, route, fetched.content_type, scope)
+
+    async with session_factory() as session:
+        job_ids = await _ROUTES[route](
+            session, fetched, uploaded_by=uploaded_by, category_id=category_id, scope=scope
+        )
+
+    # Empty means every discovered item was either dedup-skipped or failed to
+    # crawl. The real reason was already logged at its source -- either the
+    # ERROR from _run_html_crawler_pipeline (crawl/extraction failure), or the
+    # INFO from register_document_version (genuine checksum dedup). No generic
+    # guess here -- that's what caused the misleading message before.
+    for job_id in job_ids:
+        await _run_job(session_factory, job_id, url)
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--site", action="store_true", help="crawl the entire site (CrawlMode.SITE), not just this one page",)
     parser.add_argument("url", help="URL to crawl and ingest")
+    parser.add_argument(
+        "--scope",
+        choices=["page", "site"],
+        default="page",
+        help="page = crawl only the given URL (default); site = sitemap-first discovery over the whole site",
+    )
     parser.add_argument("--uploaded-by", required=True, help="app_user.id (a UUID) of the service account")
     parser.add_argument("--category-id", default=None, help="knowledge_category.category_id, optional")
     return parser.parse_args()
@@ -311,6 +380,7 @@ def main() -> None:
             category_id=UUID(args.category_id) if args.category_id else None,
             session_factory=session_factory,
             site=args.site,
+            scope=args.scope,
         )
     )
 

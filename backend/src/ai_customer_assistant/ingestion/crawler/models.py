@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import Literal, Optional
 
 @dataclass(frozen=True)
 class PageMeta:
@@ -14,6 +14,31 @@ class FetchedPage:
     html: str
 
 @dataclass(frozen=True)
+class FetchedBytes:
+    url: str
+    status_code: int
+    content_type: str
+    data: bytes
+
+@dataclass(frozen=True)
+class DiscoveredPage:
+    url: str
+    kind: Literal["PAGE", "DOCUMENT"]
+    file_type: Optional[str] = None
+
+@dataclass(frozen=True)
+class DiscoveryResult:
+    pages: tuple[DiscoveredPage, ...]
+    source: Literal["SITEMAP", "BFS_FALLBACK"]
+
+@dataclass(frozen=True)
+class DocumentDownload:
+    url: str
+    data: bytes
+    content_type: str
+    file_type: str
+
+@dataclass(frozen=True)
 class CrawlDocument:
     url: str
     title: str
@@ -23,4 +48,6 @@ class CrawlDocument:
     status_code: int
     internal_links: tuple[str, ...] = ()
     external_links: tuple[str, ...] = ()
+    content: bytes = b""
+    file_type: Optional[str] = None
     error: Optional[str] = None
