@@ -10,6 +10,7 @@
     chat: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
     graph: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="6" r="2.5"/><circle cx="19" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M7 7.3 10.3 16 M17 7.3 13.7 16 M7.5 6h9"/></svg>',
     ingest: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-3M17 8l-5-5-5 5M12 3v12"/></svg>',
+    prompt: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/></svg>',
     admin: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-3.5 8-10V5l-8-3-8 3v7c0 6.5 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>'
   };
 
@@ -18,7 +19,7 @@
     { key: 'chat', label: 'Chat', title: 'AI Customer Assistant — Chat' },
     { key: 'graph', label: 'Graph', title: 'AI Customer Assistant — Knowledge Graph' },
     { key: 'ingest', label: 'Ingest', title: 'AI Customer Assistant — Ingest' },
-    { key: 'admin', label: 'Admin', title: 'AI Customer Assistant — Admin' }
+    { key: 'prompt', label: 'Prompt', title: 'AI Customer Assistant — Agent Prompts' }
   ];
 
   function parseHash() {
@@ -86,25 +87,11 @@
     } catch (e) {}
   }
 
-  function checkHealth() {
-    var pill = document.getElementById('sysStatus');
-    if (!pill) return;
-    var dot = pill.querySelector('.dot');
-    var label = pill.querySelector('span:last-child');
-    function set(state, cls) {
-      if (dot) dot.style.background = 'var(--' + cls + ')';
-      if (label) label.textContent = state;
-    }
-    if (!NS.api) { return; }
-    NS.api.get('/health').then(function (r) {
-      set((r && r.status === 'ok') ? 'System Online' : 'System Offline', (r && r.status === 'ok') ? 'green' : 'red');
-    }).catch(function () { set('System Offline', 'red'); });
-  }
+  function checkHealth() { /* removed — the "System Online" pill was dropped from the header */ }
 
   NS.router = {
     init: function () {
       wireSidebar();
-      checkHealth();
       window.addEventListener('hashchange', render);
       render();
     },

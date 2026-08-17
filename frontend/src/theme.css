@@ -123,14 +123,14 @@ a { color: inherit; text-decoration: none; }
    ============================================================ */
 .app {
   display: grid;
-  grid-template-columns: 232px 1fr;
+  grid-template-columns: 260px 1fr;
   grid-template-rows: 60px 1fr;
   grid-template-areas:
     "header header"
     "sidebar main";
   height: 100vh;
   overflow: hidden;
-  --sidebar-w: 232px;
+  --sidebar-w: 260px;
   transition: grid-template-columns .2s ease;
 }
 .app.sidebar-collapsed { grid-template-columns: 72px 1fr; }
@@ -322,7 +322,7 @@ a { color: inherit; text-decoration: none; }
 .main {
   grid-area: main;
   overflow-y: auto;
-  padding: 24px 28px;
+  padding: 22px 22px;
 }
 .page { display: flex; flex-direction: column; flex: 1; min-height: 0; animation: fadein .2s ease; }
 @keyframes fadein { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
@@ -452,6 +452,7 @@ a { color: inherit; text-decoration: none; }
 .btn-ghost:hover { background: var(--border); }
 .btn-sm { padding: 6px 11px; font-size: 12px; }
 .btn-full { width: 100%; }
+.btn:disabled { opacity: .5; cursor: not-allowed; filter: none; transform: none; }
 
 /* ============================================================
    CHAT PAGE
@@ -750,6 +751,19 @@ a { color: inherit; text-decoration: none; }
 .file-meta .err { color: var(--red); font-weight: 600; }
 .upload-btn { width: 100%; margin-top: 4px; }
 
+.crawl-scope { display: flex; margin-bottom: 14px; }
+.crawl-scope .seg { flex: 1; }
+.crawl-scope .seg button { flex: 1; padding: 0 8px; }
+
+.wait-row { display: flex; gap: 8px; margin-top: 12px; align-items: center; }
+.wait-row select { flex: 1; min-width: 0; }
+.wait-row input {
+  flex: 1; height: 34px; padding: 0 10px; font-size: 12.5px; color: var(--text);
+  background: var(--panel-alt); border: 1px solid var(--border); border-radius: var(--radius-sm); outline: none;
+}
+.wait-row input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px color-mix(in srgb, var(--blue) 14%, transparent); }
+.wait-hint { font-size: 11.5px; color: var(--text-faint); line-height: 1.5; margin-top: 8px; min-height: 16px; }
+
 .crawl-input-row { display: flex; gap: 8px; }
 .crawl-input-row input {
   flex: 1; border: 1px solid var(--border); background: var(--panel-alt);
@@ -770,7 +784,51 @@ a { color: inherit; text-decoration: none; }
 
 .result { margin-top: 20px; } .result[hidden] { display: none; }
 .result-ok { color: var(--accent); font-size: 13px; margin-bottom: 10px; font-weight: 600; }
+.result-ok.err { color: var(--red); }
 .result-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+
+.review-panel { margin-top: 16px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel-alt); overflow: hidden; }
+.review-panel[hidden] { display: none; }
+.review-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--border); background: var(--panel); }
+.review-title { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 700; font-family: var(--font-display); }
+.source-badge { font-size: 10px; font-family: var(--font-mono); font-weight: 700; padding: 2px 7px; border-radius: 20px; }
+.source-badge.sitemap { color: var(--green); background: var(--green-dim); }
+.source-badge.bfs { color: var(--purple); background: var(--purple-dim); }
+.review-counts { display: flex; gap: 12px; font-size: 11px; font-family: var(--font-mono); color: var(--text-dim); white-space: nowrap; }
+.review-counts b { color: var(--text); font-weight: 700; }
+.review-list { max-height: 240px; overflow-y: auto; }
+.review-item { display: flex; align-items: center; gap: 9px; padding: 8px 14px; font-size: 12px; color: var(--text-dim); border-bottom: 1px solid var(--border); cursor: pointer; }
+.review-item:last-child { border-bottom: 0; }
+.review-item:hover { background: var(--panel); }
+.review-item input { accent-color: var(--blue); flex-shrink: 0; }
+.kind-badge { font-family: var(--font-mono); font-size: 9px; font-weight: 700; padding: 2px 6px; border-radius: 5px; flex-shrink: 0; }
+.kind-badge.page { color: var(--blue); background: var(--blue-dim); }
+.kind-badge.doc { color: var(--purple); background: var(--purple-dim); }
+.review-item .url { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-type { font-family: var(--font-mono); font-size: 10px; color: var(--text-faint); flex-shrink: 0; }
+.review-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 12px 14px; border-top: 1px solid var(--border); background: var(--panel); }
+.review-actions .btn:disabled { opacity: .45; cursor: not-allowed; }
+.review-note { font-size: 11px; color: var(--text-faint); margin-left: auto; }
+
+/* ============================================================
+   PROMPT PAGE
+   ============================================================ */
+.prompt-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; align-items: stretch; }
+.prompt-card { display: flex; flex-direction: column; }
+.prompt-card > p.desc { flex-shrink: 0; }
+.prompt-seg { margin-bottom: 12px; align-self: flex-start; }
+.prompt-seg button { flex: 1; padding: 0 16px; }
+.prompt-ta {
+  flex: 1; min-height: 340px; width: 100%; resize: vertical;
+  font-family: var(--font-mono); font-size: 12px; line-height: 1.6;
+  padding: 12px 14px; color: var(--text);
+  background: var(--panel-alt); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  outline: none; transition: border-color .15s ease, box-shadow .15s ease;
+}
+.prompt-ta:focus { border-color: var(--blue); box-shadow: 0 0 0 3px color-mix(in srgb, var(--blue) 14%, transparent); }
+.prompt-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+.prompt-status { font-size: 11.5px; font-weight: 600; margin-left: auto; }
+.prompt-note { font-size: 11px; color: var(--text-faint); margin-top: 8px; }
 
 /* ============================================================
    ADMIN PAGE
@@ -887,6 +945,7 @@ pre.code { font-family: var(--mono); font-size: 12px; background: var(--bg); bor
   .stat-grid { grid-template-columns: repeat(2, 1fr); }
   .module-grid { grid-template-columns: 1fr; }
   .ingest-grid { grid-template-columns: 1fr; }
+  .prompt-grid { grid-template-columns: 1fr; }
   .graph-shell { grid-template-columns: 220px 1fr; }
 }
 @media (max-width: 860px) {
