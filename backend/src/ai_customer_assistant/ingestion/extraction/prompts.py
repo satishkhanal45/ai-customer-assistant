@@ -24,6 +24,12 @@ For a chunk with an extractable entity:
   3. In the SAME response, also call `record_relation` for every
      relationship you can identify between two entities named in the text.
 
+When a person's job title / role / designation is stated in the text (for
+example "Justin Flores -- Advisor, Alpinist Studios"), record it as a `role`
+attribute on that person (entity type `Person`), IN ADDITION to any
+`record_relation` call that links the person to the company. Do not choose
+one over the other: record BOTH the attribute and the relation.
+
 If the chunk contains no concrete entity or fact, call `no_fact_found` and
 stop. Do not invent facts to fill the tool schema, and do not call
 resolve_entity alone when the text also states attributes or relationships

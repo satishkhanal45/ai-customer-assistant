@@ -14,6 +14,8 @@ later (see §4.3).
 """
 from __future__ import annotations
 
+import inspect
+import json
 from typing import Callable, Optional
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -42,6 +44,42 @@ _ROUTE_TARGETS = {
     NextAgent.TICKET_AGENT: TICKET_AGENT_NODE,
     NextAgent.NONE: END,
 }
+
+
+def _jsonable(value: object) -> object:
+    """Best-effort JSON conversion so any state value (dataclasses, enums,
+    provenance objects) can be dumped for terminal debugging."""
+    try:
+        return json.loads(json.dumps(value, default=str))
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _log_node(node_name: str, node_fn):
+    """Wrap a node function to print the SupervisorState on entry and the
+    partial update it returns — a dev/debug aid that works for both sync and
+    async node functions. ``interrupt()`` pauses propagate untouched."""
+    if inspect.iscoroutinefunction(node_fn):
+
+        async def _async_logged(state: SupervisorState) -> dict:
+            print(f"\n--- supervisor node: {node_name} (in) ---")
+            print(json.dumps(_jsonable(state), indent=2))
+            result = await node_fn(state)
+            print(f"--- supervisor node: {node_name} (out) ---")
+            print(json.dumps(_jsonable(result), indent=2))
+            return result
+
+        return _async_logged
+
+    def _sync_logged(state: SupervisorState) -> dict:
+        print(f"\n--- supervisor node: {node_name} (in) ---")
+        print(json.dumps(_jsonable(state), indent=2))
+        result = node_fn(state)
+        print(f"--- supervisor node: {node_name} (out) ---")
+        print(json.dumps(_jsonable(result), indent=2))
+        return result
+
+    return _sync_logged
 
 
 def _placeholder_agent_node(agent_name: str):
@@ -104,7 +142,7 @@ def build_supervisor_graph(
     safety_gate_node: Optional[Callable[[SupervisorState], dict]] = None,
     knowledge_graph: Optional[Callable] = None,
     groundedness_check: Optional[Callable] = None,
-    knowledge_timeout_s: float = 30,
+    knowledge_timeout_s: float = 120,
     ticket_ops: Optional[Callable] = None,
     checkpointer: Optional[BaseCheckpointSaver] = None,
 ):
@@ -156,29 +194,42 @@ def build_supervisor_graph(
         )
 
     graph = StateGraph(SupervisorState)
-    graph.add_node(CLASSIFY_NODE, make_classify_and_route_node(client))
+    graph.add_node(
+        CLASSIFY_NODE, _log_node(CLASSIFY_NODE, make_classify_and_route_node(client))
+    )
     graph.add_node(
         KNOWLEDGE_AGENT_NODE,
-        knowledge_agent_node
-        or (
-            make_knowledge_agent_node(knowledge_graph, timeout_s=knowledge_timeout_s)
-            if knowledge_graph is not None
-            else _placeholder_agent_node("Knowledge Agent")
+        _log_node(
+            KNOWLEDGE_AGENT_NODE,
+            knowledge_agent_node
+            or (
+                make_knowledge_agent_node(knowledge_graph, timeout_s=knowledge_timeout_s)
+                if knowledge_graph is not None
+                else _placeholder_agent_node("Knowledge Agent")
+            ),
         ),
     )
     graph.add_node(
         TICKET_AGENT_NODE,
-        ticket_agent_node
-        or make_ticket_agent_node(
-            ticket_ops if ticket_ops is not None else TicketStore()
+        _log_node(
+            TICKET_AGENT_NODE,
+            ticket_agent_node
+            or make_ticket_agent_node(
+                ticket_ops if ticket_ops is not None else TicketStore()
+            ),
         ),
     )
     graph.add_node(
         SAFETY_GATE_NODE,
-        safety_gate_node
-        or make_safety_gate_node(groundedness_check=groundedness_check),
+        _log_node(
+            SAFETY_GATE_NODE,
+            safety_gate_node
+            or make_safety_gate_node(groundedness_check=groundedness_check),
+        ),
     )
-    graph.add_node(ASSEMBLE_NODE, assemble_response_node)
+    graph.add_node(
+        ASSEMBLE_NODE, _log_node(ASSEMBLE_NODE, assemble_response_node)
+    )
 
     graph.set_entry_point(CLASSIFY_NODE)
     graph.add_conditional_edges(CLASSIFY_NODE, _route_after_classification)

@@ -11,9 +11,50 @@ from typing import Callable
 
 from .classification import parse_llm_response
 from .llm_client import SupervisorLLMClient
-from .prompt import SUPERVISOR_SYSTEM_PROMPT
-from .routing import assemble_final_response, decide_route
-from .schema import SupervisorState
+from .prompt import build_supervisor_system_prompt
+from .routing import _SAFE_FALLBACK_RESPONSE, assemble_final_response, decide_route
+from .schema import ConversationTurn, NextAgent, SupervisorState
+
+_MAX_HISTORY_TURNS = 4
+_MAX_HISTORY_CHARS = 4000
+
+
+def _bounded_history(history: list[ConversationTurn]) -> list[ConversationTurn]:
+    """Keep the tail of the conversation (last few turns, char-capped).
+
+    Long histories bloat the classify prompt and make Groq's
+    ``json_object`` output flaky, which previously surfaced as spurious
+    OUT_OF_SCOPE declines once a conversation accumulated several long
+    grounded answers.
+    """
+    turns = history[-_MAX_HISTORY_TURNS:]
+    kept: list[ConversationTurn] = []
+    total = 0
+    for turn in turns:
+        if total + len(turn.content) > _MAX_HISTORY_CHARS:
+            break
+        kept.append(turn)
+        total += len(turn.content)
+    return kept
+
+
+def _transient_error_update(state: SupervisorState) -> dict:
+    """Classify LLM unavailable: never decline an in-domain question as
+    OUT_OF_SCOPE because the model failed. Surface a transient error so the
+    customer can retry, mirroring the Knowledge node's error path."""
+    classification = parse_llm_response("{}")
+    return {
+        "request_category": classification.request_category,
+        "domain_confidence": classification.domain_confidence,
+        "intent": classification.intent,
+        "intent_confidence": classification.intent_confidence,
+        "clarification_required": False,
+        "clarification_question": None,
+        "clarification_attempts": state.get("clarification_attempts", 0),
+        "next_agent": NextAgent.NONE,
+        "ticket_type": None,
+        "final_response": _SAFE_FALLBACK_RESPONSE,
+    }
 
 
 def make_classify_and_route_node(
@@ -27,11 +68,17 @@ def make_classify_and_route_node(
     """
 
     def classify_and_route(state: SupervisorState) -> dict:
-        raw_response = llm_client.classify(
-            system_prompt=SUPERVISOR_SYSTEM_PROMPT,
-            user_message=state["user_message"],
-            conversation_history=state.get("conversation_history", []),
-        )
+        try:
+            raw_response = llm_client.classify(
+                system_prompt=build_supervisor_system_prompt(),
+                user_message=state["user_message"],
+                conversation_history=_bounded_history(
+                    state.get("conversation_history", [])
+                ),
+            )
+        except Exception:
+            return _transient_error_update(state)
+
         classification = parse_llm_response(raw_response)
         decision = decide_route(
             classification=classification,

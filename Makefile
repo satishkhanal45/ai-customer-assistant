@@ -99,3 +99,4 @@ trunc:
 
 user:
 	docker exec -i ai-customer-assistant-postgres psql -U ai_assistant -d ai_customer_assistant -c "INSERT INTO app_user (id, email, is_service_account) VALUES ('00000000-0000-0000-0000-000000000000','admin@admin.com', True);"
+

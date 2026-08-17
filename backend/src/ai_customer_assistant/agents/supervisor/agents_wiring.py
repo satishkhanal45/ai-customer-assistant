@@ -22,7 +22,7 @@ from typing import Any, Callable, Mapping, Optional
 from langgraph.config import get_config
 from langgraph.types import interrupt
 
-from ..contracts import flatten_history
+from ..contracts import ConversationTurn
 from .routing import _SAFE_FALLBACK_RESPONSE
 from .schema import SupervisorState
 from ..safety_agent.fallback_response import generate_fallback_response
@@ -34,7 +34,7 @@ KnowledgeGraph = Callable[[Mapping[str, Any]], Any]
 
 def make_knowledge_agent_node(
     knowledge_graph: KnowledgeGraph,
-    timeout_s: float = 30,
+    timeout_s: float = 120,
 ) -> Callable[[SupervisorState], Any]:
     """Build the Knowledge Agent adapter node.
 
@@ -43,6 +43,11 @@ def make_knowledge_agent_node(
       - ``conversation_history`` -> flattened role-labeled strings
       - (via ``flatten_history``), matching Knowledge's
       - ``conversation_history: tuple[str, ...]`` channel.
+
+    Only a bounded window of the conversation history is forwarded (the
+    last few turns, truncated to a character cap) so the Knowledge
+    prompts — which embed the history — stay small and the LLM calls
+    finish within ``timeout_s``.
 
     Runs ``knowledge_graph.ainvoke(...)`` under
     ``asyncio.wait_for(..., timeout_s)``. On timeout or any exception it
@@ -57,8 +62,8 @@ def make_knowledge_agent_node(
     async def knowledge_agent(state: SupervisorState) -> dict:
         knowledge_input = {
             "raw_query": state["user_message"],
-            "conversation_history": tuple(
-                flatten_history(state.get("conversation_history", []))
+            "conversation_history": _bounded_history(
+                state.get("conversation_history", [])
             ),
         }
         try:
@@ -84,6 +89,33 @@ def make_knowledge_agent_node(
         }
 
     return knowledge_agent
+
+
+# Only the tail of the conversation matters for retrieval context; keeping
+# this small bounds the Knowledge prompts and keeps LLM latency in check.
+_MAX_HISTORY_TURNS = 4
+_MAX_HISTORY_CHARS = 4000
+
+
+def _bounded_history(history: list[ConversationTurn]) -> tuple[str, ...]:
+    """Flatten and trim the conversation history forwarded to Knowledge.
+
+    Keeps the last ``_MAX_HISTORY_TURNS`` turns, then truncates the joined
+    text to ``_MAX_HISTORY_CHARS`` characters (whole turns are kept while
+    under the cap). Empty when there is nothing to forward.
+    """
+    turns = tuple(
+        f"{turn.role.capitalize()}: {turn.content}"
+        for turn in history[-_MAX_HISTORY_TURNS:]
+    )
+    kept: list[str] = []
+    total = 0
+    for turn in turns:
+        if total + len(turn) > _MAX_HISTORY_CHARS:
+            break
+        kept.append(turn)
+        total += len(turn)
+    return tuple(kept)
 
 
 def _error_marker(reason: str) -> dict:

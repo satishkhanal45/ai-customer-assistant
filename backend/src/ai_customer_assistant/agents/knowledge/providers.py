@@ -28,6 +28,8 @@ import json
 import os
 from typing import Callable, Optional, Protocol, TypeAlias
 
+import groq
+
 from .config import KnowledgeAgentConfig
 
 
@@ -159,8 +161,6 @@ class GroqKnowledgeProvider:
         rewrite_model: str = _DEFAULT_MODEL,
         timeout: float = 15.0,
     ) -> None:
-        import groq
-
         resolved_key = api_key or os.environ.get("GROQ_API_KEY")
         if not resolved_key:
             raise ValueError("GROQ_API_KEY not set.")
@@ -186,14 +186,21 @@ class GroqKnowledgeProvider:
         )
 
     def _complete(self, messages: list[dict], *, model: str) -> str:
-        response = self.client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=0,
-            timeout=self.timeout,
-            response_format={"type": "json_object"},
-        )
-        return response.choices[0].message.content or "{}"
+        last_error: Optional[groq.APIError] = None
+        for _ in range(2):
+            try:
+                response = self.client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=0,
+                    timeout=self.timeout,
+                    response_format={"type": "json_object"},
+                )
+                return response.choices[0].message.content or "{}"
+            except groq.APIError as exc:
+                last_error = exc
+
+        raise last_error
 
 
 # ---------------------------------------------------------------------------

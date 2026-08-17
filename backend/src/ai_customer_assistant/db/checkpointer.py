@@ -23,8 +23,21 @@ from typing import Optional
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
 _REQUIRED_ENV = ("POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB")
+
+# The app's own conversation-turn type stored in checkpoints. Registered so
+# deserialization doesn't fall back to langgraph's permissive pickle path
+# (which warns and is slated for removal).
+_MSG_PACK_ALLOWLIST: tuple[tuple[str, str], ...] = (
+    ("agents.contracts", "ConversationTurn"),
+)
+
+
+def _build_serde() -> JsonPlusSerializer:
+    """Checkpoint serializer with the app's persisted types allowlisted."""
+    return JsonPlusSerializer(allowed_msgpack_modules=_MSG_PACK_ALLOWLIST)
 
 
 def postgres_dsn() -> Optional[str]:
@@ -60,7 +73,7 @@ async def build_postgres_checkpointer(
 
     pool = AsyncConnectionPool(conninfo=resolved, open=False, kwargs={"autocommit": True})
     await pool.open()
-    saver = AsyncPostgresSaver(conn=pool)
+    saver = AsyncPostgresSaver(conn=pool, serde=_build_serde())
     await saver.setup()
     return saver
 
@@ -70,5 +83,5 @@ async def build_checkpointer() -> BaseCheckpointSaver:
     an in-memory `MemorySaver` for dev/test."""
     dsn = postgres_dsn()
     if dsn is None:
-        return MemorySaver()
+        return MemorySaver(serde=_build_serde())
     return await build_postgres_checkpointer(dsn)
