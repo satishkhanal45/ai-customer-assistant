@@ -25,14 +25,14 @@ a real in-memory SQLite database (aiosqlite), matching the
 
 from __future__ import annotations
 
-from typing import Callable, Mapping, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 from sqlalchemy import Boolean, Column, DateTime, ForeignKey, MetaData, String, Table, func, select
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import Select
 
-from .exceptions import AmbiguousEntityError, AttributeNotFoundError, EntityNotFoundError
+from .exceptions import AttributeNotFoundError, EntityNotFoundError
 from .types import StructuredFact, StructuredQuery
 
 # ==========================================================================
@@ -99,17 +99,24 @@ async def structured_lookup(query: StructuredQuery, *, session: AsyncSession) ->
     resolved entity has no matching values/relations for a *general*
     lookup (no specific attribute or relation was requested).
 
+    Entity resolution is merge-aware: when several `entity` rows match
+    the same label under different entity-type spellings (ingestion has
+    historically stored the same person as both `person` and `Person`,
+    splitting relations between the two), their values and relations are
+    UNIONED rather than failing as ambiguous — a label uniquely names a
+    real-world entity even when its stored type strings don't agree.
+
     Raises EntityNotFoundError if no entity matches (entity_type,
-    entity_label). Raises AmbiguousEntityError if more than one does.
-    Raises AttributeNotFoundError if a *specific* attribute was
-    requested and the resolved entity has no value for it."""
+    entity_label). Raises AttributeNotFoundError if a *specific*
+    attribute was requested and the resolved entity has no value for
+    it."""
     if query.entity_type is None:
         return ()
 
-    entity_row = await _resolve_single_entity(query, session=session)
+    entity_rows = await _resolve_entities(query, session=session)
     lookup_kind = _lookup_kind(query)
     handler = _LOOKUP_DISPATCH[lookup_kind]
-    return await handler(entity_row, query, session)
+    return await handler(entity_rows, query, session)
 
 
 # ==========================================================================
@@ -118,35 +125,57 @@ async def structured_lookup(query: StructuredQuery, *, session: AsyncSession) ->
 
 
 def _entity_lookup_statement(query: StructuredQuery) -> Select:
-    """Pure: build (never execute) the entity-resolution statement."""
-    stmt = select(entity_table.c.id, entity_table.c.entity_type, entity_table.c.name).where(
-        entity_table.c.entity_type == query.entity_type
-    )
+    """Pure: build (never execute) the entity-resolution statement.
+
+    ``entity_type`` and ``entity_label`` are matched case-insensitively so
+    a canonical ontology term from extraction ("Employee") still resolves
+    an entity that ingestion stored under a differently-cased type
+    ("person")."""
+    stmt = select(entity_table.c.id, entity_table.c.entity_type, entity_table.c.name)
+    if query.entity_type is not None:
+        stmt = stmt.where(func.lower(entity_table.c.entity_type) == query.entity_type.lower())
     if query.entity_label is not None:
         stmt = stmt.where(func.lower(entity_table.c.name) == query.entity_label.lower())
     return stmt
 
 
-async def _resolve_single_entity(query: StructuredQuery, *, session: AsyncSession) -> Row:
+def _label_only_statement(entity_label: str) -> Select:
+    """Pure: build an entity-resolution statement matching by label alone,
+    used as a fallback when the ontology's entity-type vocabulary doesn't
+    line up with what ingestion actually stored."""
+    return select(entity_table.c.id, entity_table.c.entity_type, entity_table.c.name).where(
+        func.lower(entity_table.c.name) == entity_label.lower()
+    )
+
+
+def _entity_ids(entity_rows: Sequence[Row]) -> tuple[str, ...]:
+    """Pure: the ids of every resolved entity row."""
+    return tuple(row.id for row in entity_rows)
+
+
+def _queried_entity(entity_rows: Sequence[Row]) -> Row:
+    """Pure: the display entity for facts oriented on the queried entity.
+
+    Multiple rows are type variants of the same real-world entity (they
+    share `name`), so the first row's identity stands in for all of
+    them."""
+    return entity_rows[0]
+
+
+async def _resolve_entities(query: StructuredQuery, *, session: AsyncSession) -> tuple[Row, ...]:
     rows = await _fetch_rows(session, _entity_lookup_statement(query))
+    if not rows and query.entity_label is not None and query.entity_type is not None:
+        # Ontology/ingestion type-vocabulary mismatch (e.g. extraction
+        # canonicalizes to "Employee" but the entity was stored as
+        # "person"): retry by label alone, which is type-independent.
+        rows = await _fetch_rows(session, _label_only_statement(query.entity_label))
     if len(rows) == 0:
         raise EntityNotFoundError(
             message=f"no entity found for entity_type={query.entity_type!r}, entity_label={query.entity_label!r}",
             entity_type=query.entity_type,
             entity_label=query.entity_label or "",
         )
-    if len(rows) > 1:
-        raise AmbiguousEntityError(
-            message=(
-                f"{len(rows)} entities match entity_type={query.entity_type!r}, "
-                f"entity_label={query.entity_label!r} — need a more specific label"
-            ),
-            entity_type=query.entity_type,
-            entity_label=query.entity_label or "",
-            candidate_count=len(rows),
-        )
-    (single_row,) = rows
-    return single_row
+    return tuple(rows)
 
 
 # ==========================================================================
@@ -169,35 +198,46 @@ def _lookup_kind(query: StructuredQuery) -> str:
     )
 
 
-def _attribute_lookup_statement(entity_id: str, entity_type: str, attribute_name: str) -> Select:
+def _attribute_lookup_statement(entity_ids: Sequence[str], attribute_name: str) -> Select:
     return (
         select(value_table.c.value, attribute_table.c.value_type)
         .select_from(value_table.join(attribute_table, value_table.c.attribute_id == attribute_table.c.id))
-        .where(value_table.c.entity_id == entity_id)
-        .where(attribute_table.c.namespace == entity_type)
+        .where(value_table.c.entity_id.in_(entity_ids))
         .where(attribute_table.c.name == attribute_name)
     )
 
 
-async def _attribute_lookup(entity_row: Row, query: StructuredQuery, session: AsyncSession) -> tuple[StructuredFact, ...]:
+async def _attribute_lookup(entity_rows: Sequence[Row], query: StructuredQuery, session: AsyncSession) -> tuple[StructuredFact, ...]:
     rows = await _fetch_rows(
-        session, _attribute_lookup_statement(entity_row.id, entity_row.entity_type, query.attribute)
+        session, _attribute_lookup_statement(_entity_ids(entity_rows), query.attribute)
     )
     if not rows:
+        # No stored value for the requested attribute — but the question may
+        # still be answerable from the entity's relations (roles are
+        # commonly stored as relations, e.g. "Alpinist Studios
+        # --account_officer--> Devin Rajkarnikar"). Degrade to a general
+        # lookup so "what is X's role?" isn't a dead end; only report "no
+        # value" when the entity has nothing at all.
+        general = await _general_lookup(entity_rows, query, session)
+        if general:
+            return general
+        entity = _queried_entity(entity_rows)
         raise AttributeNotFoundError(
             message=(
-                f"entity {entity_row.name!r} ({entity_row.entity_type}) has no value "
-                f"for attribute {query.attribute!r}"
+                f"entity {query.entity_label!r} has no value for attribute {query.attribute!r}"
             ),
-            entity_type=entity_row.entity_type,
-            entity_label=entity_row.name,
+            entity_type=query.entity_type or entity.entity_type,
+            entity_label=query.entity_label or entity.name,
             attribute=query.attribute,
         )
+    entity = _queried_entity(entity_rows)
+    entity_type = query.entity_type or entity.entity_type
+    entity_label = query.entity_label or entity.name
     return tuple(
         StructuredFact(
-            entity_id=entity_row.id,
-            entity_type=entity_row.entity_type,
-            entity_label=entity_row.name,
+            entity_id=entity.id,
+            entity_type=entity_type,
+            entity_label=entity_label,
             attribute=query.attribute,
             value=row.value,
             value_type=row.value_type,
@@ -206,57 +246,117 @@ async def _attribute_lookup(entity_row: Row, query: StructuredQuery, session: As
     )
 
 
-def _general_values_statement(entity_id: str) -> Select:
+def _general_values_statement(entity_ids: Sequence[str]) -> Select:
     return (
         select(attribute_table.c.name.label("attribute_name"), value_table.c.value, attribute_table.c.value_type)
         .select_from(value_table.join(attribute_table, value_table.c.attribute_id == attribute_table.c.id))
-        .where(value_table.c.entity_id == entity_id)
+        .where(value_table.c.entity_id.in_(entity_ids))
     )
 
 
-async def _general_lookup(entity_row: Row, query: StructuredQuery, session: AsyncSession) -> tuple[StructuredFact, ...]:
-    rows = await _fetch_rows(session, _general_values_statement(entity_row.id))
-    return tuple(
-        StructuredFact(
-            entity_id=entity_row.id,
-            entity_type=entity_row.entity_type,
-            entity_label=entity_row.name,
-            attribute=row.attribute_name,
-            value=row.value,
-            value_type=row.value_type,
-        )
-        for row in rows
-    )
-
-
-def _relation_lookup_statement(entity_id: str, relation_type: str) -> Select:
+def _outgoing_relations_statement(
+    entity_ids: Sequence[str], relation_type: Optional[str] = None
+) -> Select:
     target = entity_table.alias("target_entity")
-    return (
+    stmt = (
         select(
             relation_table.c.relation_type,
             target.c.name.label("target_name"),
             target.c.entity_type.label("target_type"),
         )
         .select_from(relation_table.join(target, relation_table.c.target_entity_id == target.c.id))
-        .where(relation_table.c.source_entity_id == entity_id)
-        .where(relation_table.c.relation_type == relation_type)
+        .where(relation_table.c.source_entity_id.in_(entity_ids))
+    )
+    if relation_type is not None:
+        stmt = stmt.where(relation_table.c.relation_type == relation_type)
+    return stmt
+
+
+def _incoming_relations_statement(
+    entity_ids: Sequence[str], relation_type: Optional[str] = None
+) -> Select:
+    source = entity_table.alias("source_entity")
+    stmt = (
+        select(
+            relation_table.c.relation_type,
+            source.c.id.label("source_entity_id"),
+            source.c.name.label("source_name"),
+            source.c.entity_type.label("source_type"),
+        )
+        .select_from(relation_table.join(source, relation_table.c.source_entity_id == source.c.id))
+        .where(relation_table.c.target_entity_id.in_(entity_ids))
+    )
+    if relation_type is not None:
+        stmt = stmt.where(relation_table.c.relation_type == relation_type)
+    return stmt
+
+
+def _outgoing_fact(entity_row: Row, row: Row) -> StructuredFact:
+    """Fact oriented on the queried entity: ``entity --rel--> target``."""
+    return StructuredFact(
+        entity_id=entity_row.id,
+        entity_type=entity_row.entity_type,
+        entity_label=entity_row.name,
+        attribute=row.relation_type,
+        value=row.target_name,
+        value_type="string",
+        related_entity_label=row.target_name,
+        relation_type=row.relation_type,
     )
 
 
-async def _relation_lookup(entity_row: Row, query: StructuredQuery, session: AsyncSession) -> tuple[StructuredFact, ...]:
-    rows = await _fetch_rows(session, _relation_lookup_statement(entity_row.id, query.relation_type))
-    return tuple(
+def _incoming_fact(entity_row: Row, row: Row) -> StructuredFact:
+    """Fact oriented on the relation's source so semantics stay correct:
+    ``source --rel--> entity`` (e.g. "Alpinist Studios employs Justin
+    Flores" stays that way even though Justin Flores is the queried
+    entity)."""
+    return StructuredFact(
+        entity_id=row.source_entity_id,
+        entity_type=row.source_type,
+        entity_label=row.source_name,
+        attribute=row.relation_type,
+        value=entity_row.name,
+        value_type="string",
+        related_entity_label=entity_row.name,
+        relation_type=row.relation_type,
+    )
+
+
+async def _general_lookup(entity_rows: Sequence[Row], query: StructuredQuery, session: AsyncSession) -> tuple[StructuredFact, ...]:
+    entity = _queried_entity(entity_rows)
+    entity_type = query.entity_type or entity.entity_type
+    entity_label = query.entity_label or entity.name
+    value_facts = tuple(
         StructuredFact(
-            entity_id=entity_row.id,
-            entity_type=entity_row.entity_type,
-            entity_label=entity_row.name,
-            attribute=row.relation_type,
-            value=row.target_name,
-            value_type="string",
-            related_entity_label=row.target_name,
-            relation_type=row.relation_type,
+            entity_id=entity.id,
+            entity_type=entity_type,
+            entity_label=entity_label,
+            attribute=row.attribute_name,
+            value=row.value,
+            value_type=row.value_type,
         )
-        for row in rows
+        for row in await _fetch_rows(session, _general_values_statement(_entity_ids(entity_rows)))
+    )
+    outgoing = await _fetch_rows(session, _outgoing_relations_statement(_entity_ids(entity_rows)))
+    incoming = await _fetch_rows(session, _incoming_relations_statement(_entity_ids(entity_rows)))
+    return (
+        *value_facts,
+        *(_outgoing_fact(entity, row) for row in outgoing),
+        *(_incoming_fact(entity, row) for row in incoming),
+    )
+
+
+async def _relation_lookup(entity_rows: Sequence[Row], query: StructuredQuery, session: AsyncSession) -> tuple[StructuredFact, ...]:
+    entity = _queried_entity(entity_rows)
+    outgoing = await _fetch_rows(
+        session, _outgoing_relations_statement(_entity_ids(entity_rows), query.relation_type)
+    )
+    incoming = await _fetch_rows(
+        session, _incoming_relations_statement(_entity_ids(entity_rows), query.relation_type)
+    )
+    return (
+        *(_outgoing_fact(entity, row) for row in outgoing),
+        *(_incoming_fact(entity, row) for row in incoming),
     )
 
 

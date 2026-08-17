@@ -295,7 +295,7 @@
 
   function send(threadId, message) {
     setBusy(true);
-    NS.api.post('/chat', { thread_id: threadId, message: message }).then(function (res) {
+    NS.api.post('/chat', { thread_id: threadId, message: message }, { timeout: 60000 }).then(function (res) {
       var t = ensureThread(threadId);
       t.messages.push({ role: 'assistant', content: res.reply || '', traceId: res.trace_id, citations: res.citations || [] });
       t.updatedAt = Date.now();

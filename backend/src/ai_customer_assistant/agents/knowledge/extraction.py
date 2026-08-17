@@ -169,18 +169,25 @@ def _non_empty_str_or_none(value: object) -> Optional[str]:
 
 
 def _parse_filters(raw_filters: object) -> tuple[QueryFilter, ...]:
+    """Parse the advisory ``filters`` slot leniently — never raises.
+
+    Filters are advisory constraints, not EAV writes (see _resolve_filter),
+    so a malformed shape from the LLM must not abort the whole query. A
+    single dict is coerced to a one-item list (a common LLM slip); every
+    entry that isn't a well-formed ``{field, value}`` pair is dropped
+    rather than failing extraction."""
+    if raw_filters is None:
+        return ()
+    if isinstance(raw_filters, dict):
+        raw_filters = [raw_filters]
     if not isinstance(raw_filters, list):
-        raise LLMGenerationError(
-            message=f"structured-extraction response 'filters' must be a list: {raw_filters!r}"
-        )
-    if not all(
-        isinstance(item, dict) and isinstance(item.get("field"), str) and isinstance(item.get("value"), str)
+        return ()
+    parsed = [
+        QueryFilter(field=item["field"], value=item["value"])
         for item in raw_filters
-    ):
-        raise LLMGenerationError(
-            message=f"structured-extraction response 'filters' entries must be {{field, value}} strings: {raw_filters!r}"
-        )
-    return tuple(QueryFilter(field=item["field"], value=item["value"]) for item in raw_filters)
+        if isinstance(item, dict) and isinstance(item.get("field"), str) and isinstance(item.get("value"), str)
+    ]
+    return tuple(parsed)
 
 
 def _parse_confidence(raw_confidence: object) -> float:

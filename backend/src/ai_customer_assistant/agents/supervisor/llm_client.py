@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Callable, Optional, Protocol
 
+import groq
 from groq import Groq
 
 from .schema import ConversationTurn
@@ -184,14 +186,21 @@ class GroqSupervisorLLMClient:
             },
         ]
 
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=0,
-            response_format={"type": "json_object"},
-        )
+        last_error: Optional[groq.APIError] = None
+        for attempt in range(3):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=0,
+                    response_format={"type": "json_object"},
+                )
+                return response.choices[0].message.content or "{}"
+            except groq.APIError as exc:
+                last_error = exc
+                time.sleep(0.5 * (attempt + 1))
 
-        return response.choices[0].message.content or "{}"
+        raise last_error
 
 
 _PROVIDER_FACTORIES: dict[str, Callable[[], SupervisorLLMClient]] = {

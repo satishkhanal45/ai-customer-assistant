@@ -20,8 +20,14 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from agents.supervisor.classification import parse_llm_response
 from agents.supervisor.graph import build_supervisor_graph
-from agents.supervisor.routing import decide_post_downstream, decide_route
+from agents.supervisor.node import _bounded_history
+from agents.supervisor.routing import (
+    _SAFE_FALLBACK_RESPONSE,
+    decide_post_downstream,
+    decide_route,
+)
 from agents.supervisor.schema import (
+    ConversationTurn,
     Intent,
     NextAgent,
     RequestCategory,
@@ -37,6 +43,25 @@ class FakeClient:
 
     def classify(self, system_prompt, user_message, conversation_history) -> str:
         return json.dumps(self.payload)
+
+
+class RaisingClient:
+    """Test double whose classify call fails like an unavailable LLM."""
+
+    def classify(self, system_prompt, user_message, conversation_history) -> str:
+        raise RuntimeError("groq unavailable")
+
+
+class CapturingClient(FakeClient):
+    """Records the conversation_history it was handed, for bounding checks."""
+
+    def __init__(self, payload: dict) -> None:
+        super().__init__(payload)
+        self.seen_histories = []
+
+    def classify(self, system_prompt, user_message, conversation_history) -> str:
+        self.seen_histories.append(list(conversation_history))
+        return super().classify(system_prompt, user_message, conversation_history)
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +246,49 @@ def test_graph_unknown_exhausted_reaches_ticket_agent():
     assert "__interrupt__" in result
     (interrupt_payload,) = result["__interrupt__"]
     assert interrupt_payload.value["type"] == "email-collection"
+
+
+def test_graph_classify_failure_returns_transient_error_not_decline():
+    """A dead classifier must NOT decline the question as OUT_OF_SCOPE —
+    that would mislead an in-domain user. Surface a transient error instead."""
+    result = build_supervisor_graph(llm_client=RaisingClient()).invoke(
+        {"user_message": "mvp development", "conversation_history": [], "clarification_attempts": 0}
+    )
+    assert result["next_agent"] is NextAgent.NONE
+    assert result["final_response"] == _SAFE_FALLBACK_RESPONSE
+    assert _SAFE_FALLBACK_RESPONSE != (
+        "I'm sorry, I am only able to help with solving the problem you are facing on our platform."
+    )
+
+
+def test_classify_history_is_bounded():
+    """Long conversations must not bloat the classify prompt wholesale —
+    history handed to the classifier is capped by turn count and chars."""
+    history = [
+        ConversationTurn(role="user", content="a" * 1500),
+        ConversationTurn(role="assistant", content="b" * 1500),
+        ConversationTurn(role="user", content="c" * 1500),
+        ConversationTurn(role="assistant", content="d" * 1500),
+        ConversationTurn(role="user", content="e" * 1500),
+        ConversationTurn(role="assistant", content="f" * 1500),
+    ]
+    client = CapturingClient(
+        {"request_category": "GREETING", "domain_confidence": 0.99, "intent": "UNKNOWN", "intent_confidence": 0.0, "clarification_question": None}
+    )
+    build_supervisor_graph(llm_client=client).invoke(
+        {"user_message": "hi", "conversation_history": history, "clarification_attempts": 0}
+    )
+    (seen,) = client.seen_histories
+    assert len(seen) == 2
+    assert sum(len(t.content) for t in seen) <= 4000
+
+
+def test_bounded_history_keeps_full_tail_when_small():
+    turns = [
+        ConversationTurn(role="user", content="short"),
+        ConversationTurn(role="assistant", content="also short"),
+    ]
+    assert _bounded_history(turns) == turns
 
 
 # ---------------------------------------------------------------------------
