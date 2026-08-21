@@ -111,10 +111,71 @@ class ChatService:
         """Process one user message and return ``(reply, citations)`` where
         ``citations`` lists the sources the reply is grounded on (each a
         dict with ``source_name`` / ``page`` / ``version_number`` /
-        ``category_name``), empty when the turn produced no retrieval."""
+        ``category_name``), empty when the turn produced no retrieval.
+
+        If the message contains multiple ``?``-delimited questions, each is
+        processed sequentially and replies are concatenated with ``\n``."""
         config = {"configurable": {"thread_id": thread_id}}
         if trace_id:
             config["configurable"]["trace_id"] = trace_id
+
+        # Split multi‑question messages by "?" and process each part
+        parts = [p.strip() for p in user_message.split("?") if p.strip()]
+        if len(parts) > 1:
+            combined_replies: list[str] = []
+            all_citations: list[dict] = []
+            for part in parts:
+                snapshot = await self.graph.aget_state(config)
+                history = list(snapshot.values.get("conversation_history") or [])
+
+                if snapshot.next:
+                    result = await self.graph.ainvoke(
+                        Command(resume=part), config=config
+                    )
+                else:
+                    result = await self.graph.ainvoke(
+                        {
+                            "user_message": part,
+                            "conversation_history": history,
+                        },
+                        config=config,
+                    )
+
+                reply = result.get("final_response") or result.get(
+                    "clarification_question"
+                ) or ""
+                citations = _citations_from_result(result)
+                combined_replies.append(reply)
+                all_citations.extend(citations)
+
+                user_turn = ConversationTurn(role="user", content=part)
+                assistant_turn = ConversationTurn(
+                    role="assistant", content=reply
+                )
+                await self.graph.aupdate_state(
+                    config,
+                    {
+                        "conversation_history": [
+                            *history,
+                            user_turn,
+                            assistant_turn,
+                        ]
+                    },
+                )
+
+            reply = "\n".join(combined_replies)
+            citations = all_citations
+            await self.graph.aupdate_state(
+                config,
+                {
+                    "conversation_history": [
+                        *history,
+                        ConversationTurn(role="user", content=user_message),
+                        ConversationTurn(role="assistant", content=reply),
+                    ]
+                },
+            )
+            return reply, citations
 
         snapshot = await self.graph.aget_state(config)
         history = list(snapshot.values.get("conversation_history") or [])
