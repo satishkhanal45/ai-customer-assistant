@@ -276,7 +276,7 @@ async def build_chat_service(
     graph = build_supervisor_graph(
         llm_client=resolved_client,
         knowledge_graph=knowledge_graph,
-        ticket_ops=TicketStore(),
+        ticket_ops=TicketStore(session_factory=session_factory),
         checkpointer=resolved_checkpointer,
     )
     resolved_embedding = (

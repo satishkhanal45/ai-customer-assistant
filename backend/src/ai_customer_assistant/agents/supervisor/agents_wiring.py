@@ -169,12 +169,12 @@ def make_ticket_agent_node(
 
     Two-step shape, per agents_integration_plan_new.md §2.3 / §4.4:
       1. opening turn: ``ticket_ops.call(query)`` -> ``PendingTicket``, then
-         ``interrupt()``s for the email (the checkpointer persists the paused
-         state keyed by ``thread_id`` — no ``pending_ticket`` state field is
-         needed);
+          ``interrupt()``s for the email (the checkpointer persists the paused
+          state keyed by ``thread_id`` — no ``pending_ticket`` state field is
+          needed);
       2. resume turn: ``ticket_ops.create_ticket(pending, email, key)`` -> a
-         real ``Ticket``, rendered as a DOWNSTREAM_RESULT-style confirmation
-         the assembly node turns into ``final_response``.
+          real ``Ticket``, rendered as a DOWNSTREAM_RESULT-style confirmation
+          the assembly node turns into ``final_response``.
 
     Idempotency (Phase 4): the adapter derives an ``idempotency_key`` from the
     runtime config (client ``request_id``, else ``thread_id`` + per-thread
@@ -186,7 +186,7 @@ def make_ticket_agent_node(
     ``CHECK_TICKET_STATUS`` is routed away at classification time (§4.4) and
     never reaches this node.
     """
-    def ticket_agent(state: SupervisorState) -> dict:
+    async def ticket_agent(state: SupervisorState) -> dict:
         query = state.get("user_message", "")
         pending = ticket_ops.call(query)
         email = interrupt(
@@ -197,7 +197,7 @@ def make_ticket_agent_node(
         )
         configurable = (get_config() or {}).get("configurable", {})
         key = _idempotency_key(configurable, ticket_ops)
-        ticket = ticket_ops.create_ticket(
+        ticket = await ticket_ops.create_ticket(
             pending, email, idempotency_key=key
         )
         confirmation = (

@@ -17,6 +17,8 @@ the adapter only ever sees the store's ``create_ticket(...)``.
 
 from __future__ import annotations
 
+from sqlalchemy import insert
+
 from agents.ticket_agent.ticket_agent import call as _call
 from agents.ticket_agent.ticket_agent import create_ticket as _build_ticket
 from agents.ticket_agent.types import PendingTicket, Ticket
@@ -34,9 +36,10 @@ class TicketStore:
 
     - With an ``idempotency_key`` already seen: returns the previously
       created ``Ticket`` (no second creation, no state change).
-    - Otherwise: builds a fresh ``Ticket`` and records it, keyed by
-      ``idempotency_key`` when one was supplied, plus appends to
-      ``rows`` so tests can count created rows.
+    - Otherwise: builds a fresh ``Ticket``, records it in-memory keyed by
+      ``idempotency_key`` when supplied, appends to ``rows`` so tests can
+      count created rows, and persistently inserts into the ``ticket`` table
+      when a ``session_factory`` is configured.
 
     ``next_sequence(scope)`` returns the count of tickets already recorded
     under an idempotency-key scope prefix (e.g. a ``thread_id``) — the
@@ -46,9 +49,10 @@ class TicketStore:
     the tests assert against.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, session_factory=None) -> None:
         self._by_key: dict[str, Ticket] = {}
         self.rows: list[Ticket] = []
+        self._session_factory = session_factory
 
     def call(self, query: str) -> PendingTicket:
         """Open a ticket for ``query`` — compose so the store is a complete
@@ -60,7 +64,7 @@ class TicketStore:
         ``scope`` prefix (for server-derived keys like ``thread_id``)."""
         return sum(1 for key in self._by_key if key.startswith(f"{scope}:"))
 
-    def create_ticket(
+    async def create_ticket(
         self,
         pending: PendingTicket,
         email: str,
@@ -73,4 +77,21 @@ class TicketStore:
         self.rows.append(ticket)
         if idempotency_key is not None:
             self._by_key[idempotency_key] = ticket
+
+        # Persist to database if session_factory is configured
+        if self._session_factory is not None:
+            from db.async_session import session_factory as _sf
+            async with _sf() as session:
+                from db.models import Ticket as _DbTicket
+                await session.execute(
+                    insert(_DbTicket).values(
+                        ticket_id=ticket.ticket_id,
+                        email=ticket.email,
+                        query=ticket.query,
+                        priority=ticket.priority,
+                        status=ticket.status,
+                    )
+                )
+                await session.commit()
+
         return ticket

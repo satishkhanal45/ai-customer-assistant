@@ -47,9 +47,11 @@ class Ticket:
                   priority-assignment step can be added later without
                   changing this schema (see module docstring in
                   ticket_agent.py for why).
+        status: Ticket status, defaults to "OPEN".
     """
 
     ticket_id: str
     email: str
     query: str
     priority: str | None = None
+    status: str = "OPEN"
