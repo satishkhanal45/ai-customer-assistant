@@ -28,7 +28,6 @@ def test_downstream_result_defaults():
         status=DownstreamStatus.GROUNDED,
         response="This is the answer.",
     )
-    assert result.customer_wants_escalation is False
     assert result.schema_version == 1
     assert result.agent_name is None
     assert result.latency_ms is None
@@ -38,9 +37,8 @@ def test_downstream_result_defaults():
 
 def test_downstream_result_observability_fields():
     result = DownstreamResult(
-        status=DownstreamStatus.UNGROUNDED,
+        status=DownstreamStatus.GROUNDED,
         response="No answer yet.",
-        customer_wants_escalation=True,
         agent_name="ticket_agent",
         latency_ms=12.5,
         citations=("src/guide.md",),

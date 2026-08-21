@@ -32,6 +32,10 @@ _REQUIRED_ENV = ("POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB")
 # (which warns and is slated for removal).
 _MSG_PACK_ALLOWLIST: tuple[tuple[str, str], ...] = (
     ("agents.contracts", "ConversationTurn"),
+    # The Knowledge Agent's adapter forwards citation provenance into the
+    # Supervisor's downstream_result; it must round-trip through the Postgres
+    # checkpointer so sources can be surfaced to the customer.
+    ("agents.knowledge.types", "ChunkProvenance"),
 )
 
 

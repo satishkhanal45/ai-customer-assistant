@@ -1,10 +1,9 @@
 """Shared BGE embedding singleton (Phase 6, §4.6).
 
 Per the integration plan, `embed_query` (Knowledge Agent's vector search)
-and the Safety gate's embedding-based groundedness check must share ONE
-``SentenceTransformer`` (BAAI/bge-base-en-v1.5) instance, constructed
-once in ``chat_service`` and injected everywhere — never re-instantiated
-per request.
+and the shared embedding model must share ONE ``SentenceTransformer``
+(BAAI/bge-base-en-v1.5) instance, constructed once in ``chat_service`` and
+injected everywhere — never re-instantiated per request.
 
 This module owns that construction: ``build_shared_embeddings`` loads the
 model once (module-level cache, so a process constructs exactly one), and
@@ -13,8 +12,7 @@ hands back both consumption faces:
   - ``embed_query(text) -> tuple[float, ...]`` — the
     ``EmbeddingFunction`` the Knowledge Agent's ``build_knowledge_agent_graph``
     injects into its ``vector_search`` node;
-  - ``embedding_model`` — the raw ``SentenceTransformer`` passed to
-    ``check_groundedness(...)`` / the Safety gate's groundedness binding.
+  - ``embedding_model`` — the raw ``SentenceTransformer`` instance.
 
 Tests inject a fake model via ``build_shared_embeddings(model=...)`` so no
 network/model download is needed; the server path loads the real model once
@@ -35,8 +33,8 @@ class SharedEmbeddings:
 
     ``embed_query`` is derived from ``model``, so both consumers always
     share the exact same weights and normalization behaviour. The raw
-    model is kept on the instance for Safety's ``check_groundedness``,
-    which also needs a ``SentenceTransformer``.
+    model is kept on the instance for callers that need a
+    ``SentenceTransformer`` directly.
     """
 
     def __init__(self, model: SentenceTransformer) -> None:

@@ -6,23 +6,21 @@ Everything a request needs is built once here and reused across requests:
 - ``db.checkpointer.build_checkpointer()``: the durable checkpointer
   (Postgres when configured, MemorySaver otherwise).
 - ``agents.supervisor.graph.build_supervisor_graph(...)``: the compiled
-  Supervisor graph with the ticket store / optional knowledge graph /
-  safety gate injected.
+  Supervisor graph with the ticket store / optional knowledge graph
+  injected.
 - The Supervisor ``llm_client`` (real provider or the deterministic stub,
   chosen by ``build_llm_client`` from the environment).
 - The shared BGE embedding singleton (§4.6): ``build_shared_embeddings``
-  constructs exactly one ``SentenceTransformer`` for the process, feeds
-  ``embed_query`` to the compiled Knowledge graph's ``vector_search``, and
-  exposes the identical instance as ``ChatService.embedding_model`` for
-  Safety's groundedness binding.
+  constructs exactly one ``SentenceTransformer`` for the process and feeds
+  ``embed_query`` to the compiled Knowledge graph's ``vector_search``.
 
 ``ChatService.handle_message`` is the only chat surface. Conversation
 history is never passed in by the caller: it lives behind the checkpointer
 keyed by ``thread_id`` and is read back on every turn (§5). The API only
 sends the new ``user_message`` plus the ``thread_id``.
 
-Multi-turn flows via ``interrupt()`` (ticket email collection, escalation
-confirmation) are surfaced transparently:
+Multi-turn flows via ``interrupt()`` (ticket email collection) are surfaced
+transparently:
 
 - When the previous turn paused waiting for input (a pending interrupt),
   the next ``user_message`` resumes the graph via ``Command(resume=...)``.
@@ -32,7 +30,7 @@ confirmation) are surfaced transparently:
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Mapping, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 from langgraph.types import Command
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -55,9 +53,9 @@ _EMAIL_COLLECTION_QUESTION = (
 
 def _citations_from_result(result: Mapping[str, Any]) -> list[dict]:
     """Pull the ``ChunkProvenance`` list the Knowledge node attached to the
-    run (``knowledge_response.citations``) into plain serializable dicts."""
-    knowledge_response = result.get("knowledge_response") or {}
-    citations = knowledge_response.get("citations") or []
+    run (``downstream_result.citations``) into plain serializable dicts."""
+    downstream_result = result.get("downstream_result") or {}
+    citations = downstream_result.get("citations") or []
     out: list[dict] = []
     for c in citations:
         out.append(
@@ -85,8 +83,8 @@ class ChatService:
         self.llm_client = llm_client
         # The shared BGE instance (Phase 6, §4.6): the same SentenceTransformer
         # the compiled Knowledge graph's `embed_query` was built from, kept here
-        # so Safety's groundedness binding uses the exact same model — never
-        # re-instantiated per request.
+        # so callers that need the embedding model reuse the same instance —
+        # never re-instantiated per request.
         self.embedding_model = embedding_model
 
     async def handle_message(
@@ -122,8 +120,8 @@ class ChatService:
         history = list(snapshot.values.get("conversation_history") or [])
 
         if snapshot.next:
-            # A previous turn paused waiting for the user (email collection
-            # or escalation confirmation): this message is the resume value.
+            # A previous turn paused waiting for the user (ticket email
+            # collection): this message is the resume value.
             result = await self.graph.ainvoke(
                 Command(resume=user_message), config=config
             )
@@ -186,7 +184,6 @@ async def build_chat_service(
     *,
     llm_client: Optional[SupervisorLLMClient] = None,
     knowledge_graph: Optional[Any] = None,
-    safety_gate_node: Optional[Callable[[Any], Mapping[str, Any]]] = None,
     checkpointer: Optional[Any] = None,
     embedding_model: Optional[object] = None,
     shared_embeddings: Optional[SharedEmbeddings] = None,
@@ -202,8 +199,8 @@ async def build_chat_service(
       environment (Agent provider pattern, see ``providers.py``), the
       shared ``embed_query`` injected into ``vector_search``.
     - ``shared_embeddings`` / ``session_factory``: the Phase 6 (§ 4.6)
-      construction seam — one BGE instance feeds both ``embed_query`` (this
-      graph) and ``ChatService.embedding_model`` (Safety's binding).
+      construction seam — one BGE instance feeds the shared ``embed_query``
+      used by this graph's ``vector_search``.
     - ``ticket_ops`` is always a real ``TicketStore``.
     """
     resolved_client = llm_client or build_llm_client()
@@ -218,7 +215,6 @@ async def build_chat_service(
     graph = build_supervisor_graph(
         llm_client=resolved_client,
         knowledge_graph=knowledge_graph,
-        safety_gate_node=safety_gate_node,
         ticket_ops=TicketStore(),
         checkpointer=resolved_checkpointer,
     )

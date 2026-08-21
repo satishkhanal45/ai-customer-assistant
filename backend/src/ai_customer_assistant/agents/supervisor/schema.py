@@ -67,11 +67,6 @@ class SupervisorState(TypedDict, total=False):
     user_message: str
     conversation_history: list[ConversationTurn]
     downstream_result: Optional[dict]
-    # Knowledge Agent output, mapped by the wiring adapter: only
-    # GroundedResponse-shaped fields (answer / is_grounded / citations).
-    # Never a DownstreamResult — Safety's report gate constructs that
-    # contract downstream (see agents_integration_plan_new.md §2.2/§2.4).
-    knowledge_response: Optional[dict]
     # Correlation id generated once per incoming request at the API
     # boundary, threaded through every node for cross-agent log
     # correlation (see agents_integration_plan_new.md §2.1 / §4.6).

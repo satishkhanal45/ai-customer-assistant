@@ -85,6 +85,50 @@ relation_table = Table(
 )
 
 
+# Membership / container relations. A "who are the members of X?" style
+# query canonicalizes to one of these (e.g. "members" -> the vocabulary
+# term "contains"), but the ingested graph stores membership across many
+# role relations ("advisory board member", "founded_by", "project_manager",
+# "sr_software_engineer", ...) rather than a single "member" edge. Exact
+# matching on one relation type therefore finds nothing for such queries,
+# so when a membership-type relation lookup comes up empty we degrade to a
+# membership lookup that surfaces the entity's person-targeted relations
+# (its roster), falling back to the full relation set only when no people
+# are linked.
+#
+# "related_to" is also included: it is the generic catch-all the extractor
+# falls back to when it can't pin a role relation to the vocabulary
+# ("who are the advisors of X?" -> "related_to"), so treating it the same
+# way keeps people-role questions ("advisors", "board members", ...)
+# answerable instead of dead-ending on an empty exact match.
+_MEMBERSHIP_RELATION_TYPES: frozenset[str] = frozenset(
+    {
+        "contains",
+        "includes",
+        "includes member",
+        "members",
+        "member",
+        "has member",
+        "has_member",
+        "member of",
+        "member_of",
+        "comprises",
+        "made up of",
+        "team",
+        "team member",
+        "team_member",
+        "related to",
+        "related_to",
+    }
+)
+
+# Entity types whose instances count as people when assembling a member
+# roster from an organization's relations (matched case-insensitively).
+_PERSON_ENTITY_TYPES: frozenset[str] = frozenset(
+    {"person", "people", "employee", "member", "staff", "personnel"}
+)
+
+
 # ==========================================================================
 # Public API
 # ==========================================================================
@@ -305,6 +349,19 @@ def _outgoing_fact(entity_row: Row, row: Row) -> StructuredFact:
     )
 
 
+def _is_membership_relation(relation_type: Optional[str]) -> bool:
+    """Pure: whether a canonicalized relation type expresses membership /
+    containment, in which case an empty exact lookup degrades to a general
+    lookup so "who are the members of X?" stays answerable."""
+    return relation_type is not None and relation_type.strip().lower() in _MEMBERSHIP_RELATION_TYPES
+
+
+def _is_person_type(entity_type: Optional[str]) -> bool:
+    """Pure: whether an entity type denotes a person (case-insensitive),
+    used to filter an organization's relations down to its member roster."""
+    return entity_type is not None and entity_type.strip().lower() in _PERSON_ENTITY_TYPES
+
+
 def _incoming_fact(entity_row: Row, row: Row) -> StructuredFact:
     """Fact oriented on the relation's source so semantics stay correct:
     ``source --rel--> entity`` (e.g. "Alpinist Studios employs Justin
@@ -354,10 +411,32 @@ async def _relation_lookup(entity_rows: Sequence[Row], query: StructuredQuery, s
     incoming = await _fetch_rows(
         session, _incoming_relations_statement(_entity_ids(entity_rows), query.relation_type)
     )
+    if not outgoing and not incoming and _is_membership_relation(query.relation_type):
+        # "members of X" is stored across many role relations, not a single
+        # typed edge; surface the entity's person-targeted relations (its
+        # roster) rather than reporting an unanswerable empty result.
+        return await _membership_lookup(entity_rows, query, session)
     return (
         *(_outgoing_fact(entity, row) for row in outgoing),
         *(_incoming_fact(entity, row) for row in incoming),
     )
+
+
+async def _membership_lookup(entity_rows: Sequence[Row], query: StructuredQuery, session: AsyncSession) -> tuple[StructuredFact, ...]:
+    """Assemble the member roster: the queried entity's relations whose
+    counterpart is a person. Falls back to a general lookup when the entity
+    has no person-targeted relations, so a membership query never dead-ends
+    on an empty result."""
+    entity = _queried_entity(entity_rows)
+    outgoing = await _fetch_rows(session, _outgoing_relations_statement(_entity_ids(entity_rows)))
+    incoming = await _fetch_rows(session, _incoming_relations_statement(_entity_ids(entity_rows)))
+    member_facts = (
+        *(_outgoing_fact(entity, row) for row in outgoing if _is_person_type(row.target_type)),
+        *(_incoming_fact(entity, row) for row in incoming if _is_person_type(row.source_type)),
+    )
+    if not member_facts:
+        return await _general_lookup(entity_rows, query, session)
+    return member_facts
 
 
 _LOOKUP_DISPATCH: Mapping[str, Callable] = {

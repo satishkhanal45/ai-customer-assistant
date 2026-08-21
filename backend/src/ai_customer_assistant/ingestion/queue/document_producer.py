@@ -21,9 +21,11 @@ import os
 from uuid import UUID, uuid4
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import (
+    AppUser,
     KnowledgeInjectionJob,
     KnowledgeSource,
     KnowledgeSourceVersion,
@@ -179,6 +181,30 @@ def _plan_version(
             return DocumentVersionPlan(new_source=None, source_id=existing_id, version_number=next_number)
 
 
+SERVICE_ACCOUNT_ID = UUID("00000000-0000-0000-0000-000000000000")
+
+
+async def ensure_service_account(session: AsyncSession) -> None:
+    """Idempotently guarantee the default service-account ``app_user`` row
+    exists.
+
+    Uploads default ``uploaded_by`` to the nil UUID (see api/ingest.py
+    ``DEFAULT_USER_ID``), which is a foreign key to ``app_user.id``. If that
+    row is absent — e.g. after ``app_user`` is truncated or on a fresh
+    schema — the ``knowledge_source`` insert fails with a foreign-key
+    violation. Upserting it here makes registration self-healing."""
+    stmt = (
+        pg_insert(AppUser)
+        .values(
+            id=SERVICE_ACCOUNT_ID,
+            email="system@alpinist.local",
+            is_service_account=True,
+        )
+        .on_conflict_do_nothing(index_elements=[AppUser.id])
+    )
+    await session.execute(stmt)
+
+
 async def register_document_version(
     session: AsyncSession,
     *,
@@ -195,6 +221,8 @@ async def register_document_version(
     Returns the queued job's ORM row, or None if this exact content was
     already ingested (global checksum dedup -> skip entirely).
     """
+    if uploaded_by == SERVICE_ACCOUNT_ID:
+        await ensure_service_account(session)
     checksum = compute_checksum(raw_bytes)
 
     retryable_version_id = await _find_retryable_version(session, checksum)

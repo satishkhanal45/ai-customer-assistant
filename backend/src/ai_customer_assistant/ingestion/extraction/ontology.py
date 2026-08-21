@@ -102,6 +102,11 @@ DOMAIN_ENTITY_TYPES: Mapping[str, tuple[str, ...]] = MappingProxyType(
         "Policies": (
             "Policy", "Guideline", "Standard", "Procedure",
             "Employee Handbook", "Training Material", "Benefit", "Leave Type",
+            "Employee Policy", "Leave Policy",
+        ),
+        "Company Services": (
+            "Web Development", "Mobile App", "AI System", "Frontend",
+            "Backend", "Animation", "UI/UX Design",
         ),
         "Security": (
             "Security Policy", "Security Practice", "Compliance Standard",
@@ -185,6 +190,61 @@ ENTITY_TYPE_SYNONYMS: Mapping[str, str] = MappingProxyType(
         "consulting": "Consulting Service",
         "product": "Product",
         "project": "Project",
+        # -- company services (web / mobile / AI / design / animation) ------
+        "web development": "Web Development",
+        "web dev": "Web Development",
+        "web development service": "Web Development",
+        "website development": "Web Development",
+        "web development services": "Web Development",
+        "mobile app": "Mobile App",
+        "mobile app development": "Mobile App",
+        "mobile application": "Mobile App",
+        "mobile development": "Mobile App",
+        "mobile app development services": "Mobile App",
+        "ios development": "Mobile App",
+        "android development": "Mobile App",
+        "app development": "Mobile App",
+        "ai system": "AI System",
+        "ai systems": "AI System",
+        "ai development": "AI System",
+        "ai development services": "AI System",
+        "artificial intelligence system": "AI System",
+        "ai solution": "AI System",
+        "frontend": "Frontend",
+        "front-end": "Frontend",
+        "front end": "Frontend",
+        "frontend development": "Frontend",
+        "frontend development services": "Frontend",
+        "backend": "Backend",
+        "back-end": "Backend",
+        "back end": "Backend",
+        "backend development": "Backend",
+        "backend development services": "Backend",
+        "animation": "Animation",
+        "animation service": "Animation",
+        "animation services": "Animation",
+        "motion graphics": "Animation",
+        "2d animation": "Animation",
+        "3d animation": "Animation",
+        "ui ux": "UI/UX Design",
+        "ui/ux": "UI/UX Design",
+        "ui/ux design": "UI/UX Design",
+        "ui design": "UI/UX Design",
+        "ux design": "UI/UX Design",
+        "ux": "UI/UX Design",
+        "web design": "UI/UX Design",
+        # -- company policies / HR ------------------------------------------
+        "employee policy": "Employee Policy",
+        "employee policies": "Employee Policy",
+        "hr policy": "Employee Policy",
+        "human resources policy": "Employee Policy",
+        "staff policy": "Employee Policy",
+        "leave policy": "Leave Policy",
+        "leave policies": "Leave Policy",
+        "vacation policy": "Leave Policy",
+        "time off policy": "Leave Policy",
+        "annual leave policy": "Leave Policy",
+        "holiday policy": "Leave Policy",
     }
 )
 
@@ -203,7 +263,7 @@ _ENTITY_TYPE_ATTRIBUTE_EXTENSIONS: Mapping[str, tuple[str, ...]] = MappingProxyT
         "Department": ("owner", "team"),
         "Team": ("manager", "department"),
         "Office": ("country", "city", "address"),
-        "Employee": ("role", "department", "email", "phone"),
+        "Employee": ("role", "designation", "department", "email", "phone", "salary", "joined_on"),
         "Person": ("role", "title", "employer", "department", "email", "phone"),
         "Role": ("department",),
         "Client": ("industry", "contract_type", "website"),
@@ -215,7 +275,7 @@ _ENTITY_TYPE_ATTRIBUTE_EXTENSIONS: Mapping[str, tuple[str, ...]] = MappingProxyT
         "Support Plan": ("support_level", "pricing_model", "response_time"),
         "Pricing Plan": ("pricing_model", "cost", "budget"),
         "SLA": ("service_level", "response_time", "uptime"),
-        "Package": ("pricing_model", "version"),
+        "Package": ("pricing_model", "version", "cost"),
         "Proposal": ("target_customer", "estimated_duration", "cost"),
         "Product": ("category", "version", "pricing_model"),
         "Project": ("owner", "start_date", "end_date", "budget"),
@@ -225,6 +285,14 @@ _ENTITY_TYPE_ATTRIBUTE_EXTENSIONS: Mapping[str, tuple[str, ...]] = MappingProxyT
         "API": ("api_type", "protocol", "authentication_method", "version"),
         "Microservice": ("technology", "programming_language", "protocol", "deployment_model"),
         "Integration": ("provider", "authentication_method", "protocol"),
+        # -- Company Services ------------------------------------------------
+        "Web Development": ("stack", "frameworks", "portfolio", "pricing_model", "turnaround"),
+        "Mobile App": ("platform", "os", "frameworks", "portfolio", "pricing_model"),
+        "AI System": ("ai_application", "models_used", "integration", "pricing_model"),
+        "Frontend": ("frameworks", "technologies", "pricing_model"),
+        "Backend": ("frameworks", "technologies", "api", "pricing_model"),
+        "Animation": ("animation_type", "tools", "portfolio", "pricing_model", "turnaround"),
+        "UI/UX Design": ("design_tools", "portfolio", "pricing_model"),
         # -- Technology -------------------------------------------------------
         "Technology": ("category", "version"),
         "Programming Language": ("version",),
@@ -255,6 +323,8 @@ _ENTITY_TYPE_ATTRIBUTE_EXTENSIONS: Mapping[str, tuple[str, ...]] = MappingProxyT
         "Knowledge Chunk": ("source", "version_number"),
         # -- Policies ---------------------------------------------------------------
         "Policy": ("category", "effective_date", "review_date"),
+        "Employee Policy": ("category", "effective_date", "review_date", "department", "owner"),
+        "Leave Policy": ("category", "effective_date", "review_date", "leave_types", "accrual"),
         "Guideline": ("category",),
         "Standard": ("category", "compliance"),
         "Procedure": ("category", "department"),
@@ -340,6 +410,11 @@ ATTRIBUTE_SYNONYMS: Mapping[str, str] = MappingProxyType(
         "works at": "employer",
         "field": "category",
         "segment": "category",
+        "price": "cost",
+        "rate": "cost",
+        "price range": "cost",
+        "monthly rate": "cost",
+        "fee": "cost",
     }
 )
 
@@ -396,6 +471,15 @@ ATTRIBUTE_VALUE_TYPES: Mapping[str, ValueType] = MappingProxyType(
         # Contact
         "website": "string", "email": "string", "phone": "string",
         "address": "string", "country": "string", "city": "string",
+        # Company Services
+        "stack": "string", "frameworks": "json", "portfolio": "string",
+        "turnaround": "string", "platform": "string", "os": "string",
+        "ai_application": "string", "models_used": "json", "integration": "string",
+        "technologies": "json", "api": "string", "animation_type": "string",
+        "tools": "json", "design_tools": "json",
+        # HR / policies
+        "designation": "string", "salary": "number", "joined_on": "date",
+        "leave_types": "json", "accrual": "string",
         # Miscellaneous
         "notes": "string", "remarks": "string", "dependencies": "json",
         "prerequisites": "json", "related_document": "string",
@@ -412,7 +496,9 @@ RELATION_TYPE_VOCABULARY: tuple[str, ...] = (
     "uses", "depends_on", "implements", "belongs_to", "managed_by",
     "owned_by", "created_by", "approved_by", "integrates_with", "contains",
     "requires", "supports", "deployed_on", "stored_in", "hosted_on",
-    "communicates_with", "related_to",
+    "communicates_with", "related_to", "employs", "provides", "leads",
+    "targets", "serves", "founded_by", "specializes_in", "delivers",
+    "builds", "develops", "designs",
 )
 
 RELATION_TYPE_SYNONYMS: Mapping[str, str] = MappingProxyType(
@@ -448,6 +534,12 @@ RELATION_TYPE_SYNONYMS: Mapping[str, str] = MappingProxyType(
         "headed by": "leads",
         "founded by": "founded_by",
         "founder of": "founded_by",
+        "specializes in": "specializes_in",
+        "specialised in": "specializes_in",
+        "delivers": "delivers",
+        "builds": "builds",
+        "develops": "develops",
+        "designs": "designs",
     }
 )
 
@@ -637,7 +729,12 @@ def safe_canonicalize_relation_type(candidate_text: Optional[str]) -> str:
 
 def formatted_ontology_reference() -> str:
     """Compact Domain -> Entity Types block for the extraction system
-    prompt, assembled from the static tables so it always stays in sync."""
+    prompt, assembled from the static tables so it always stays in sync.
+
+    Entity types ONLY (no per-type attributes): the reference is sent on
+    every model call, so keeping it small bounds the token cost of ingestion.
+    Attributes are handled by the schema descriptions and by the extraction
+    agent's canonicalization, not by listing them all in-context."""
     lines = [
         f"- {domain}: {', '.join(entity_types)}"
         for domain, entity_types in DOMAIN_ENTITY_TYPES.items()

@@ -28,20 +28,18 @@ class DownstreamStatus(str, Enum):
     """Verdict of one downstream agent turn, as seen by the Supervisor.
 
     - ``GROUNDED``: final answer ready to show the customer.
-    - ``UNGROUNDED``: answer failed the safety groundedness check.
     - ``ERROR``: the agent failed (timeout / infra), never propagates
       to the API layer.
     """
 
     GROUNDED = "GROUNDED"
-    UNGROUNDED = "UNGROUNDED"
     ERROR = "ERROR"
 
 
 class DownstreamResult(BaseModel):
     """Typed replacement for the bare
-    ``{"status", "response", "customer_wants_escalation"}`` dict v1
-    used. The Supervisor's ``decide_post_downstream`` consumes this.
+    ``{"status", "response"}`` dict v1
+    used.
 
     Observability fields (``agent_name``, ``latency_ms``, ``citations``,
     ``confidence``) are logged with a ``trace_id`` and never rendered to
@@ -52,7 +50,6 @@ class DownstreamResult(BaseModel):
 
     status: DownstreamStatus
     response: str
-    customer_wants_escalation: bool = False
     schema_version: int = 1
 
     agent_name: str | None = None

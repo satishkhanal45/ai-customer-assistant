@@ -220,14 +220,26 @@ class TestStructureAwareSplitting:
 
 
 class TestStructuredSourceType:
-    def test_one_chunk_no_splitting_regardless_of_size(
+    def test_structured_document_within_chunk_size_stays_one_chunk(
         self, word_tokenizer, long_form_source_types, structured_source_types
     ) -> None:
-        text = " ".join(f"field{i}" for i in range(900))  # far over chunk_size_tokens
+        text = " ".join(f"field{i}" for i in range(100))  # within chunk_size_tokens
         document = make_document(source_type="csv", text=text, structure=None)
         chunks = _chunk(document, word_tokenizer, long_form_source_types, structured_source_types)
         assert len(chunks) == 1
         assert chunks[0].text == text
+
+    def test_oversized_structured_record_splits_to_avoid_truncation(
+        self, word_tokenizer, long_form_source_types, structured_source_types
+    ) -> None:
+        # Far over chunk_size_tokens. The embedding model (BGE) truncates at
+        # 512 tokens, so an oversized record must be split rather than silently
+        # losing data past the model's context window (see _handle_structured).
+        text = " ".join(f"field{i}" for i in range(900))
+        document = make_document(source_type="csv", text=text, structure=None)
+        chunks = _chunk(document, word_tokenizer, long_form_source_types, structured_source_types)
+        assert len(chunks) > 1
+        assert all(c.token_count <= 500 for c in chunks)
 
     def test_empty_structured_document_produces_zero_chunks(
         self, word_tokenizer, long_form_source_types, structured_source_types

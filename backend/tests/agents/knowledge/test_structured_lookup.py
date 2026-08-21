@@ -118,3 +118,102 @@ async def test_attribute_lookup_returns_value_when_present(session, populated):
     assert len(facts) == 1
     assert facts[0].value == "Advisor"
     assert facts[0].attribute == "role"
+
+
+async def test_membership_relation_lookup_surfaces_members(session, populated):
+    """A membership/container query (e.g. "members of Alpinist Studios"
+    canonicalized to relation_type='contains') must not dead-end on an exact
+    relation_type match that no stored edge uses; it degrades to a membership
+    lookup that surfaces the entity's person-targeted relations (its roster)."""
+    company, _, _ = populated
+    query = StructuredQuery(
+        entity_type="Company",
+        entity_label="Alpinist Studios",
+        attribute=None,
+        relation_type="contains",
+        filters=(),
+        confidence=0.9,
+    )
+    facts = await structured_lookup(query, session=session)
+    relations = {fact.relation_type for fact in facts if fact.relation_type}
+    assert relations == {"employs", "advisor"}
+    # Facts are oriented on the queried company.
+    assert all(fact.entity_label == "Alpinist Studios" for fact in facts if fact.relation_type)
+
+
+async def test_non_membership_relation_lookup_stays_exact(session, populated):
+    """A precise relation query ('contains' is absent from stored edges but
+    a non-membership relation like 'uses' also absent) must NOT degrade —
+    so unrelated empty results are not flooded with the entity's full graph."""
+    company, _, _ = populated
+    query = StructuredQuery(
+        entity_type="Company",
+        entity_label="Alpinist Studios",
+        attribute=None,
+        relation_type="uses",
+        filters=(),
+        confidence=0.9,
+    )
+    facts = await structured_lookup(query, session=session)
+    assert facts == ()
+
+
+async def test_related_to_broad_relation_surfaces_members(session, populated):
+    """'who are the advisors of X?' often canonicalizes to the generic
+    vocabulary term 'related_to' (the extractor's catch-all for role
+    relations not in the vocabulary). That broad relation must degrade to a
+    membership lookup so the entity's people surface, not an empty result."""
+    company, _, _ = populated
+    query = StructuredQuery(
+        entity_type="Company",
+        entity_label="Alpinist Studios",
+        attribute=None,
+        relation_type="related_to",
+        filters=(),
+        confidence=0.9,
+    )
+    facts = await structured_lookup(query, session=session)
+    relations = {fact.relation_type for fact in facts if fact.relation_type}
+    assert relations == {"employs", "advisor"}
+    assert all(fact.entity_label == "Alpinist Studios" for fact in facts if fact.relation_type)
+
+
+async def test_membership_lookup_excludes_non_person_targets(session):
+    """The membership roster is built from person-targeted relations only;
+    relations to non-person entities (e.g. a partner company) are excluded,
+    and a membership query with no person relations falls back to the full
+    relation set rather than dead-ending."""
+    now = datetime.now(timezone.utc)
+    company = _uid()
+    person = _uid()
+    partner = _uid()
+    await session.execute(
+        entity_table.insert(),
+        [
+            {"id": company, "label": company, "entity_type": "Company", "name": "Alpinist Studios", "created_at": now},
+            {"id": person, "label": person, "entity_type": "person", "name": "Justin Flores", "created_at": now},
+            {"id": partner, "label": partner, "entity_type": "company", "name": "Partner Co", "created_at": now},
+        ],
+    )
+    await session.execute(
+        relation_table.insert(),
+        [
+            {"id": _uid(), "source_entity_id": company, "target_entity_id": person, "relation_type": "employs", "created_at": now},
+            {"id": _uid(), "source_entity_id": company, "target_entity_id": partner, "relation_type": "partners with", "created_at": now},
+        ],
+    )
+    await session.commit()
+
+    query = StructuredQuery(
+        entity_type="Company",
+        entity_label="Alpinist Studios",
+        attribute=None,
+        relation_type="contains",
+        filters=(),
+        confidence=0.9,
+    )
+    facts = await structured_lookup(query, session=session)
+    relations = {fact.relation_type for fact in facts if fact.relation_type}
+    # Only the person-targeted relation survives; the partner relation is dropped.
+    assert relations == {"employs"}
+    assert all(fact.value == "Justin Flores" for fact in facts)
