@@ -136,21 +136,27 @@ async def _link_entity_to_chunk(session: AsyncSession, version_id: UUID, chunk_i
 
 async def _persist_one_extraction(session: AsyncSession, version_id: UUID, extraction: ChunkExtraction) -> UUID | None:
     """Write one chunk's resolved entity + facts + relations. Returns the
-    resolved entity_id, or None if nothing extractable (step 5's rule)."""
-    if extraction.entity is None:
-        return None
+    resolved entity_id, or None if there was no primary entity.
 
-    entity_type, name = extraction.entity
-    entity_id = await _resolve_entity(session, entity_type, name)
-    await _link_entity_to_chunk(session, version_id, extraction.chunk_index, entity_id)
+    Facts and relations are persisted even when no primary ``resolve_entity``
+    call was made: the model often emits ``record_attribute_value`` /
+    ``record_relation`` for entities it never resolved, and those must not be
+    dropped. Each fact/relation resolves (and, if needed, creates) its own
+    referenced entities."""
+    entity_id: UUID | None = None
 
-    resolved: dict[tuple[str, str], UUID] = {extraction.entity: entity_id}
+    resolved: dict[tuple[str, str], UUID] = {}
 
     async def resolve(entity_type_: str, name_: str) -> UUID:
         key = (entity_type_, name_)
         if key not in resolved:
             resolved[key] = await _resolve_entity(session, entity_type_, name_)
         return resolved[key]
+
+    if extraction.entity is not None:
+        entity_type, name = extraction.entity
+        entity_id = await resolve(entity_type, name)
+        await _link_entity_to_chunk(session, version_id, extraction.chunk_index, entity_id)
 
     for fact in extraction.facts:
         attribute_id = await _resolve_attribute(

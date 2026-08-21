@@ -1,14 +1,9 @@
 """Tests for the adapter layer between Supervisor and downstream agents.
 
-Phase 1 covers the Knowledge Agent adapter
+Covers the Knowledge Agent adapter
 (``agents_wiring.make_knowledge_agent_node``): state mapping into the
-Knowledge graph, the async call under a timeout, and the GroundedResponse-
-shaped result / error-marker returned into ``SupervisorState``.
-
-Phase 2 covers the Safety gate (``agents_wiring.make_safety_gate_node``):
-the groundedness verdict produced as the canonical ``DownstreamResult``,
-the upstream-error short-circuit, and the interrupt()-based escalation
-confirmation against a MemorySaver checkpointer.
+Knowledge graph, the async call under a timeout, and the downstream_result
+it returns into ``SupervisorState``.
 """
 from __future__ import annotations
 
@@ -17,13 +12,8 @@ import json
 
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.types import Command
 
-from agents.safety_agent.types import GroundednessResult
-from agents.supervisor.agents_wiring import (
-    make_knowledge_agent_node,
-    make_safety_gate_node,
-)
+from agents.supervisor.agents_wiring import make_knowledge_agent_node
 from agents.supervisor.schema import ConversationTurn, SupervisorState
 from agents.ticket_agent.types import PendingTicket, Ticket
 
@@ -73,9 +63,9 @@ def test_knowledge_node_maps_state_and_returns_answer():
     node = make_knowledge_agent_node(fake)
 
     update = asyncio.run(node(_state()))
-    assert update["knowledge_response"]["answer_text"] == "Refunds within 30 days."
-    assert update["knowledge_response"]["is_grounded"] is True
-    assert update["knowledge_response"]["citations"] == []
+    assert update["downstream_result"]["status"] == "GROUNDED"
+    assert update["downstream_result"]["response"] == "Refunds within 30 days."
+    assert update["downstream_result"]["citations"] == []
 
 
 def test_knowledge_node_uses_user_message_as_raw_query():
@@ -119,40 +109,41 @@ def test_knowledge_node_preserves_citations():
     node = make_knowledge_agent_node(fake)
 
     update = asyncio.run(node(_state()))
-    assert update["knowledge_response"]["citations"] == list(citations)
+    assert update["downstream_result"]["citations"] == list(citations)
 
 
 # ---------------------------------------------------------------------------
 # error / timeout path
 # ---------------------------------------------------------------------------
 
-def test_knowledge_node_timeout_returns_error_marker():
+def test_knowledge_node_timeout_returns_error_result():
     fake = FakeKnowledgeGraph(
         result={"response": FakeResponse("too slow", True)}, delay=0.05
     )
     node = make_knowledge_agent_node(fake, timeout_s=0.01)
 
     update = asyncio.run(node(_state()))
-    assert update["knowledge_response"]["error"] == "timeout"
-    assert update["knowledge_response"]["answer_text"] == ""
-    assert update["knowledge_response"]["is_grounded"] is False
+    assert update["downstream_result"]["status"] == "ERROR"
+    assert update["downstream_result"]["error"] == "timeout"
+    assert update["downstream_result"]["response"]
 
 
-def test_knowledge_node_llm_exception_returns_error_marker():
+def test_knowledge_node_llm_exception_returns_error_result():
     fake = FakeKnowledgeGraph(exc=RuntimeError("LLM down"))
     node = make_knowledge_agent_node(fake)
 
     update = asyncio.run(node(_state()))
-    assert update["knowledge_response"]["error"] == "error"
-    assert update["knowledge_response"]["answer_text"] == ""
+    assert update["downstream_result"]["status"] == "ERROR"
+    assert update["downstream_result"]["error"] == "error"
 
 
-def test_knowledge_node_missing_response_returns_error_marker():
+def test_knowledge_node_missing_response_returns_error_result():
     fake = FakeKnowledgeGraph(result={})
     node = make_knowledge_agent_node(fake)
 
     update = asyncio.run(node(_state()))
-    assert update["knowledge_response"]["error"] == "missing_response"
+    assert update["downstream_result"]["status"] == "ERROR"
+    assert update["downstream_result"]["error"] == "missing_response"
 
 
 def test_timeout_flush_is_optional_param():
@@ -197,7 +188,7 @@ def test_build_graph_rejects_both_knowledge_sources():
 async def test_wired_knowledge_node_runs_under_ainvoke():
     """Once a real knowledge graph is wired the Supervisor graph is async
     (per plan open question #5); verify the full path populates
-    knowledge_response."""
+    downstream_result."""
     from agents.supervisor.graph import build_supervisor_graph
 
     payload = json.dumps(
@@ -218,195 +209,49 @@ async def test_wired_knowledge_node_runs_under_ainvoke():
     result = await graph.ainvoke(
         {"user_message": "What is the refund policy?", "conversation_history": [], "clarification_attempts": 0}
     )
-    assert result["knowledge_response"]["answer_text"] == "answer"
-    assert result["knowledge_response"]["is_grounded"] is False
+    assert result["downstream_result"]["status"] == "GROUNDED"
+    assert result["downstream_result"]["response"] == "answer"
+    assert result["final_response"] == "answer"
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 — safety gate node (``make_safety_gate_node``)
+# Ticket Agent flow
 # ---------------------------------------------------------------------------
 
-def _knowledge_routing_payload() -> str:
-    return json.dumps(
+def test_ticket_agent_flow_collects_email_then_creates_ticket():
+    """The Ticket Agent's two-step flow: open the ticket (interrupt for the
+    email), then resume with the email to create the Ticket and finalize."""
+    from langgraph.types import Command
+
+    from agents.supervisor.graph import build_supervisor_graph
+
+    payload = json.dumps(
         {
             "request_category": "DOMAIN_REQUEST",
             "domain_confidence": 0.9,
-            "intent": "KNOWLEDGE_QUERY",
-            "intent_confidence": 0.95,
+            "intent": "CREATE_TICKET",
+            "intent_confidence": 0.97,
             "clarification_question": None,
         }
     )
-
-
-def _knowledge_node_returning(
-    answer_text: str,
-    is_grounded: bool,
-    *,
-    error: str | None = None,
-) -> Callable:
-    """Sync knowledge node that just publishes a knowledge_response, letting
-    the safety gate be exercised at graph level without a compiled RAG graph."""
-
-    def _node(_state) -> dict:
-        knowledge_response = {
-            "answer_text": answer_text,
-            "is_grounded": is_grounded,
-            "citations": [],
-        }
-        if error is not None:
-            knowledge_response["error"] = error
-        return {"knowledge_response": knowledge_response}
-
-    return _node
-
-
-def test_safety_gate_grounded_returns_grounded_result():
-    """A grounded verdict maps to report_grounded -> status GROUNDED."""
-    seen = []
-
-    def groundedness_check(answer: str):
-        seen.append(answer)
-        return GroundednessResult(is_grounded=True, confidence_score=1.0)
-
-    node = make_safety_gate_node(groundedness_check=groundedness_check)
-    update = node(
-        {
-            "user_message": "What is the refund policy?",
-            "knowledge_response": {
-                "answer_text": "Refunds within 30 days.",
-                "is_grounded": True,
-                "citations": [],
-            },
-        }
-    )
-    assert seen == ["Refunds within 30 days."]
-    assert update["downstream_result"]["status"] == "GROUNDED"
-    assert update["downstream_result"]["response"] == "Refunds within 30 days."
-    assert update["downstream_result"]["customer_wants_escalation"] is False
-
-
-def test_safety_gate_upstream_error_short_circuits():
-    """The groundedness check must never run on a failed retrieval."""
-    called = False
-
-    def groundedness_check(_: str):
-        nonlocal called
-        called = True
-        return GroundednessResult(is_grounded=True, confidence_score=1.0)
-
-    node = make_safety_gate_node(groundedness_check=groundedness_check)
-    update = node(
-        {
-            "user_message": "What is the refund policy?",
-            "knowledge_response": {
-                "answer_text": "",
-                "is_grounded": False,
-                "citations": [],
-                "error": "timeout",
-            },
-        }
-    )
-    assert called is False
-    assert update["downstream_result"]["status"] == "ERROR"
-    assert update["downstream_result"]["customer_wants_escalation"] is False
-
-
-def test_safety_gate_grounded_uses_knowledge_hint_when_no_check():
-    """Default verdict trusts Knowledge's own is_grounded hint."""
-    node = make_safety_gate_node()
-    update = node(
-        {
-            "user_message": "What is the refund policy?",
-            "knowledge_response": {
-                "answer_text": "Refunds within 30 days.",
-                "is_grounded": True,
-                "citations": [],
-            },
-        }
-    )
-    assert update["downstream_result"]["status"] == "GROUNDED"
-
-
-def _build_safety_graph():
-    """Graph wired with a sync knowledge node that always returns an
-    ungrounded answer plus the real safety gate, on a MemorySaver
-    checkpointer (required for the interrupt() flow)."""
-    from agents.supervisor.graph import build_supervisor_graph
-
-    return build_supervisor_graph(
-        llm_client=_StubClient(_knowledge_routing_payload()),
-        knowledge_agent_node=_knowledge_node_returning(
-            "answer", is_grounded=False
-        ),
-        safety_gate_node=make_safety_gate_node(
-            groundedness_check=lambda answer: GroundednessResult(
-                is_grounded=False, confidence_score=0.0
-            )
-        ),
+    fake_ticket_ops = FakeTicketOps()
+    graph = build_supervisor_graph(
+        llm_client=_StubClient(payload),
+        ticket_ops=fake_ticket_ops,
         checkpointer=MemorySaver(),
     )
 
-
-def test_safety_gate_ungraded_pauses_with_escalation_confirmation():
-    """First ungrounded turn: interrupt() with an escalation-confirmation
-    payload; no downstream_result is produced until the resume."""
-    from agents.supervisor.graph import build_supervisor_graph
-
-    graph = _build_safety_graph()
-
-    config = {"configurable": {"thread_id": "safety-decline"}}
+    config = {"configurable": {"thread_id": "ticket-flow"}}
     first = graph.invoke(
         {
-            "user_message": "What is the refund policy?",
+            "user_message": "I need a refund",
             "conversation_history": [],
             "clarification_attempts": 0,
         },
         config=config,
     )
     assert "__interrupt__" in first
-    (interrupt_payload,) = first["__interrupt__"]
-    assert interrupt_payload.value["type"] == "escalation-confirmation"
-    assert "downstream_result" not in first
-
-    declined = graph.invoke(Command(resume=False), config=config)
-    assert declined["downstream_result"]["status"] == "UNGROUNDED"
-    assert declined["downstream_result"]["customer_wants_escalation"] is False
-    assert declined["final_response"] == declined["downstream_result"]["response"]
-
-
-def test_safety_gate_ungraded_after_confirm_escalates():
-    """Customer confirms -> the ESCALATE branch of the post-downstream edge
-    fires, the Ticket Agent opens a ticket and interrupt()s for the email;
-    on resume it produces a real Ticket + non-null final_response."""
-    from agents.supervisor.graph import build_supervisor_graph
-
-    fake_ticket_ops = FakeTicketOps()
-    graph = build_supervisor_graph(
-        llm_client=_StubClient(_knowledge_routing_payload()),
-        knowledge_agent_node=_knowledge_node_returning(
-            "answer", is_grounded=False
-        ),
-        safety_gate_node=make_safety_gate_node(
-            groundedness_check=lambda answer: GroundednessResult(
-                is_grounded=False, confidence_score=0.0
-            )
-        ),
-        ticket_ops=fake_ticket_ops,
-        checkpointer=MemorySaver(),
-    )
-
-    config = {"configurable": {"thread_id": "safety-confirm"}}
-    graph.invoke(
-        {
-            "user_message": "What is the refund policy?",
-            "conversation_history": [],
-            "clarification_attempts": 0,
-        },
-        config=config,
-    )
-    email_interrupt = graph.invoke(Command(resume=True), config=config)
-    assert "__interrupt__" in email_interrupt
-    (email_payload,) = email_interrupt["__interrupt__"]
+    (email_payload,) = first["__interrupt__"]
     assert email_payload.value["type"] == "email-collection"
 
     ticket = graph.invoke(
@@ -415,47 +260,8 @@ def test_safety_gate_ungraded_after_confirm_escalates():
     assert ticket["downstream_result"]["status"] == "GROUNDED"
     assert ticket["final_response"] is not None
     assert "customer@example.com" in ticket["final_response"]
-    assert "What is the refund policy?" in fake_ticket_ops.called_with_query
+    assert "I need a refund" in fake_ticket_ops.called_with_query
     assert len(fake_ticket_ops.created) == 1
-    assert fake_ticket_ops.created[0].email == "customer@example.com"
-
-
-def test_safety_gate_ungraded_decline_takes_finalize_branch():
-    """Customer declines -> FINALIZE branch: assemble_response finalizes the
-    fallback text into final_response, never reaching the Ticket Agent."""
-    from agents.supervisor.graph import build_supervisor_graph
-
-    fake_ticket_ops = FakeTicketOps()
-    graph = build_supervisor_graph(
-        llm_client=_StubClient(_knowledge_routing_payload()),
-        knowledge_agent_node=_knowledge_node_returning(
-            "answer", is_grounded=False
-        ),
-        safety_gate_node=make_safety_gate_node(
-            groundedness_check=lambda answer: GroundednessResult(
-                is_grounded=False, confidence_score=0.0
-            )
-        ),
-        ticket_ops=fake_ticket_ops,
-        checkpointer=MemorySaver(),
-    )
-
-    config = {"configurable": {"thread_id": "safety-finalize"}}
-    graph.invoke(
-        {
-            "user_message": "What is the refund policy?",
-            "conversation_history": [],
-            "clarification_attempts": 0,
-        },
-        config=config,
-    )
-    declined = graph.invoke(Command(resume=False), config=config)
-    assert declined["downstream_result"]["status"] == "UNGROUNDED"
-    assert declined["downstream_result"]["customer_wants_escalation"] is False
-    assert declined["final_response"] is not None
-    assert declined["final_response"] == declined["downstream_result"]["response"]
-    assert fake_ticket_ops.calls == []
-    assert fake_ticket_ops.created == []
 
 
 class FakeTicketOps:

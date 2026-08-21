@@ -6,7 +6,7 @@ node, llm_client) are wired together by graph.build_supervisor_graph.
 from .classification import Classification, parse_llm_response
 from .graph import build_supervisor_graph
 from .llm_client import StubSupervisorLLMClient, SupervisorLLMClient
-from .routing import RoutingDecision, decide_post_downstream, decide_route
+from .routing import RoutingDecision, decide_route
 from .schema import (
     ConversationTurn,
     Intent,
@@ -23,7 +23,6 @@ __all__ = [
     "StubSupervisorLLMClient",
     "SupervisorLLMClient",
     "RoutingDecision",
-    "decide_post_downstream",
     "decide_route",
     "ConversationTurn",
     "Intent",

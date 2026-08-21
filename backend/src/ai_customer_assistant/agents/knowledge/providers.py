@@ -26,11 +26,19 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Callable, Optional, Protocol, TypeAlias
 
 import groq
 
 from .config import KnowledgeAgentConfig
+
+# Transient-call budget for the Groq backend: connection blips and 429 rate
+# limits are retried with exponential backoff (honouring Groq's "try again in
+# XmYs" hint when present) before the error is surfaced to the graph.
+_RETRY_ATTEMPTS = 4
+_RETRY_BASE_DELAY = 1.5
+_MAX_COOLDOWN_WAIT = 300.0  # 5 minutes
 
 
 class KnowledgeProvider(Protocol):
@@ -186,8 +194,8 @@ class GroqKnowledgeProvider:
         )
 
     def _complete(self, messages: list[dict], *, model: str) -> str:
-        last_error: Optional[groq.APIError] = None
-        for _ in range(2):
+        last_error: Optional[Exception] = None
+        for attempt in range(_RETRY_ATTEMPTS):
             try:
                 response = self.client.chat.completions.create(
                     model=model,
@@ -197,10 +205,33 @@ class GroqKnowledgeProvider:
                     response_format={"type": "json_object"},
                 )
                 return response.choices[0].message.content or "{}"
-            except groq.APIError as exc:
+            except Exception as exc:  # noqa: BLE001 - APIError + wrapped connection errors
                 last_error = exc
-
+            if attempt < _RETRY_ATTEMPTS - 1:
+                cooldown = _cooldown_seconds(str(last_error))
+                time.sleep((cooldown or _RETRY_BASE_DELAY) * (attempt + 1))
+        assert last_error is not None
         raise last_error
+
+
+def _cooldown_seconds(message: str) -> float | None:
+    """Parse Groq's 'Please try again in 6m33.552s.' hint into seconds."""
+    for token in message.replace(",", " ").split():
+        stripped = token.rstrip(".")
+        if "m" in stripped and stripped.endswith("s"):
+            minutes_part, seconds_part = stripped[:-1].split("m", 1)
+            try:
+                return float(minutes_part) * 60 + float(seconds_part)
+            except ValueError:
+                continue
+        try:
+            if stripped.endswith("m"):
+                return float(stripped[:-1]) * 60
+            if stripped.endswith("s"):
+                return float(stripped[:-1])
+        except ValueError:
+            continue
+    return None
 
 
 # ---------------------------------------------------------------------------

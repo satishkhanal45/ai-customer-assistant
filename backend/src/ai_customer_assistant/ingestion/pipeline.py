@@ -36,7 +36,6 @@ from typing import Awaitable, Callable
 from uuid import UUID
 
 import httpx
-from langchain_groq import ChatGroq
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ingestion.chunk_embed.types import ExtractedDocument as ChunkerDocument
@@ -330,13 +329,13 @@ async def _resolve_deps(session: AsyncSession) -> PipelineDeps:
 
 def _default_extraction_agent() -> ExtractionAgent:
     """Wire the EAV extraction model. Honor EAV_MODEL when set; default to a
-    Groq model that reliably emits the full EAV tool set (resolve_entity +
-    record_attribute_value + record_relation), not just resolve_entity."""
+    Groq model in JSON mode (one structured extraction per chunk)."""
     import os
 
-    from ingestion.extraction.agent import build_extraction_agent
-    from langchain_groq import ChatGroq
+    from groq import Groq
 
-    model = os.environ.get("EAV_MODEL", "llama-3.3-70b-versatile")
-    llm = ChatGroq(model=os.environ.get("EAV_MODEL", "llama-3.3-70b-versatile"), temperature=0)
-    return build_extraction_agent(llm)
+    from ingestion.extraction.agent import build_extraction_agent
+
+    model = os.environ.get("EAV_MODEL", "openai/gpt-oss-120b")
+    client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+    return build_extraction_agent(client=client, model=model)

@@ -23,19 +23,16 @@ from langgraph.graph import END, StateGraph
 
 from .agents_wiring import (
     make_knowledge_agent_node,
-    make_safety_gate_node,
     make_ticket_agent_node,
 )
 from .llm_client import StubSupervisorLLMClient, SupervisorLLMClient
 from .node import assemble_response_node, make_classify_and_route_node
-from .routing import decide_post_downstream
 from .schema import NextAgent, SupervisorState
 from ..ticket_agent.store import TicketStore
 
 CLASSIFY_NODE = "classify_and_route"
 ASSEMBLE_NODE = "assemble_response"
 KNOWLEDGE_AGENT_NODE = "knowledge_agent"
-SAFETY_GATE_NODE = "safety_gate"
 TICKET_AGENT_NODE = "ticket_agent"
 
 # Where classification/post-downstream routing can send the conversation.
@@ -109,39 +106,12 @@ def _route_after_classification(state: SupervisorState) -> str:
     )
 
 
-# Post-downstream branches (Phase 3): after a downstream agent (Safety gate
-# or Ticket Agent) reports back, decide whether to finalize the response or
-# reroute into the Ticket Agent as an escalation. assemble_response is now
-# pure string formatting; the routing decision lives in this edge.
-POST_DOWNSTREAM_FINALIZE = "FINALIZE"
-POST_DOWNSTREAM_ESCALATE = "ESCALATE"
-
-_POST_DOWNSTREAM_TARGETS = {
-    POST_DOWNSTREAM_FINALIZE: ASSEMBLE_NODE,
-    POST_DOWNSTREAM_ESCALATE: TICKET_AGENT_NODE,
-}
-
-
-def _route_after_downstream(state: SupervisorState) -> str:
-    """Conditional-edge function evaluated right after the Safety gate and
-    after the Ticket Agent: FINALIZE -> assemble_response, ESCALATE -> the
-    (re-entrant) ticket_agent node."""
-    decision = decide_post_downstream(state.get("downstream_result") or {})
-    return (
-        POST_DOWNSTREAM_ESCALATE
-        if decision.next_agent is NextAgent.TICKET_AGENT
-        else POST_DOWNSTREAM_FINALIZE
-    )
-
-
 def build_supervisor_graph(
     llm_client: Optional[SupervisorLLMClient] = None,
     *,
     knowledge_agent_node: Optional[Callable[[SupervisorState], dict]] = None,
     ticket_agent_node: Optional[Callable[[SupervisorState], dict]] = None,
-    safety_gate_node: Optional[Callable[[SupervisorState], dict]] = None,
     knowledge_graph: Optional[Callable] = None,
-    groundedness_check: Optional[Callable] = None,
     knowledge_timeout_s: float = 120,
     ticket_ops: Optional[Callable] = None,
     checkpointer: Optional[BaseCheckpointSaver] = None,
@@ -159,28 +129,10 @@ def build_supervisor_graph(
     and an explicit ``knowledge_agent_node`` is ambiguous and raises
     ValueError — the callable must not silently override a wired graph.
 
-    Phase 2: a ``safety_gate`` node runs after every Knowledge Agent path
-    before assembly. Either inject an explicit ``safety_gate_node`` or let
-    the default be built via ``make_safety_gate_node``. When the Knowledge
-    path is a placeholder (no real build, timeout, error) the placeholder
-    node already returns a ``downstream_result``; the gate passes untouched
-    states through (no ``knowledge_response`` -> no-op update).
-
-    Phase 3: the post-downstream routing decision
-    (``decide_post_downstream``) is a conditional edge evaluated right
-    after ``safety_gate`` and after ``ticket_agent`` — ``assemble_response``
-    is pure string formatting. FINALIZE -> assemble_response -> END;
-    ESCALATE -> the re-entrant ``ticket_agent`` node, which for a wired
-    ``ticket_ops`` collects an email via ``interrupt()`` and creates a real
-    Ticket on resume.
-
-    Phase 4: the Ticket Agent adapter runs against a ``TicketStore`` — the
-    idempotent persistence boundary. When ``ticket_ops`` is supplied it is
-    used as-is (a ``TicketStore`` instance, or a duck-typed fake with
-    ``call`` / ``create_ticket`` / optional ``next_sequence``); when None,
-    the graph instantiates its own in-memory ``TicketStore`` so the
-    CREATE_TICKET path is fully functional out of the box. Passing an
-    explicit ``ticket_agent_node`` callable still overrides everything.
+    Every downstream agent (Knowledge or Ticket) reports back a
+    ``downstream_result``; ``assemble_response`` is pure string formatting
+    that renders it into ``final_response``. The Knowledge Agent's answer is
+    passed straight through — there is no separate safety gate.
     """
     client = llm_client or StubSupervisorLLMClient()
 
@@ -220,26 +172,13 @@ def build_supervisor_graph(
         ),
     )
     graph.add_node(
-        SAFETY_GATE_NODE,
-        _log_node(
-            SAFETY_GATE_NODE,
-            safety_gate_node
-            or make_safety_gate_node(groundedness_check=groundedness_check),
-        ),
-    )
-    graph.add_node(
         ASSEMBLE_NODE, _log_node(ASSEMBLE_NODE, assemble_response_node)
     )
 
     graph.set_entry_point(CLASSIFY_NODE)
     graph.add_conditional_edges(CLASSIFY_NODE, _route_after_classification)
-    graph.add_edge(KNOWLEDGE_AGENT_NODE, SAFETY_GATE_NODE)
-    graph.add_conditional_edges(
-        SAFETY_GATE_NODE, _route_after_downstream, _POST_DOWNSTREAM_TARGETS
-    )
-    graph.add_conditional_edges(
-        TICKET_AGENT_NODE, _route_after_downstream, _POST_DOWNSTREAM_TARGETS
-    )
+    graph.add_edge(KNOWLEDGE_AGENT_NODE, ASSEMBLE_NODE)
+    graph.add_edge(TICKET_AGENT_NODE, ASSEMBLE_NODE)
     graph.add_edge(ASSEMBLE_NODE, END)
 
     return graph.compile(checkpointer=checkpointer)

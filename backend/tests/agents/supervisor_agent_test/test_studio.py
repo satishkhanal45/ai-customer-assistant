@@ -14,7 +14,6 @@ EXPECTED_NODES = frozenset(
     {
         "classify_and_route",
         "knowledge_agent",
-        "safety_gate",
         "ticket_agent",
         "assemble_response",
     }

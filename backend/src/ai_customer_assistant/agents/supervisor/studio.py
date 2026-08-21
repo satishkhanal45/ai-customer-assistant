@@ -14,10 +14,7 @@ knowledge base plus a one-time BGE ``SentenceTransformer`` download. Neither
 is reliably available from the host where ``langgraph dev`` runs, so per the
 doc's fallback guidance we default to fakes: deterministic stub classifier,
 a fake Knowledge subgraph, and ``MemorySaver``. This is plenty to visualize
-topology, routing, and the interrupt/resume flows, at fast startup with zero
-external calls. The single real-vs-fake choice is made here, once, and the
-fake ``knowledge_graph`` result is toggled by the input message so both the
-straight-through and escalation paths can be driven from Studio's UI.
+topology and routing at fast startup with zero external calls.
 
 The construction reuses ``build_supervisor_graph`` and the existing
 supervisor graph composition directly — no graph logic is re-implemented.
@@ -51,10 +48,8 @@ class _StudioLLMClient:
     Studio can exercise different routes from its UI:
 
       - greeting words -> GREETING (terminates at END directly);
-      - an explicitly ``ungrounded`` message -> KNOWLEDGE_QUERY (routing to
-        the fake Knowledge node, whose stub below yields an ungrounded
-        answer, triggering the escalation-confirmation interrupt);
-      - any other knowledge-ish message -> KNOWLEDGE_QUERY (grounded).
+      - any other message -> KNOWLEDGE_QUERY (routes to the fake Knowledge
+        node).
     """
 
     def classify(
@@ -84,29 +79,19 @@ class _StudioKnowledgeGraph:
 
     Matches the shape ``make_knowledge_agent_node`` expects: an object with
     an ``ainvoke(input) -> Mapping`` whose ``response`` key is a
-    ``GroundedResponse``. Groundedness is flipped by the input message so the
-    both the straight-through (grounded) and escalation (ungrounded) paths
-    are reachable from Studio.
+    ``GroundedResponse``.
     """
 
     _GROUNDED_ANSWER = (
         "Support plans are offered as Basic, Pro, and Enterprise tiers. "
         "This answer is grounded in the knowledge base."
     )
-    _UNGROUNDED_ANSWER = (
-        "I'm not entirely certain about that, and this answer isn't backed "
-        "by a retrieved source."
-    )
 
     async def ainvoke(self, state: Mapping[str, Any]) -> dict:
-        query = str(state.get("raw_query", "")).lower()
-        ungrounded = "ungrounded" in query
         return {
             "response": GroundedResponse(
-                answer_text=self._UNGROUNDED_ANSWER
-                if ungrounded
-                else self._GROUNDED_ANSWER,
-                is_grounded=not ungrounded,
+                answer_text=self._GROUNDED_ANSWER,
+                is_grounded=True,
                 citations=(),
             )
         }
@@ -119,7 +104,7 @@ def build_supervisor_graph_for_studio():
     ``build_supervisor_graph`` with fake/durable-in-memory dependencies (see
     module docstring for the real-vs-fake decision):
       - ``llm_client``: deterministic stub classifier;
-      - ``knowledge_graph``: stub subgraph (grounded/ungrounded by message);
+      - ``knowledge_graph``: stub subgraph;
       - ``ticket_ops``: the in-memory ``TicketStore`` (same as the app default);
       - ``checkpointer``: ``MemorySaver``, the dev/test default.
     """

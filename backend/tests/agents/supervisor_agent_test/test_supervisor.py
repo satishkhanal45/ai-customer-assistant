@@ -3,7 +3,7 @@
 Three layers, tested separately per the immutable/pure-function design:
 
 1. classification.parse_llm_response — pure, no I/O.
-2. routing.decide_route / decide_post_downstream — pure, no I/O.
+2. routing.decide_route — pure, no I/O.
 3. graph.build_supervisor_graph — wiring, exercised with a FakeClient so no
    network call happens in the default test run.
 
@@ -23,7 +23,6 @@ from agents.supervisor.graph import build_supervisor_graph
 from agents.supervisor.node import _bounded_history
 from agents.supervisor.routing import (
     _SAFE_FALLBACK_RESPONSE,
-    decide_post_downstream,
     decide_route,
 )
 from agents.supervisor.schema import (
@@ -186,32 +185,6 @@ def test_unknown_intent_escalates_after_max_attempts():
     assert decision.next_agent is NextAgent.TICKET_AGENT
     assert decision.ticket_type is TicketType.ESCALATION
     assert decision.clarification_required is False
-
-
-# ---------------------------------------------------------------------------
-# routing.decide_post_downstream
-# ---------------------------------------------------------------------------
-
-def test_post_downstream_finalizes_normal_result():
-    decision = decide_post_downstream({"status": "OK", "response": "Here you go."})
-    assert decision.next_agent is NextAgent.NONE
-    assert decision.final_response == "Here you go."
-
-
-def test_post_downstream_escalates_on_ungrounded_confirmed():
-    decision = decide_post_downstream(
-        {"status": "UNGROUNDED", "customer_wants_escalation": True}
-    )
-    assert decision.next_agent is NextAgent.TICKET_AGENT
-    assert decision.ticket_type is TicketType.ESCALATION
-
-
-def test_post_downstream_does_not_escalate_without_confirmation():
-    decision = decide_post_downstream(
-        {"status": "UNGROUNDED", "customer_wants_escalation": False, "response": "Sorry, not sure."}
-    )
-    assert decision.next_agent is NextAgent.NONE
-    assert decision.final_response == "Sorry, not sure."
 
 
 # ---------------------------------------------------------------------------

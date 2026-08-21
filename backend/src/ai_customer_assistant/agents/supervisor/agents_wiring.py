@@ -1,10 +1,10 @@
 """Adapter nodes: bridge between the Supervisor's graph and downstream
 agents.
 
-Each downstream agent (Knowledge, Safety, Ticket) is injected as an
-already-built node callable — or, for Knowledge, a compiled subgraph
-wrapped here — rather than constructed by the Supervisor. These adapters
-are single-responsibility: they only map SupervisorState in, drive the
+Each downstream agent (Knowledge, Ticket) is injected as an already-built
+node callable — or, for Knowledge, a compiled subgraph wrapped here —
+rather than constructed by the Supervisor. These adapters are
+single-responsibility: they only map SupervisorState in, drive the
 downstream call, and map the result back out. No routing, no formatting,
 no persistence logic lives in this module.
 
@@ -25,9 +25,6 @@ from langgraph.types import interrupt
 from ..contracts import ConversationTurn
 from .routing import _SAFE_FALLBACK_RESPONSE
 from .schema import SupervisorState
-from ..safety_agent.fallback_response import generate_fallback_response
-from ..safety_agent.report import report_grounded, report_ungrounded
-from ..safety_agent.types import GroundednessResult
 
 KnowledgeGraph = Callable[[Mapping[str, Any]], Any]
 
@@ -39,7 +36,7 @@ def make_knowledge_agent_node(
     """Build the Knowledge Agent adapter node.
 
     Maps ``SupervisorState`` -> Knowledge state input:
-      - ``user_messagap: 6px;ge`` -> ``raw_query``
+      - ``user_message`` -> ``raw_query``
       - ``conversation_history`` -> flattened role-labeled strings
       - (via ``flatten_history``), matching Knowledge's
       - ``conversation_history: tuple[str, ...]`` channel.
@@ -51,13 +48,12 @@ def make_knowledge_agent_node(
 
     Runs ``knowledge_graph.ainvoke(...)`` under
     ``asyncio.wait_for(..., timeout_s)``. On timeout or any exception it
-    returns a GroundedResponse-shaped *error marker* (``error`` key set),
-    not a ``DownstreamResult`` — the Safety gate (Phase 2) is the single
-    place that constructs ``DownstreamStatus.ERROR`` from a failed
-    retrieval.
+    returns a ``downstream_result`` with status ``ERROR`` and the safe
+    fallback response.
 
-    Success returns only GroundedResponse fields under ``knowledge_response``:
-    ``{"answer_text", "is_grounded", "citations"}``.
+    Success returns a ``downstream_result`` with status ``GROUNDED`` and
+    the answer text as ``response``. Citations are forwarded alongside so
+    the serving layer can surface them to the customer.
     """
     async def knowledge_agent(state: SupervisorState) -> dict:
         knowledge_input = {
@@ -72,18 +68,18 @@ def make_knowledge_agent_node(
                 timeout=timeout_s,
             )
         except asyncio.TimeoutError:
-            return _error_marker("timeout")
+            return _error_result("timeout")
         except Exception:
-            return _error_marker("error")
+            return _error_result("error")
 
         response = result.get("response")
         if response is None:
-            return _error_marker("missing_response")
+            return _error_result("missing_response")
 
         return {
-            "knowledge_response": {
-                "answer_text": response.answer_text,
-                "is_grounded": response.is_grounded,
+            "downstream_result": {
+                "status": "GROUNDED",
+                "response": response.answer_text,
                 "citations": list(response.citations),
             }
         }
@@ -118,117 +114,18 @@ def _bounded_history(history: list[ConversationTurn]) -> tuple[str, ...]:
     return tuple(kept)
 
 
-def _error_marker(reason: str) -> dict:
-    """GroundedResponse-shaped marker so the Safety gate can map it to
-    ``DownstreamStatus.ERROR`` without guessing at the failure mode."""
+def _error_result(reason: str) -> dict:
+    """DownstreamResult-shaped marker for a failed retrieval.
+
+    The failed turn is surfaced as a safe fallback rather than propagated
+    to the customer. ``reason`` is kept for observability."""
     return {
-        "knowledge_response": {
-            "answer_text": "",
-            "is_grounded": False,
-            "citations": [],
+        "downstream_result": {
+            "status": "ERROR",
+            "response": _SAFE_FALLBACK_RESPONSE,
             "error": reason,
         }
     }
-
-
-def _verdict_from_knowledge_hint(knowledge_response: dict) -> GroundednessResult:
-    """Default verdict when no groundedness_check is injected: trust the
-    Knowledge node's own ``is_grounded`` hint until the real embedded
-    similarity check is bound in Phase 6."""
-    hint = bool(knowledge_response.get("is_grounded"))
-    return GroundednessResult(is_grounded=hint, confidence_score=1.0 if hint else 0.0)
-
-
-def _confirms_escalation(resume_value: object) -> bool:
-    """Normalize the customer's resume value into an escalation flag.
-
-    Only an explicit confirmation counts: truthy booleans and the common
-    affirmative strings. Anything else (garbage, empty, ``False``) means
-    the customer declined — matching the plan's "resume with garbage"
-    check (decline is the safe default, never escalates by accident).
-    """
-    if resume_value is True:
-        return True
-    if isinstance(resume_value, str) and resume_value.strip().lower() in {
-        "yes",
-        "y",
-        "true",
-        "confirm",
-    }:
-        return True
-    return False
-
-
-def make_safety_gate_node(
-    groundedness_check: Optional[Callable[[str], GroundednessResult]] = None,
-) -> Callable[[SupervisorState], dict]:
-    """Build the Safety gate adapter node.
-
-    Runs AFTER the Knowledge Agent node and BEFORE the downstream
-    routing/assembly (see ``graph.py``), mapping the ``knowledge_response``
-    channel into the canonical ``DownstreamResult`` the Supervisor's
-    ``decide_post_downstream`` consumes.
-
-    Behavior, per agents_integration_plan_new.md §2.4 / §4.2:
-      - No ``knowledge_response`` in state (placeholder or an injected
-        Knowledge node that already returned a ``downstream_result``):
-        returns an empty update so routing sees the pre-existing result.
-      - Upstream error marker (``error`` key, from the Phase-1 Knowledge
-        adapter's timeout/error/missing_response paths): short-circuits
-        straight to ``DownstreamResult(status=ERROR, ...)`` — the groundedness
-        check is NEVER attempted on a failed retrieval.
-      - Otherwise the answer is checked for groundedness. Grounded ->
-        ``report_grounded`` (GROUNED). Ungrounded -> ``report_ungrounded``
-        gated behind an escalation confirmation via ``interrupt()`` (the
-        Phase-0 checkpointer persists the paused state keyed by
-        ``thread_id``; resume supplies True/False). No new state fields.
-
-    The ``groundedness_check`` callable is injected (default: the
-    Knowledge node's own ``is_grounded`` hint) so every boundary is
-    testable in isolation with a fake — the real
-    ``check_groundedness(answer, retrieved_chunks, embedding_model)``
-    binding is a Phase-6 ``chat_service`` concern, where the shared BGE
-    model and retrieved chunks are available.
-    """
-    def safety_gate(state: SupervisorState) -> dict:
-        knowledge_response = state.get("knowledge_response")
-        if knowledge_response is None:
-            return {}
-
-        if knowledge_response.get("error"):
-            return {
-                "downstream_result": {
-                    "status": "ERROR",
-                    "response": _SAFE_FALLBACK_RESPONSE,
-                    "customer_wants_escalation": False,
-                }
-            }
-
-        answer_text = knowledge_response.get("answer_text", "")
-        verdict = (
-            groundedness_check(answer_text)
-            if groundedness_check is not None
-            else _verdict_from_knowledge_hint(knowledge_response)
-        )
-        if verdict.is_grounded:
-            return {"downstream_result": report_grounded(answer_text)}
-
-        query = state.get("user_message", "")
-        confirmation = interrupt(
-            {
-                "type": "escalation-confirmation",
-                "question": generate_fallback_response(query),
-            }
-        )
-        return {
-            "downstream_result": report_ungrounded(
-                query,
-                verdict,
-                customer_wants_escalation=_confirms_escalation(confirmation),
-            )
-        }
-
-    return safety_gate
 
 
 TicketOps = Callable[[], Any]
@@ -277,7 +174,7 @@ def make_ticket_agent_node(
          needed);
       2. resume turn: ``ticket_ops.create_ticket(pending, email, key)`` -> a
          real ``Ticket``, rendered as a DOWNSTREAM_RESULT-style confirmation
-         the Supervisor's FINALIZE edge turns into ``final_response``.
+         the assembly node turns into ``final_response``.
 
     Idempotency (Phase 4): the adapter derives an ``idempotency_key`` from the
     runtime config (client ``request_id``, else ``thread_id`` + per-thread
@@ -285,9 +182,7 @@ def make_ticket_agent_node(
     resume with the same key hits the store's cache and returns the *existing*
     ticket — no duplicate row.
 
-    The ESCALATE branch of the post-downstream conditional edge reaches this
-    node re-entrantly (after the safety gate confirms escalation), and the
-    ``CREATE_TICKET`` classification route reaches it directly.
+    The ``CREATE_TICKET`` classification route reaches this node directly.
     ``CHECK_TICKET_STATUS`` is routed away at classification time (§4.4) and
     never reaches this node.
     """
@@ -313,7 +208,6 @@ def make_ticket_agent_node(
             "downstream_result": {
                 "status": "GROUNDED",
                 "response": confirmation,
-                "customer_wants_escalation": False,
             }
         }
 

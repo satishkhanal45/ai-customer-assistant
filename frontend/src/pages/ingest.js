@@ -335,7 +335,7 @@
   function pollJob(jobId) {
     return new Promise(function (resolve) {
       var tries = 0;
-      var MAX_TRIES = 150; // 2s * 150 = 5 min
+      var MAX_TRIES = 600; // 2s * 600 = 20 min
       var timer = setInterval(function () {
         NS.api.get('/ingest/jobs/' + jobId).then(function (st) {
           if (st.status === 'SUCCEEDED') {
