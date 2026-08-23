@@ -176,6 +176,10 @@ def make_ticket_agent_node(
           real ``Ticket``, rendered as a DOWNSTREAM_RESULT-style confirmation
           the assembly node turns into ``final_response``.
 
+    Clarifying question (Phase 5): before asking for the email, the agent
+    first asks the user for the reason/purpose of creating the ticket. This
+    reason is captured and included in the ticket confirmation.
+
     Idempotency (Phase 4): the adapter derives an ``idempotency_key`` from the
     runtime config (client ``request_id``, else ``thread_id`` + per-thread
     ordinal) and threads it into ``ticket_ops.create_ticket(...)``. A retried
@@ -188,13 +192,34 @@ def make_ticket_agent_node(
     """
     async def ticket_agent(state: SupervisorState) -> dict:
         query = state.get("user_message", "")
-        pending = ticket_ops.call(query)
+        
+        # Phase 5: Ask clarifying question about ticket purpose
+        # This will pause the agent and wait for user input
+        clarifying_prompt = interrupt(
+            {
+                "type": "clarifying_question",
+                "query": "For what reason do you want to create a ticket?",
+            }
+        )
+        
+        # Extract the reason from the clarifying response
+        # The interrupt returns a dict with the user's response
+        if isinstance(clarifying_prompt, dict):
+            clarifying_reason = clarifying_prompt.get("reason", "general inquiry")
+        elif isinstance(clarifying_prompt, str):
+            clarifying_reason = clarifying_prompt
+        else:
+            clarifying_reason = "general inquiry"
+        
+        # Now ask for email with clarifying reason context
         email = interrupt(
             {
                 "type": "email-collection",
                 "query": query,
+                "clarifying_reason": clarifying_reason,
             }
         )
+        pending = ticket_ops.call(query)
         configurable = (get_config() or {}).get("configurable", {})
         key = _idempotency_key(configurable, ticket_ops)
         ticket = await ticket_ops.create_ticket(

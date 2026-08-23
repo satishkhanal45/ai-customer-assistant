@@ -320,3 +320,95 @@
   NS.pages = NS.pages || {};
   NS.pages.chat = { init: init, destroy: destroy };
 })(window.ACA);
+NS.pages.chat = { init: init, destroy: destroy };
+
+// Add a new function to handle interrupt responses
+NS.pages.chat.handleInterrupt = function(interruptResponse) {
+    if (interruptResponse && interruptResponse.type === 'clarifying_question') {
+        // Extract the query text from the interrupt response
+        var questionText = interruptResponse.query || 'For what reason do you want to create a ticket?';
+        // Display the clarifying question as an assistant message
+        var t = NS.pages.chat.ensureThread(NS.pages.chat.activeId);
+        t.messages.push({
+            role: 'assistant',
+            content: questionText,
+            // Don't add traceId/citations for interrupt responses
+            traceId: null,
+            citations: []
+        });
+        NS.pages.chat.save();
+        NS.pages.chat.renderMessages();
+    }
+}(window.ACA);
+
+// Modify the send function to handle interrupt responses
+var originalSend = NS.pages.chat.send;
+NS.pages.chat.send = function(threadId, message) {
+    setBusy(true);
+    NS.api.post('/chat', { thread_id: threadId, message: message }, { timeout: 60000 }).then(function (res) {
+      var t = NS.pages.chat.ensureThread(threadId);
+      // Check if the response contains a clarifying question interrupt
+      if (res.interrupt && res.interrupt.type === 'clarifying_question') {
+        NS.pages.chat.handleInterrupt(res.interrupt);
+      } else {
+        t.messages.push({ role: 'assistant', content: res.reply || '', traceId: res.trace_id, citations: res.citations || [] });
+      }
+      t.updatedAt = Date.now();
+      save();
+      if (activeId === threadId) { renderThreadList(); renderMessages(); }
+      setBusy(false);
+    }).catch(function (err) {
+      // existing error handling...
+    });
+  };
+// Add function to handle clarifying question interrupt responses
+// This should be added after the NS.pages.chat initialization or in the init function
+
+// Add this function after the NS.pages.chat initialization section
+NS.pages.chat.handleClarifyingQuestion = function(interruptResponse) {
+    if (interruptResponse && interruptResponse.type === 'clarifying_question') {
+        // Extract just the query text from the interrupt response dict
+        var questionText = interruptResponse.query || 'For what reason do you want to create a ticket?';
+        // Create a message object with just the question text
+        var msg = {
+            role: 'assistant',
+            content: questionText,
+            // Don't include traceId/citations for interrupt responses
+            traceId: null,
+            citations: []
+        };
+        // Add the message to the current thread
+        var t = NS.pages.chat.ensureThread(NS.pages.chat.activeId);
+        t.messages.push(msg);
+        NS.pages.chat.save();
+        NS.pages.chat.renderMessages();
+    }
+}
+
+// Modify the send function to check for interrupt responses
+var originalSend = NS.pages.chat.send;
+NS.pages.chat.send = function(threadId, message) {
+    setBusy(true);
+    NS.api.post('/chat', { thread_id: threadId, message: message }, { timeout: 60000 }).then(function (res) {
+      var t = NS.pages.chat.ensureThread(threadId);
+      // Check if the response contains a clarifying question interrupt
+      if (res.interrupt && res.interrupt.type === 'clarifying_question') {
+        NS.pages.chat.handleClarifyingQuestion(res.interrupt);
+      } else {
+        t.messages.push({ role: 'assistant', content: res.reply || '', traceId: res.trace_id, citations: res.citations || [] });
+      }
+      t.updatedAt = Date.now();
+      save();
+      if (activeId === threadId) { renderThreadList(); renderMessages(); }
+      setBusy(false);
+    }).catch(function (err) {
+      // existing error handling
+      var t = NS.pages.chat.ensureThread(threadId);
+      t.messages.push({ role: 'assistant', content: 'Error: ' + (err.message || 'request failed'), error: true, retriable: true, resendMessage: message });
+      t.updatedAt = Date.now();
+      save();
+      if (activeId === threadId) { renderThreadList(); renderMessages(); }
+      setBusy(false);
+      NS.utils.status('Chat request failed', true);
+    });
+};
