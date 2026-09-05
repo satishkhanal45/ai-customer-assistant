@@ -333,6 +333,10 @@ class Ticket(Base):
     )
     email: Mapped[str] = mapped_column(String(255), nullable=False)
     query: Mapped[str] = mapped_column(Text, nullable=False)
+    # The customer's answer to the clarifying question the Ticket Agent asks
+    # before collecting the email. Nullable: escalation paths open a ticket
+    # without asking, and every row created before this column existed has none.
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     priority: Mapped[str | None] = mapped_column(String(32), nullable=True)
     status: Mapped[str] = mapped_column(TicketStatusEnum, nullable=False, server_default="OPEN")
     created_at: Mapped[datetime] = mapped_column(nullable=False, server_default=func.now())

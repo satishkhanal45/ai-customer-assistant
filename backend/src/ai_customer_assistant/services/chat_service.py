@@ -41,7 +41,7 @@ from agents.knowledge.graph import build_knowledge_agent_graph
 from agents.knowledge.providers import build_knowledge_provider, llm_completions
 from agents.supervisor.graph import build_supervisor_graph
 from agents.supervisor.llm_client import SupervisorLLMClient, build_llm_client
-from agents.ticket_agent.store import TicketStore
+from agents.ticket_agent.store import TicketStore, send_ticket_email
 from db.checkpointer import build_checkpointer
 from services.embeddings import SharedEmbeddings
 
@@ -87,6 +87,21 @@ class ChatService:
         # never re-instantiated per request.
         self.embedding_model = embedding_model
 
+    @staticmethod
+    async def _has_pending_interrupt(graph: Any, config: dict) -> bool:
+        """Detect whether the graph has a pending interrupt that needs resuming.
+
+        ``snapshot.next`` is empty after the *second* interrupt on a
+        resumed thread in some LangGraph versions, even though
+        ``snapshot.tasks`` still carries the interrupt metadata.  We
+        therefore check both signals."""
+        snapshot = await graph.aget_state(config)
+        if snapshot.next:
+            return True
+        return any(
+            getattr(task, "interrupts", ()) for task in snapshot.tasks
+        )
+
     async def handle_message(
         self,
         thread_id: str,
@@ -124,11 +139,15 @@ class ChatService:
         if len(parts) > 1:
             combined_replies: list[str] = []
             all_citations: list[dict] = []
+            had_interrupt = False
             for part in parts:
                 snapshot = await self.graph.aget_state(config)
                 history = list(snapshot.values.get("conversation_history") or [])
+                pending = snapshot.next or any(
+                    getattr(task, "interrupts", ()) for task in snapshot.tasks
+                )
 
-                if snapshot.next:
+                if pending:
                     result = await self.graph.ainvoke(
                         Command(resume=part), config=config
                     )
@@ -141,46 +160,46 @@ class ChatService:
                         config=config,
                     )
 
-                reply = result.get("final_response") or result.get(
-                    "clarification_question"
-                ) or ""
-                citations = _citations_from_result(result)
+                if "__interrupt__" in result:
+                    reply = self._render_interrupt(result["__interrupt__"])
+                    citations = []
+                    had_interrupt = True
+                else:
+                    reply = result.get("final_response") or result.get(
+                        "clarification_question"
+                    ) or ""
+                    citations = _citations_from_result(result)
+
                 combined_replies.append(reply)
                 all_citations.extend(citations)
 
-                user_turn = ConversationTurn(role="user", content=part)
-                assistant_turn = ConversationTurn(
-                    role="assistant", content=reply
-                )
-                await self.graph.aupdate_state(
-                    config,
-                    {
-                        "conversation_history": [
-                            *history,
-                            user_turn,
-                            assistant_turn,
-                        ]
-                    },
-                )
+                if not had_interrupt:
+                    user_turn = ConversationTurn(role="user", content=part)
+                    assistant_turn = ConversationTurn(
+                        role="assistant", content=reply
+                    )
+                    await self.graph.aupdate_state(
+                        config,
+                        {
+                            "conversation_history": [
+                                *history,
+                                user_turn,
+                                assistant_turn,
+                            ]
+                        },
+                    )
 
             reply = "\n".join(combined_replies)
             citations = all_citations
-            await self.graph.aupdate_state(
-                config,
-                {
-                    "conversation_history": [
-                        *history,
-                        ConversationTurn(role="user", content=user_message),
-                        ConversationTurn(role="assistant", content=reply),
-                    ]
-                },
-            )
             return reply, citations
 
         snapshot = await self.graph.aget_state(config)
         history = list(snapshot.values.get("conversation_history") or [])
+        pending = snapshot.next or any(
+            getattr(task, "interrupts", ()) for task in snapshot.tasks
+        )
 
-        if snapshot.next:
+        if pending:
             # A previous turn paused waiting for the user (ticket email
             # collection): this message is the resume value.
             result = await self.graph.ainvoke(
@@ -195,11 +214,14 @@ class ChatService:
                 config=config,
             )
 
-        user_turn = ConversationTurn(role="user", content=user_message)
         if "__interrupt__" in result:
             # The turn paused waiting for the user: render the assistant's
-            # question as the reply and persist the exchange so the follow-up
-            # resume sees the full transcript.
+            # question as the reply.  Do NOT call aupdate_state here —
+            # writing a new checkpoint after an interrupt can clear the
+            # pending interrupt in the checkpointer, preventing the next
+            # turn from resuming.  The checkpointer already preserves the
+            # graph state at the interrupt point; conversation_history will
+            # be updated when the interrupted flow completes.
             reply = self._render_interrupt(result["__interrupt__"])
             citations: list[dict] = []
         else:
@@ -212,16 +234,17 @@ class ChatService:
             ) or ""
             citations = _citations_from_result(result)
 
-        await self.graph.aupdate_state(
-            config,
-            {
-                "conversation_history": [
-                    *history,
-                    user_turn,
-                    ConversationTurn(role="assistant", content=reply),
-                ]
-            },
-        )
+            user_turn = ConversationTurn(role="user", content=user_message)
+            await self.graph.aupdate_state(
+                config,
+                {
+                    "conversation_history": [
+                        *history,
+                        user_turn,
+                        ConversationTurn(role="assistant", content=reply),
+                    ]
+                },
+            )
         return reply, citations
 
     @staticmethod
@@ -233,11 +256,19 @@ class ChatService:
             return "Please provide more information so I can continue."
         payload = interrupts[0].value
         if isinstance(payload, Mapping):
-            question = payload.get("question")
-            if question:
-                return str(question)
-            if payload.get("type") == "email-collection":
+            # Explicit type-based handling first
+            interrupt_type = payload.get("type")
+            if interrupt_type == "email-collection":
                 return _EMAIL_COLLECTION_QUESTION
+            if interrupt_type == "clarifying_question":
+                query = payload.get("query")
+                if query:
+                    return str(query)
+            # Fallback: check for "question" or "query" keys
+            for key in ("question", "query"):
+                text = payload.get(key)
+                if text:
+                    return str(text)
         return str(payload)
 
 
@@ -276,7 +307,13 @@ async def build_chat_service(
     graph = build_supervisor_graph(
         llm_client=resolved_client,
         knowledge_graph=knowledge_graph,
-        ticket_ops=TicketStore(session_factory=session_factory),
+        ticket_ops=TicketStore(
+            session_factory=session_factory,
+            # The composition root is the only place the real notifier is
+            # wired in, so a TicketStore built anywhere else (tests, the
+            # graph's own default) never opens an SMTP connection.
+            send_email=send_ticket_email if session_factory is not None else None,
+        ),
         checkpointer=resolved_checkpointer,
     )
     resolved_embedding = (
