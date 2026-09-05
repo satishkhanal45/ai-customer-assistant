@@ -8,9 +8,12 @@
   var hiddenRelations = {};
   var mode = '2d';
   var g2 = null, g3 = null;
-  var forceParams = { charge: -40, linkDistance: 50, gravity: 0.25 };
+  var forceParams = { charge: -80, linkDistance: 80, gravity: 0.5 };
   var enginesLoaded = { fg: false, three: false, fg3d: false };
   var roots = {};
+  var radialMode = false;
+  var rootNodeId = null;
+  var depthLimit = 2; // default: show 2 hops around selected node
 
   function cssVar(name, fb) { return NS.utils.cssVar(name, fb); }
   function highlightColor() { return cssVar('--accent', '#3b5bfd'); }
@@ -100,12 +103,20 @@
       document.getElementById('btnShare').addEventListener('click', shareLink);
       var fCharge = document.getElementById('fCharge');
       var fDist = document.getElementById('fDist');
+      var fGravity = document.getElementById('fGravity');
       fCharge.addEventListener('input', function () { forceParams.charge = Number(fCharge.value); applyForce(); });
       fDist.addEventListener('input', function () { forceParams.linkDistance = Number(fDist.value); applyForce(); });
+      fGravity.addEventListener('input', function () { forceParams.gravity = Number(fGravity.value); applyForce(); });
+      document.getElementById('depth').addEventListener('change', function () {
+        depthLimit = parseInt(document.getElementById('depth').value, 10);
+        renderActive();
+      });
       document.getElementById('searchMode').addEventListener('change', function () {
         document.getElementById('search').value = ''; closeSuggest();
       });
       document.getElementById('btnStats').addEventListener('click', updateStats);
+      document.getElementById('btnRadial').addEventListener('click', toggleRadial);
+      document.getElementById('btnCluster').addEventListener('click', toggleCluster);
       create2D();
       renderActive();
       restoreFromHash();
@@ -158,8 +169,11 @@
       '<button id="btnStats" class="btn btn-ghost btn-sm">Stats</button>' +
       '</div>' +
       '<div class="gc-group" id="ctlDepth"><label>DEPTH</label><select class="gc-select" id="depth"><option value="1">1</option><option value="2" selected>2</option><option value="3">3</option></select></div>' +
-      '<div class="gc-group" id="ctlForce"><label>CHARGE</label><input id="fCharge" type="range" min="-120" max="0" value="-40">' +
-      '<label>DIST</label><input id="fDist" type="range" min="20" max="140" value="50"></div>';
+      '<div class="gc-group"><button id="btnRadial" class="btn btn-ghost btn-sm">Radial</button></div>' +
+      '<div class="gc-group"><button id="btnCluster" class="btn btn-ghost btn-sm">Cluster</button></div>' +
+      '<div class="gc-group" id="ctlForce"><label>CHARGE</label><input id="fCharge" type="range" min="-120" max="0" value="-80">' +
+      '<label>DIST</label><input id="fDist" type="range" min="20" max="140" value="80">' +
+      '<label>GRAV</label><input id="fGravity" type="range" min="0" max="1" step="0.01" value="0.5"></div>';
     toolbar.innerHTML = html;
   }
 
@@ -308,8 +322,11 @@
 
   function renderActive() {
     updateHudRefs();
-    if (mode === '2d') { create2D(); if (g2) g2.graphData({ nodes: visibleNodes(), links: visibleLinks() }); }
-    else { create3D(); if (g3) g3.graphData({ nodes: visibleNodes(), links: visibleLinks() }); }
+    var visible = visibleNodes();
+    var links = visibleLinks();
+    var filtered = filterByDepth(visible, links);
+    if (mode === '2d') { create2D(); if (g2) g2.graphData({ nodes: filtered.nodes, links: filtered.links }); }
+    else { create3D(); if (g3) g3.graphData({ nodes: filtered.nodes, links: filtered.links }); }
     updateHud(); updateLegend();
   }
 
@@ -599,6 +616,230 @@
     g3.autoRotate(on);
     btn.classList.toggle('on', on);
     flash(on ? 'Auto-rotate on.' : 'Auto-rotate off.');
+  }
+
+  function toggleRadial() {
+    radialMode = !radialMode;
+    document.getElementById('btnRadial').classList.toggle('active', radialMode);
+    if (radialMode) {
+      rootNodeId = getSelectedNodeId();
+      applyRadialLayout(rootNodeId);
+    } else {
+      // Reset to force-directed layout
+      if (mode === '2d' && g2) g2.graphData({ nodes: visibleNodes(), links: visibleLinks() });
+      if (mode === '3d' && g3) g3.graphData({ nodes: visibleNodes(), links: visibleLinks() });
+    }
+    flash(radialMode ? 'Radial layout from root.' : 'Force-directed layout.');
+  }
+
+  function toggleCluster() {
+    clusterMode = !clusterMode;
+    document.getElementById('btnCluster').classList.toggle('active', clusterMode);
+    if (clusterMode) {
+      applyClusterLayout();
+    } else {
+      // Reset to force-directed layout
+      if (mode === '2d' && g2) g2.graphData({ nodes: visibleNodes(), links: visibleLinks() });
+      if (mode === '3d' && g3) g3.graphData({ nodes: visibleNodes(), links: visibleLinks() });
+    }
+    flash(clusterMode ? 'Community clustering enabled.' : 'Community clustering disabled.');
+  }
+
+  function getSelectedNodeId() {
+    // Return the id of the currently selected/active node, or the first visible node
+    var visible = visibleNodes();
+    if (!visible.length) return null;
+    // Try to find a node that's been clicked/expanded recently
+    // For now, return the first visible node as root
+    return visible[0] ? visible[0].id : null;
+  }
+
+  function applyRadialLayout(rootId) {
+    var nodes = visibleNodes();
+    var links = visibleLinks();
+    
+    if (!rootId) {
+      // No root, just do simple circular layout
+      applySimpleCircularLayout(nodes);
+      return;
+    }
+    
+    // BFS to compute depth and order from root
+    var nodeMap = {};
+    nodes.forEach(function (n) { nodeMap[n.id] = n; });
+    
+    var depth = {};
+    var order = {};
+    var queue = [{ id: rootId, depth: 0, parent: null }];
+    var visited = { [rootId]: true };
+    var idx = 0;
+    
+    while (queue.length > 0) {
+      var curr = queue.shift();
+      var n = nodeMap[curr.id];
+      if (!n) continue;
+      depth[n.id] = curr.depth;
+      order[n.id] = idx++;
+      
+      // Find neighbors (connected nodes)
+      var neighbors = [];
+      links.forEach(function (l) {
+        if (l.source === curr.id && !visited[l.target]) {
+          neighbors.push(l.target);
+          visited[l.target] = true;
+        }
+        if (l.target === curr.id && !visited[l.source]) {
+          neighbors.push(l.source);
+          visited[l.source] = true;
+        }
+      });
+      
+      neighbors.forEach(function (nid) {
+        queue.push({ id: nid, depth: curr.depth + 1, parent: curr.id });
+      });
+    }
+    
+    // Apply radial positions
+    var maxDepth = 0;
+    for (var d in depth) { if (depth[d] > maxDepth) maxDepth = depth[d]; }
+    var radiusFactor = 30; // pixels per depth level
+    var angleStep = 2 * Math.PI / Math.max(nodes.length, 1);
+    
+    nodes.forEach(function (n) {
+      var d = depth[n.id] !== undefined ? depth[n.id] : 0;
+      var o = order[n.id] !== undefined ? order[n.id] : 0;
+      var radius = d * radiusFactor;
+      var theta = o * angleStep;
+      n.x = radius * Math.cos(theta);
+      n.y = radius * Math.sin(theta);
+    });
+    
+    if (mode === '2d' && g2) {
+      g2.graphData({ nodes: nodes, links: links });
+    }
+    if (mode === '3d' && g3) {
+      g3.graphData({ nodes: nodes, links: links });
+    }
+  }
+
+  function applySimpleCircularLayout(nodes) {
+    var angleStep = 2 * Math.PI / Math.max(nodes.length, 1);
+    nodes.forEach(function (n, i) {
+      var theta = i * angleStep;
+      n.x = 200 * Math.cos(theta);
+      n.y = 200 * Math.sin(theta);
+    });
+    if (mode === '2d' && g2) g2.graphData({ nodes: nodes, links: links });
+    if (mode === '3d' && g3) g3.graphData({ nodes: nodes, links: links });
+  }
+
+  function applyClusterLayout() {
+    var nodes = visibleNodes();
+    var links = visibleLinks();
+    
+    // Group nodes by entity_type
+    var groups = {};
+    nodes.forEach(function (n) {
+      var t = n.entity_type;
+      if (!groups[t]) groups[t] = [];
+      groups[t].push(n);
+    });
+    
+    // Create cluster nodes for each group
+    var clusterNodes = [];
+    var clusterLinks = [];
+    var nodeIdMap = {};
+    
+    var xOffset = 0;
+    var groupIdx = 0;
+    
+    for (var type in groups) {
+      var groupNodes = groups[type];
+      var clusterId = 'cluster-' + groupIdx;
+      var centerX = (groupIdx % 5) * 150;
+      var centerY = Math.floor(groupIdx / 5) * 150;
+      
+      // Add cluster center node
+      clusterNodes.push({
+        id: clusterId,
+        name: type + ' (' + groupNodes.length + ')',
+        entity_type: type,
+        x: centerX,
+        y: centerY,
+        _isCluster: true,
+        _memberIds: groupNodes.map(function (n) { return n.id; })
+      });
+      
+      // Add links from cluster center to member nodes
+      groupNodes.forEach(function (n) {
+        clusterLinks.push({
+          id: 'cluster-' + n.id + '-' + clusterId,
+          source: clusterId,
+          target: n.id,
+          label: n.entity_type
+        });
+        nodeIdMap[n.id] = n.id;
+      });
+      
+      groupIdx++;
+    }
+    
+    // Combine cluster nodes with non-cluster nodes
+    var allNodes = [...clusterNodes, ...nodes];
+    var allLinks = [...clusterLinks, ...links];
+    
+    // Update node positions - cluster centers at grid positions, members at their force positions
+    allNodes.forEach(function (n) {
+      if (n._isCluster) return;
+      // Keep original node positions or assign based on cluster
+      if (!n.x && !n.y) {
+        n.x = Math.random() * 400 - 200;
+        n.y = Math.random() * 400 - 200;
+      }
+    });
+    
+    if (mode === '2d' && g2) g2.graphData({ nodes: allNodes, links: allLinks });
+    if (mode === '3d' && g3) g3.graphData({ nodes: allNodes, links: allLinks });
+  }
+
+  function filterByDepth(nodes, links) {
+    if (depthLimit <= 0 || !rootNodeId) return { nodes: nodes, links: links };
+    
+    var nodeMap = {};
+    nodes.forEach(function (n) { nodeMap[n.id] = n; });
+    
+    // BFS to compute depth from root
+    var depth = {};
+    var queue = [{ id: rootNodeId, depth: 0 }];
+    var visited = { [rootNodeId]: true };
+    
+    while (queue.length > 0) {
+      var curr = queue.shift();
+      var d = depth[curr.id];
+      
+      if (d >= depthLimit) continue; // don't explore beyond depth limit
+      
+      links.forEach(function (l) {
+        var neighborId = null;
+        if (l.source === curr.id) neighborId = l.target;
+        if (l.target === curr.id) neighborId = l.source;
+        
+        if (neighborId && !visited[neighborId] && nodeMap[neighborId]) {
+          visited[neighborId] = true;
+          depth[neighborId] = d + 1;
+          queue.push({ id: neighborId });
+        }
+      });
+    }
+    
+    // Filter nodes and links
+    var filteredNodes = nodes.filter(function (n) { return depth[n.id] !== undefined && depth[n.id] <= depthLimit; });
+    var filteredLinks = links.filter(function (l) {
+      return depth[l.source] !== undefined && depth[l.source] <= depthLimit &&
+             depth[l.target] !== undefined && depth[l.target] <= depthLimit;
+    });
+    
+    return { nodes: filteredNodes, links: filteredLinks };
   }
 
   /* ---------------- export / share / stats ---------------- */
