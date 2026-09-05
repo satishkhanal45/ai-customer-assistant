@@ -1,1 +1,1 @@
-# AI Customer Assistant
+/mnt/hdd/satish/ai-customer-assistant/backend

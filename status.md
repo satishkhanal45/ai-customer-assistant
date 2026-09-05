@@ -3,7 +3,7 @@
 **Repository:** `/mnt/hdd/satish/ai-customer-assistant`
 **Branch analysed:** `features/graph_visualization` (HEAD `ba45956`, with 7 uncommitted files)
 **Report date:** 2026-09-05
-**Last updated:** 2026-09-05 — **P0-1 (ticket flow) fixed**, see §2 and §6.1
+**Last updated:** 2026-09-05 — **P0-1 (ticket flow)** and **P1-1 (pgvector retrieval)** fixed; see the changelog
 **Method:** full read of `backend/src` (14.8k LOC), `backend/tests` (4.6k LOC), `frontend/src` (2.8k LOC), migrations, Docker/Make tooling and docs; plus a live run of the test suite.
 
 ---
@@ -18,16 +18,18 @@ This is a **multi-agent RAG customer-support assistant** for Alpinist Studios, b
 |---|---|
 | Architecture & module design | **Strong.** Clean layering, dependency injection everywhere, pure functions separated from I/O, excellent docstrings. |
 | Feature completeness (MVP scope) | **~75%.** Chat, RAG, ingestion, crawling, graph browsing and ticket creation all work. Ticket status lookup and the admin surface do not. |
-| Test suite | **286 passing / 3 failing / 6 erroring** (295 collected). Of what remains, 1 failure is P0-2 and the other 8 need a live Postgres or a Playwright browser. |
+| Test suite | **307 passing / 3 failing / 6 erroring** (316 collected). Of what remains, 1 failure is P0-2 and the other 8 need a live Postgres or a Playwright browser. |
 | Production readiness | **Low.** No authentication, no authorisation, `CORS: *`, secrets read ad hoc, debug `print()` of full conversation state, no observability. |
-| Scalability | **Low.** Vector search loads *every* chunk into Python per query; blocking LLM calls run on the event loop; ingestion runs inside the API process. |
+| Scalability | **Improving.** Vector search now ranks inside pgvector (P1-1 fixed). Still open: blocking LLM calls on the event loop, and ingestion running inside the API process. |
 | Repo hygiene | **Medium.** Dead files, duplicated modules, an empty README, debug values committed, 20+ stale branches. |
 
-The **ticket flow (§6.1) is now fixed** — see the changelog below. The next most important items are **P0-2 (import-time `load_dotenv()`)**, **P0-3 (no authentication)**, **P0-4 (debug `print()` of conversation state)**, and then **P1-1 (pgvector-native retrieval)**.
+The **ticket flow (P0-1)** and **pgvector-native retrieval (P1-1)** are now fixed — see the changelog. The next most important items are **P0-2 (import-time `load_dotenv()`)**, **P0-3 (no authentication)**, **P0-4 (debug `print()` of conversation state)**, and then **P1-2 (blocking LLM calls on the event loop)**.
 
 ### Changelog
 
-**2026-09-05 — P0-1 ticket flow repaired.** All four defects fixed, the flow verified end to end against the live database, and the suite moved from 268→286 passing with 7 regressions cleared and 11 new tests added. Details in §6.1.
+**2026-09-05 — P1-1 pgvector retrieval.** Ranking pushed into the database with `ORDER BY embedding <=> :q LIMIT :top_k`; embeddings no longer cross the wire. HNSW index added (migration `9f1a2b7c4e08`). Both paths verified identical on live data. 21 tests added to a module that previously had none. Suite 286 → 307 passing.
+
+**2026-09-05 — P0-1 ticket flow repaired.** All four defects fixed, the flow verified end to end against the live database, and the suite moved from 268→286 passing with 7 regressions cleared and 11 new tests added.
 
 ---
 
@@ -39,13 +41,13 @@ cd backend && env -u PYTHONPATH ./.venv/bin/python -m pytest -q
 → 10 failed, 268 passed, 6 errors in 170.19s
 ```
 
-**Current, after the ticket-flow fix:**
+**Current, after the ticket-flow and pgvector fixes:**
 ```
 cd backend && env -u PYTHONPATH ./.venv/bin/python -m pytest -q
-→ 3 failed, 286 passed, 6 errors in 128.14s
+→ 3 failed, 307 passed, 6 errors in 135.12s
 ```
 
-Collected: 295 tests — `tests/agents` 113, `tests/chunk_embed` 97, `tests/ingestion` 63, `tests/services` 16, `tests/api` 6, `tests/db` 4.
+Collected: 316 tests — `tests/agents` 134, `tests/chunk_embed` 97, `tests/ingestion` 63, `tests/services` 16, `tests/api` 6, `tests/db` 4.
 
 **Group A — real regressions.** Seven of the eight were the P0-1 ticket flow and are now **fixed**:
 
@@ -105,10 +107,10 @@ Collected: 295 tests — `tests/agents` 113, `tests/chunk_embed` 97, `tests/inge
 ## 4. What is done
 
 ### 4.1 Database schema — complete
-`backend/src/ai_customer_assistant/db/models.py`, 7 Alembic migrations in a clean linear chain, single head (`0001 → 11160c9078cc → 0003 → 1e4beb1b8d68 → 2a1c9f0e45d7 → 4c2d8a1f9e0b → 7b3e5c1a9d42`).
+`backend/src/ai_customer_assistant/db/models.py`, 8 Alembic migrations in a clean linear chain, single head (`0001 → 11160c9078cc → 0003 → 1e4beb1b8d68 → 2a1c9f0e45d7 → 4c2d8a1f9e0b → 7b3e5c1a9d42 → 9f1a2b7c4e08`).
 
 - **EAV core:** `entity`, `attribute`, `value`, `relation` with the right unique constraints for idempotent writes.
-- **Document versioning:** `knowledge_source` ⇄ `knowledge_source_version` (the circular FK is correctly handled with `use_alter=True`), `embedding_chunk` (`Vector(768)`), `knowledge_source_entity_map`, `knowledge_injection_job`.
+- **Document versioning:** `knowledge_source` ⇄ `knowledge_source_version` (the circular FK is correctly handled with `use_alter=True`), `embedding_chunk` (`Vector(768)`, HNSW-indexed on `vector_cosine_ops`), `knowledge_source_entity_map`, `knowledge_injection_job`.
 - **`ticket`** table (added in the two most recent commits).
 - Soft-delete via `is_active`, version lifecycle `PENDING → PROCESSING → INDEXED → STALE/ARCHIVED/FAILED`.
 
@@ -274,23 +276,38 @@ Beyond the privacy problem, `print()` is synchronous, unbuffered under `PYTHONUN
 
 ---
 
-### 🟠 P1-1 — Vector search does not use pgvector
+### ✅ P1-1 — Vector search did not use pgvector — **FIXED 2026-09-05**
 
-**Location:** `agents/knowledge/vector_search.py:234-272`
+**Was:** `agents/knowledge/vector_search.py`
 
-`_candidate_chunks_statement()` selects **every** live chunk row — including its full 768-float embedding — and `_rank_by_similarity` computes cosine similarity in pure Python.
+`_candidate_chunks_statement()` selected **every** live chunk row — including its full 768-float embedding — and `_rank_by_similarity` computed cosine similarity in pure Python. Cost was `O(n)` network transfer plus `O(n·768)` Python float math **per query**, on a schema where `pgvector` was installed and the column was already a real `Vector(768)`.
 
-The module docstring (lines 23-36) states this tradeoff was deliberate, to keep ranking unit-testable against SQLite. That is a defensible prototype decision and a serious production one: cost is `O(n)` network transfer + `O(n·768)` Python float math **per query**. At 10k chunks that is ~30 MB pulled and ~7.7M multiplications per question. The `pgvector` extension is installed and the column is a real `Vector(768)` — it is simply not being used.
+**What changed.** Ranking is now dialect-aware, decided from the session's own bind so no config setting can drift out of sync with reality:
 
-**Fix:**
-```sql
-ORDER BY embedding <=> :query_vector LIMIT :top_k
-```
-plus an HNSW index:
-```sql
-CREATE INDEX ON embedding_chunk USING hnsw (embedding vector_cosine_ops);
-```
-Keep `_cosine_similarity` and `_rank_by_similarity` as pure functions for the existing tests; add a `use_pgvector: bool` config flag so the SQLite test path stays green. This is a contained change — the join contract and the `RetrievedChunk` shape do not move.
+| Backend | Path |
+|---|---|
+| PostgreSQL (production) | `ORDER BY embedding <=> :query_vector LIMIT :top_k` pushed into pgvector; the embedding column is **not** selected at all |
+| Anything else (SQLite, tests) | the original pure `_rank_by_similarity`, unchanged |
+
+`<=>` is cosine *distance*, so the similarity threshold becomes `distance <= 1 - threshold` and the score is reported back as `1 - distance`. The join contract, the `RetrievedChunk` shape and every downstream helper are untouched — callers cannot tell which path ran.
+
+**Measured on the live database** (32 live chunks, identical query):
+
+| | Python path | pgvector path |
+|---|---|---|
+| Rows fetched | 32 | 8 |
+| Floats shipped over the wire | 24,576 (~96 KB) | **0** |
+| Mean retrieval, 20 runs | 210.4 ms | 175.4 ms |
+
+The gap widens linearly with corpus size — the Python path is `O(n)` transfer plus `O(n·768)` arithmetic, while the SQL path returns `top_k` rows regardless of `n`.
+
+**Equivalence verified, not assumed.** Both paths were run against the same live Postgres data: identical chunk ordering, identical similarity scores to 4 decimal places, provenance intact.
+
+**Honest caveat on the HNSW index.** Migration `9f1a2b7c4e08` adds `USING hnsw (embedding vector_cosine_ops)`, built `CONCURRENTLY`. `EXPLAIN` confirms Postgres uses it for a bare single-table `ORDER BY ... LIMIT` — but **not** for this query, because the live-version join contract makes the planner join first and sort after. That is pgvector's well-known pre-filtering limitation, not a mistake in the index. Making it fire under the join needs an ANN pre-filter CTE (`ORDER BY ... LIMIT k * overfetch` over `embedding_chunk` alone, join and re-filter afterwards), which trades exact recall for speed. That trade is deliberately **not** taken here: at this corpus size the sort is cheap, and silently dropping live chunks would be worse. The index is in place for when the corpus makes it worthwhile.
+
+**Files changed:** `agents/knowledge/vector_search.py`, `alembic/versions/9f1a2b7c4e08_hnsw_index_embedding_chunk.py` (new), `tests/agents/knowledge/test_vector_search.py` (new — 21 tests for a module that previously had **none**, covering the pure scorers, the emitted SQL shape, dialect detection, and a SQLite end-to-end run asserting the join contract excludes non-indexed, inactive and superseded content).
+
+**Still open on retrieval quality:** P2-2 below (the missing BGE query instruction and the uncalibrated 0.70 threshold) is unaffected by this change.
 
 ---
 
@@ -457,7 +474,7 @@ A turn taking 60–120 s is aborted in the browser while the server completes it
 5. Mark DB/Playwright tests with `@pytest.mark.integration` and add a `-m "not integration"` default so the unit suite is green on a clean checkout.
 
 ### 7.2 Performance & scale
-6. pgvector `<=>` + HNSW index (P1-1) — the single biggest win.
+6. ~~pgvector `<=>` + HNSW index (P1-1).~~ **Done 2026-09-05** — see the P1-1 entry.
 7. Non-blocking LLM calls (P1-2).
 8. Remove the `?` splitter (P1-3) — cuts LLM cost immediately.
 9. Consolidate to one database engine with explicit pool sizing (P1-4).
