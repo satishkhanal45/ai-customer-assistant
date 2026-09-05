@@ -218,9 +218,13 @@ async def test_wired_knowledge_node_runs_under_ainvoke():
 # Ticket Agent flow
 # ---------------------------------------------------------------------------
 
-def test_ticket_agent_flow_collects_email_then_creates_ticket():
-    """The Ticket Agent's two-step flow: open the ticket (interrupt for the
-    email), then resume with the email to create the Ticket and finalize."""
+async def test_ticket_agent_flow_collects_reason_then_email_then_creates_ticket():
+    """The Ticket Agent's three-step flow: ask why the customer wants a
+    ticket, then interrupt for the email, then resume with the email to
+    create the Ticket and finalize.
+
+    Driven with ``ainvoke`` because the ticket adapter node is async (its
+    store performs database I/O)."""
     from langgraph.types import Command
 
     from agents.supervisor.graph import build_supervisor_graph
@@ -242,7 +246,7 @@ def test_ticket_agent_flow_collects_email_then_creates_ticket():
     )
 
     config = {"configurable": {"thread_id": "ticket-flow"}}
-    first = graph.invoke(
+    first = await graph.ainvoke(
         {
             "user_message": "I need a refund",
             "conversation_history": [],
@@ -251,10 +255,16 @@ def test_ticket_agent_flow_collects_email_then_creates_ticket():
         config=config,
     )
     assert "__interrupt__" in first
-    (email_payload,) = first["__interrupt__"]
-    assert email_payload.value["type"] == "email-collection"
+    (reason_payload,) = first["__interrupt__"]
+    assert reason_payload.value["type"] == "clarifying_question"
 
-    ticket = graph.invoke(
+    second = await graph.ainvoke(Command(resume="billing issue"), config=config)
+    assert "__interrupt__" in second
+    (email_payload,) = second["__interrupt__"]
+    assert email_payload.value["type"] == "email-collection"
+    assert email_payload.value["clarifying_reason"] == "billing issue"
+
+    ticket = await graph.ainvoke(
         Command(resume="customer@example.com"), config=config
     )
     assert ticket["downstream_result"]["status"] == "GROUNDED"
@@ -263,22 +273,32 @@ def test_ticket_agent_flow_collects_email_then_creates_ticket():
     assert "I need a refund" in fake_ticket_ops.called_with_query
     assert len(fake_ticket_ops.created) == 1
 
+    # The clarifying answer must survive into the ticket and the reply the
+    # customer sees, rather than being collected and thrown away.
+    assert fake_ticket_ops.created[0].reason == "billing issue"
+    assert "billing issue" in ticket["final_response"]
+
 
 class FakeTicketOps:
     def __init__(self):
         self.calls: list[tuple[str, str]] = []
         self.created: list = []
         self.called_with_query: list[str] = []
+        self.reasons: list[str | None] = []
         self.idempotency_keys: list[str] = []
 
-    def call(self, query: str):
+    def call(self, query: str, reason: str | None = None):
         self.calls.append(("call", query))
         self.called_with_query.append(query)
-        return PendingTicket(query=query)
+        self.reasons.append(reason)
+        return PendingTicket(query=query, reason=reason)
 
-    def create_ticket(self, pending, email: str, idempotency_key=None):  # type: ignore[no-untyped-def]
+    async def create_ticket(self, pending, email: str, idempotency_key=None):  # type: ignore[no-untyped-def]
         ticket = Ticket(
-            ticket_id="ticket-1", email=email, query=pending.query
+            ticket_id="ticket-1",
+            email=email,
+            query=pending.query,
+            reason=pending.reason,
         )
         self.created.append(ticket)
         self.idempotency_keys.append(idempotency_key)

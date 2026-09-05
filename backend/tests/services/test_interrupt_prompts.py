@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from langgraph.checkpoint.memory import MemorySaver
 
 from agents.supervisor.llm_client import StubSupervisorLLMClient
 from services.chat_service import build_chat_service
@@ -45,7 +46,8 @@ class TestClarificationQuestion:
         svc = await build_chat_service(
             llm_client=_stub(
                 _clarification_payload("Which of these do you need — tickets or help?")
-            )
+            ),
+            checkpointer=MemorySaver(),
         )
         reply = await svc.handle_message("t-clarify", "hmm")
         assert reply == "Which of these do you need — tickets or help?"
@@ -53,7 +55,8 @@ class TestClarificationQuestion:
     @pytest.mark.asyncio
     async def test_clarification_distinct_from_email_collection(self):
         svc = await build_chat_service(
-            llm_client=_stub(_clarification_payload("Should I open a ticket for you?"))
+            llm_client=_stub(_clarification_payload("Should I open a ticket for you?")),
+            checkpointer=MemorySaver(),
         )
         reply = await svc.handle_message("t-clar-2", "whatever")
         assert reply == "Should I open a ticket for you?"
@@ -66,9 +69,22 @@ class TestClarificationQuestion:
 
 class TestTicketEmailCollection:
     @pytest.mark.asyncio
-    async def test_ticket_open_asks_for_email(self):
-        svc = await build_chat_service(llm_client=_stub(_create_ticket_payload()))
+    async def test_ticket_open_asks_for_clarifying_question(self):
+        """First interrupt in the ticket flow is the clarifying question
+        about the reason for creating a ticket."""
+        svc = await build_chat_service(llm_client=_stub(_create_ticket_payload()), checkpointer=MemorySaver())
         reply = await svc.handle_message("t-email", "Open a ticket please")
+        assert "reason" in reply.lower() or "ticket" in reply.lower()
+
+    @pytest.mark.asyncio
+    async def test_email_collection_after_clarifying_question(self):
+        """After answering the clarifying question, the email-collection
+        prompt is shown."""
+        svc = await build_chat_service(llm_client=_stub(_create_ticket_payload()), checkpointer=MemorySaver())
+        # First call: clarifying question
+        await svc.handle_message("t-email", "Open a ticket please")
+        # Second call: provide reason -> triggers email-collection interrupt
+        reply = await svc.handle_message("t-email", "billing issue")
         assert "email" in reply.lower()
         from services.chat_service import _EMAIL_COLLECTION_QUESTION
 

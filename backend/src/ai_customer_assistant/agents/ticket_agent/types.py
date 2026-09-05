@@ -27,9 +27,15 @@ class PendingTicket:
     Attributes:
         query: The original customer query that could not be answered
                and needs human follow-up.
+        reason: The customer's own answer to the clarifying question
+                ("why do you want a ticket?"), collected before the email
+                so the support team sees the intent alongside the raw
+                query. None when the caller opened the ticket without
+                asking (e.g. an escalation path that already knows why).
     """
 
     query: str
+    reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +49,10 @@ class Ticket:
         email: The customer's email, in normalized form as returned by
                the email validator, case preserved as submitted.
         query: The original customer query.
+        reason: The customer-supplied reason carried forward from the
+                PendingTicket, so it survives all the way to storage and
+                the confirmation email rather than being collected and
+                discarded.
         priority: Left as None for now — deliberately unset so a
                   priority-assignment step can be added later without
                   changing this schema (see module docstring in
@@ -53,5 +63,6 @@ class Ticket:
     ticket_id: str
     email: str
     query: str
+    reason: str | None = None
     priority: str | None = None
     status: str = "OPEN"

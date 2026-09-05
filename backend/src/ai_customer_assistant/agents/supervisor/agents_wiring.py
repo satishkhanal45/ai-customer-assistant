@@ -167,18 +167,20 @@ def make_ticket_agent_node(
 ) -> Callable[[SupervisorState], dict]:
     """Build the Ticket Agent adapter node.
 
-    Two-step shape, per agents_integration_plan_new.md §2.3 / §4.4:
-      1. opening turn: ``ticket_ops.call(query)`` -> ``PendingTicket``, then
-          ``interrupt()``s for the email (the checkpointer persists the paused
-          state keyed by ``thread_id`` — no ``pending_ticket`` state field is
-          needed);
-      2. resume turn: ``ticket_ops.create_ticket(pending, email, key)`` -> a
+    Three-step shape, per agents_integration_plan_new.md §2.3 / §4.4 plus the
+    Phase 5 clarifying question:
+      1. opening turn: ``interrupt()`` asking *why* the customer wants a
+          ticket (the checkpointer persists the paused state keyed by
+          ``thread_id`` — no ``pending_ticket`` state field is needed);
+      2. reason turn: ``ticket_ops.call(query, reason)`` -> ``PendingTicket``,
+          then ``interrupt()`` for the email;
+      3. email turn: ``ticket_ops.create_ticket(pending, email, key)`` -> a
           real ``Ticket``, rendered as a DOWNSTREAM_RESULT-style confirmation
           the assembly node turns into ``final_response``.
 
-    Clarifying question (Phase 5): before asking for the email, the agent
-    first asks the user for the reason/purpose of creating the ticket. This
-    reason is captured and included in the ticket confirmation.
+    The collected reason is threaded into the ``PendingTicket`` — and from
+    there into the persisted row, the confirmation email, and the reply the
+    customer sees. It is deliberately *not* dropped after being asked for.
 
     Idempotency (Phase 4): the adapter derives an ``idempotency_key`` from the
     runtime config (client ``request_id``, else ``thread_id`` + per-thread
@@ -186,54 +188,73 @@ def make_ticket_agent_node(
     resume with the same key hits the store's cache and returns the *existing*
     ticket — no duplicate row.
 
+    Async because ``ticket_ops.create_ticket`` performs database I/O; the
+    compiled Supervisor graph must therefore be driven with ``ainvoke``.
+
     The ``CREATE_TICKET`` classification route reaches this node directly.
     ``CHECK_TICKET_STATUS`` is routed away at classification time (§4.4) and
     never reaches this node.
     """
     async def ticket_agent(state: SupervisorState) -> dict:
         query = state.get("user_message", "")
-        
-        # Phase 5: Ask clarifying question about ticket purpose
-        # This will pause the agent and wait for user input
-        clarifying_prompt = interrupt(
+
+        # Step 1 — why does the customer want a ticket? Pauses the graph.
+        clarifying_response = interrupt(
             {
                 "type": "clarifying_question",
-                "query": "For what reason do you want to create a ticket?",
+                "query": _TICKET_REASON_QUESTION,
             }
         )
-        
-        # Extract the reason from the clarifying response
-        # The interrupt returns a dict with the user's response
-        if isinstance(clarifying_prompt, dict):
-            clarifying_reason = clarifying_prompt.get("reason", "general inquiry")
-        elif isinstance(clarifying_prompt, str):
-            clarifying_reason = clarifying_prompt
-        else:
-            clarifying_reason = "general inquiry"
-        
-        # Now ask for email with clarifying reason context
+        reason = _resume_text(clarifying_response, key="reason")
+
+        # Step 2 — open the pending ticket with the reason attached, then ask
+        # for the email. `call` is pure, so re-running it on each resume (as
+        # LangGraph replays the node from the top) is harmless.
+        pending = ticket_ops.call(query, reason)
         email = interrupt(
             {
                 "type": "email-collection",
                 "query": query,
-                "clarifying_reason": clarifying_reason,
+                "clarifying_reason": reason,
             }
         )
-        pending = ticket_ops.call(query)
+
+        # Step 3 — book the ticket.
         configurable = (get_config() or {}).get("configurable", {})
         key = _idempotency_key(configurable, ticket_ops)
         ticket = await ticket_ops.create_ticket(
-            pending, email, idempotency_key=key
-        )
-        confirmation = (
-            f"Your ticket has been created (ID {ticket.ticket_id}). "
-            f"We'll follow up with you at {ticket.email}."
+            pending, _resume_text(email, key="email"), idempotency_key=key
         )
         return {
             "downstream_result": {
                 "status": "GROUNDED",
-                "response": confirmation,
+                "response": _confirmation(ticket),
             }
         }
 
     return ticket_agent
+
+
+_TICKET_REASON_QUESTION = "For what reason do you want to create a ticket?"
+
+
+def _resume_text(resume_value: object, *, key: str) -> str:
+    """Normalize whatever ``interrupt()`` handed back into plain text.
+
+    The serving layer resumes with the customer's raw message (a string); the
+    mapping branch exists for callers that resume with a structured payload.
+    """
+    if isinstance(resume_value, Mapping):
+        return str(resume_value.get(key) or "").strip()
+    return str(resume_value or "").strip()
+
+
+def _confirmation(ticket: Any) -> str:
+    """Render the customer-facing confirmation, echoing back the reason they
+    gave so the answer to the clarifying question is visibly used."""
+    reason = getattr(ticket, "reason", None)
+    reason_clause = f' regarding "{reason}"' if reason else ""
+    return (
+        f"Your ticket has been created (ID {ticket.ticket_id}){reason_clause}. "
+        f"We'll follow up with you at {ticket.email}."
+    )

@@ -9,6 +9,10 @@ Two layers, matching how the feature is surfaced:
     the same client ``request_id`` (the idempotency key) and the same email
     produce exactly one persisted ticket row and both reads report the same
     ticket id.
+
+``TicketStore.create_ticket`` is a coroutine (it performs database I/O), so
+these tests await it and drive the compiled graph with ``ainvoke`` — the same
+way the serving layer does.
 """
 from __future__ import annotations
 
@@ -59,33 +63,63 @@ def _classification(**overrides):
 # ---------------------------------------------------------------------------
 
 class TestTicketStoreIdempotency:
-    def test_same_key_returns_existing_ticket(self) -> None:
+    async def test_same_key_returns_existing_ticket(self) -> None:
         store = TicketStore()
         pending = PendingTicket(query="Refund question")
-        first = store.create_ticket(
+        first = await store.create_ticket(
             pending, "customer@example.com", idempotency_key="request:req-1"
         )
-        second = store.create_ticket(
+        second = await store.create_ticket(
             pending, "customer@example.com", idempotency_key="request:req-1"
         )
         assert second.ticket_id == first.ticket_id
         assert len(store.rows) == 1
         assert store.rows[0] is first
 
-    def test_distinct_keys_create_distinct_rows(self) -> None:
+    async def test_distinct_keys_create_distinct_rows(self) -> None:
         store = TicketStore()
         pending = PendingTicket(query="Refund question")
-        store.create_ticket(pending, "a@example.com", idempotency_key="request:req-1")
-        store.create_ticket(pending, "b@example.com", idempotency_key="request:req-2")
+        await store.create_ticket(pending, "a@example.com", idempotency_key="request:req-1")
+        await store.create_ticket(pending, "b@example.com", idempotency_key="request:req-2")
         assert len(store.rows) == 2
 
-    def test_without_key_always_creates_fresh_row(self) -> None:
+    async def test_without_key_always_creates_fresh_row(self) -> None:
         store = TicketStore()
         pending = PendingTicket(query="Refund question")
-        first = store.create_ticket(pending, "a@example.com")
-        second = store.create_ticket(pending, "a@example.com")
+        first = await store.create_ticket(pending, "a@example.com")
+        second = await store.create_ticket(pending, "a@example.com")
         assert first.ticket_id != second.ticket_id
         assert len(store.rows) == 2
+
+    async def test_reason_survives_to_the_created_ticket(self) -> None:
+        """The clarifying answer must reach the Ticket, not stop at the
+        PendingTicket — this is the regression that let it be collected and
+        then silently discarded."""
+        store = TicketStore()
+        pending = store.call("I was double charged", "billing issue")
+        ticket = await store.create_ticket(pending, "a@example.com")
+        assert ticket.reason == "billing issue"
+
+    async def test_bare_store_sends_no_email(self) -> None:
+        """A TicketStore built without an injected notifier must not attempt
+        SMTP — constructing one in a test can't reach the network."""
+        store = TicketStore()
+        assert store._send_email is None
+        await store.create_ticket(PendingTicket(query="q"), "a@example.com")
+
+    async def test_injected_notifier_receives_the_ticket(self) -> None:
+        sent: list = []
+        store = TicketStore(send_email=sent.append)
+        ticket = await store.create_ticket(PendingTicket(query="q"), "a@example.com")
+        assert sent == [ticket]
+
+    async def test_duplicate_key_does_not_resend_email(self) -> None:
+        sent: list = []
+        store = TicketStore(send_email=sent.append)
+        pending = PendingTicket(query="q")
+        await store.create_ticket(pending, "a@example.com", idempotency_key="k")
+        await store.create_ticket(pending, "a@example.com", idempotency_key="k")
+        assert len(sent) == 1
 
 
 class TestIdempotencyKeyDerivation:
@@ -95,13 +129,13 @@ class TestIdempotencyKeyDerivation:
         key = _idempotency_key({"request_id": "req-9", "thread_id": "t"})
         assert key == "request:req-9"
 
-    def test_server_derived_uses_thread_and_sequence(self) -> None:
+    async def test_server_derived_uses_thread_and_sequence(self) -> None:
         from agents.supervisor.agents_wiring import _idempotency_key
 
         store = TicketStore()
         assert _idempotency_key({"thread_id": "t"}, store=store) == "t:0"
         pending = PendingTicket(query="q")
-        store.create_ticket(pending, "a@example.com", idempotency_key="t:0")
+        await store.create_ticket(pending, "a@example.com", idempotency_key="t:0")
         assert _idempotency_key({"thread_id": "t"}, store=store) == "t:1"
 
     def test_fake_without_sequence_falls_back_to_thread(self) -> None:
@@ -114,7 +148,7 @@ class TestIdempotencyKeyDerivation:
 # Graph-level: two resumes with the same request_id + email -> one row
 # ---------------------------------------------------------------------------
 
-def test_two_resumes_same_request_id_create_one_row():
+async def test_two_resumes_same_request_id_create_one_row():
     store = TicketStore()
     payload = {
         "request_category": "DOMAIN_REQUEST",
@@ -131,7 +165,7 @@ def test_two_resumes_same_request_id_create_one_row():
     config = {
         "configurable": {"thread_id": "idem-thread-1", "request_id": "req-dup"}
     }
-    opened = graph.invoke(
+    opened = await graph.ainvoke(
         {
             "user_message": "Please create a ticket for my refund",
             "conversation_history": [],
@@ -141,15 +175,20 @@ def test_two_resumes_same_request_id_create_one_row():
     )
     assert "__interrupt__" in opened
 
-    resumed1 = graph.invoke(
+    # Step 2: answer the clarifying question -> pauses again for the email.
+    reasoned = await graph.ainvoke(Command(resume="billing issue"), config=config)
+    assert "__interrupt__" in reasoned
+
+    resumed1 = await graph.ainvoke(
         Command(resume="customer@example.com"), config=config
     )
-    resumed2 = graph.invoke(
+    resumed2 = await graph.ainvoke(
         Command(resume="customer@example.com"), config=config
     )
 
     assert len(store.rows) == 1
     assert resumed1["final_response"] == resumed2["final_response"]
+    assert store.rows[0].reason == "billing issue"
 
 
 # ---------------------------------------------------------------------------

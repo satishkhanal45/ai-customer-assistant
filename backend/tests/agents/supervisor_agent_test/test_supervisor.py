@@ -203,22 +203,24 @@ def test_graph_greeting_end_to_end():
     assert result["final_response"] == "Hello! How can I help you today?"
 
 
-def test_graph_unknown_exhausted_reaches_ticket_agent():
+async def test_graph_unknown_exhausted_reaches_ticket_agent():
     payload = {"request_category": "DOMAIN_REQUEST", "domain_confidence": 0.8, "intent": "UNKNOWN", "intent_confidence": 0.0, "clarification_question": None}
-    # With the TicketStore default the Ticket Agent pauses for an email via
-    # interrupt(), so a checkpointer (MemorySaver) is required here.
+    # With the TicketStore default the Ticket Agent pauses via interrupt(),
+    # so a checkpointer (MemorySaver) is required here. The node is async
+    # (its store performs database I/O), so drive the graph with ainvoke.
     graph = build_supervisor_graph(
         llm_client=FakeClient(payload), checkpointer=MemorySaver()
     )
     config = {"configurable": {"thread_id": "unknown-exhausted"}}
-    result = graph.invoke(
+    result = await graph.ainvoke(
         {"user_message": "irrelevant for FakeClient", "conversation_history": [], "clarification_attempts": 2},
         config=config,
     )
     assert result["clarification_attempts"] == 3
     assert "__interrupt__" in result
     (interrupt_payload,) = result["__interrupt__"]
-    assert interrupt_payload.value["type"] == "email-collection"
+    # First pause of the three-step ticket flow is the clarifying question.
+    assert interrupt_payload.value["type"] == "clarifying_question"
 
 
 def test_graph_classify_failure_returns_transient_error_not_decline():

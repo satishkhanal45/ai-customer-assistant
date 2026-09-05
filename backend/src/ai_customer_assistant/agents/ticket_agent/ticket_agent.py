@@ -16,8 +16,14 @@ logic of its own, by design, since that decision has already been made
 before call() is ever invoked.
 
 Two-step shape, mirroring the actual conversation flow:
-    1. call(query)              -> PendingTicket   (ticket opened, no email yet)
+    1. call(query, reason)      -> PendingTicket   (ticket opened, no email yet)
     2. create_ticket(pending, email) -> Ticket      (email collected + validated)
+
+``reason`` is the customer's answer to the clarifying question the
+Supervisor's adapter asks before the email ("why do you want a ticket?").
+It is optional so escalation paths that already know why can open a
+ticket without one, and it is carried through create_ticket() unchanged
+so it reaches storage and the confirmation instead of being dropped.
 
 open_ticket() is provided as a convenience that composes both steps for
 callers that already have both the query and the email in hand at once.
@@ -36,21 +42,25 @@ from agents.ticket_agent.types import PendingTicket, Ticket
 from agents.ticket_agent.validation import validate_email
 
 
-def call(query: str) -> PendingTicket:
+def call(query: str, reason: str | None = None) -> PendingTicket:
     """
     Open a ticket for ``query``.
 
     This is the "call(query)" step: it does nothing but wrap the query
+    (and, when the caller collected one, the customer's stated reason)
     as a PendingTicket, signaling that human follow-up has been
     requested and an email is now needed to complete the ticket.
 
     Args:
         query: The original customer query that needs human follow-up.
+        reason: The customer's stated reason for wanting a ticket, when
+            the caller asked for one. Optional — callers that never ask
+            (escalation) leave it None.
 
     Returns:
-        A PendingTicket carrying the query, awaiting an email.
+        A PendingTicket carrying the query and reason, awaiting an email.
     """
-    return PendingTicket(query=query)
+    return PendingTicket(query=query, reason=reason)
 
 
 def create_ticket(pending: PendingTicket, email: str) -> Ticket:
@@ -75,11 +85,12 @@ def create_ticket(pending: PendingTicket, email: str) -> Ticket:
         ticket_id=str(uuid.uuid4()),
         email=normalized_email,
         query=pending.query,
+        reason=pending.reason,
         priority=None,
     )
 
 
-def open_ticket(query: str, email: str) -> Ticket:
+def open_ticket(query: str, email: str, reason: str | None = None) -> Ticket:
     """
     Convenience wrapper composing call() and create_ticket() in one step,
     for callers that already have both the query and email available.
@@ -87,13 +98,14 @@ def open_ticket(query: str, email: str) -> Ticket:
     Args:
         query: The original customer query that needs human follow-up.
         email: The customer-submitted email address.
+        reason: The customer's stated reason, when already known.
 
     Returns:
         A fully-formed Ticket, identical to calling
-        create_ticket(call(query), email).
+        create_ticket(call(query, reason), email).
 
     Raises:
         validation.InvalidEmailError: if ``email`` is not a
             syntactically valid email address.
     """
-    return create_ticket(call(query), email)
+    return create_ticket(call(query, reason), email)

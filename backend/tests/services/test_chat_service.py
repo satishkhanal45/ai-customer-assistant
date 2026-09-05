@@ -52,15 +52,29 @@ class _KnowledgeQueryClient(StubSupervisorLLMClient):
         )
 
 
+def _chat_service_kwargs(**overrides):
+    """Build kwargs for build_chat_service with MemorySaver as the default
+    checkpointer, so tests never hit Postgres."""
+    defaults = {"checkpointer": MemorySaver()}
+    defaults.update(overrides)
+    return defaults
+
+
 @pytest.mark.asyncio
-async def test_handle_message_creates_ticket_across_two_calls():
-    svc = await build_chat_service(llm_client=_CreateTicketClient())
+async def test_handle_message_creates_ticket_across_three_calls():
+    svc = await build_chat_service(**_chat_service_kwargs(llm_client=_CreateTicketClient()))
 
+    # Step 1: ticket request triggers clarifying_question interrupt
     first = await svc.handle_message("t-thread", "I need a refund")
-    assert "email" in first.lower()
+    assert "ticket" in first.lower()
 
-    second = await svc.handle_message("t-thread", "customer@example.com")
-    assert "ticket" in second.lower() and "created" in second.lower()
+    # Step 2: providing reason triggers email-collection interrupt
+    second = await svc.handle_message("t-thread", "billing issue")
+    assert "email" in second.lower()
+
+    # Step 3: providing email creates the ticket
+    third = await svc.handle_message("t-thread", "customer@example.com")
+    assert "ticket" in third.lower() and "created" in third.lower()
 
 
 @pytest.mark.asyncio
@@ -69,22 +83,25 @@ async def test_handle_message_reads_history_from_checkpointer():
     carry the first conversation into the new turn. Proven by asking a
     knowledge query after a ticket turn and observing the conversation
     history channel accumulated two turns."""
-    svc = await build_chat_service(llm_client=_CreateTicketClient())
+    svc = await build_chat_service(**_chat_service_kwargs(llm_client=_CreateTicketClient()))
 
+    # Three-call ticket flow: clarifying_question → email-collection → ticket
     await svc.handle_message("t-2", "I need a refund")
+    await svc.handle_message("t-2", "billing issue")
     await svc.handle_message("t-2", "customer@example.com")
 
     snapshot = await svc.graph.aget_state({"configurable": {"thread_id": "t-2"}})
     history = snapshot.values.get("conversation_history")
     assert history is not None
-    assert [turn.role for turn in history] == ["user", "assistant", "user", "assistant"]
+    # Only the final (non-interrupt) turn is persisted to history
+    assert [turn.role for turn in history] == ["user", "assistant"]
 
 
 @pytest.mark.asyncio
 async def test_handle_message_reads_history_forward():
     """A follow-up turn receives the prior transcript in conversation_history
     (the Knowledge Agent flattening of it), proving history did not reset."""
-    svc = await build_chat_service(llm_client=_KnowledgeQueryClient())
+    svc = await build_chat_service(**_chat_service_kwargs(llm_client=_KnowledgeQueryClient()))
 
     reply1 = await svc.handle_message("t-3", "Tell me about refunds")
     assert isinstance(reply1, str)
@@ -99,14 +116,13 @@ async def test_handle_message_reads_history_forward():
 
 @pytest.mark.asyncio
 async def test_thread_ids_are_isolated():
-    svc = await build_chat_service(llm_client=_CreateTicketClient())
+    svc = await build_chat_service(**_chat_service_kwargs(llm_client=_KnowledgeQueryClient()))
 
-    await svc.handle_message("t-a", "I need a refund")
-    await svc.handle_message("t-b", "I want to cancel my order")
+    await svc.handle_message("t-a", "Tell me about refunds")
+    await svc.handle_message("t-b", "How do I cancel?")
 
     snapshot_a = await svc.graph.aget_state({"configurable": {"thread_id": "t-a"}})
     snapshot_b = await svc.graph.aget_state({"configurable": {"thread_id": "t-b"}})
-    # t-a is mid-ticket (one interrupt turn logged), t-b has only its own.
     assert (snapshot_a.values.get("conversation_history") or []) != (
         snapshot_b.values.get("conversation_history") or []
     )
