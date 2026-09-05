@@ -20,20 +20,43 @@ Provenance is resolved by additionally (left) joining knowledge_category
 (nullable — only chunks that were actually linked to a resolved
 business entity carry embedding_chunk.entity_id).
 
-Design tradeoff, stated plainly: this implementation fetches every
-candidate row surviving the join/filter above, then ranks by cosine
-similarity in Python (`_rank_by_similarity`), rather than pushing
-`ORDER BY embedding <=> :query_vector LIMIT :k` into pgvector itself.
-This keeps ranking a pure, dependency-free function that's fully
-unit-testable against any backend (including the plain SQLite fixture
-used in this module's tests) without requiring a live pgvector
-extension. For corpora where the live-chunk candidate set is large
-enough that fetching every embedding is wasteful, replace
-`_rank_by_similarity`'s work with a pgvector ORDER BY/LIMIT clause
-inside `_candidate_chunks_statement()` — the join/filter contract, the
-RetrievedChunk shape, and every function below it stay identical
-either way, only the two functions that currently do the ranking in
-Python would be trimmed.
+Ranking is dialect-aware, and the two paths are equivalent by
+construction — they differ only in *where* the cosine arithmetic runs:
+
+* **PostgreSQL (production).** `ORDER BY embedding <=> :query_vector
+  LIMIT :top_k` is pushed into pgvector, so the database returns at most
+  `top_k` rows, the distance arithmetic runs in C, and no embedding
+  column crosses the wire at all.
+
+  Honest caveat on the HNSW index added by migration `9f1a2b7c4e08`:
+  because this query joins `embedding_chunk` to the version/source
+  tables to enforce the live-version contract, Postgres currently plans
+  a join-then-sort rather than an index scan. The index is exercised
+  only when the planner sees a bare single-table `ORDER BY ... LIMIT`.
+  Making it fire under the join needs an ANN pre-filter CTE
+  (`SELECT ... ORDER BY embedding <=> :q LIMIT :k * overfetch` first,
+  join and re-filter after), which trades exact recall for speed and is
+  deliberately *not* done here — at this corpus size the sort is
+  cheap, and silently dropping live chunks would be worse than a sort.
+  The index is in place for when the corpus makes that trade worthwhile.
+* **Anything else (SQLite, used by this module's tests).** Every
+  candidate row is fetched and scored by the pure `_rank_by_similarity`,
+  which needs no pgvector extension and no live Postgres.
+
+The Python path used to be the *only* path, which meant every live chunk
+row — 768 floats apiece — was transferred and scored per query: O(n)
+network plus O(n·768) Python float math for a query that pgvector answers
+with an index lookup. That is why the dialect check exists; it is not a
+stylistic preference.
+
+`<=>` is pgvector's **cosine distance** operator (`1 - cosine
+similarity`), so the SQL path filters on `distance <= 1 - threshold` and
+reports `similarity = 1 - distance`. Both paths therefore produce the
+same `RetrievedChunk.similarity_score` for the same data, which
+`tests/agents/knowledge/test_vector_search.py` asserts directly.
+
+The join/filter contract, the `RetrievedChunk` shape, and every helper
+below are identical across both paths.
 
 Local table definitions mirror structured_lookup.py's convention
 (structural mirror of schema.md, not the source of truth) and
@@ -49,7 +72,21 @@ import json
 import math
 from typing import Callable, Sequence
 
-from sqlalchemy import Boolean, Column, ForeignKey, Integer, MetaData, String, Table, Text, cast, select
+from pgvector.sqlalchemy import Vector
+from sqlalchemy import (
+    Boolean,
+    Column,
+    Float,
+    ForeignKey,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Text,
+    bindparam,
+    cast,
+    select,
+)
 from sqlalchemy.engine import Row
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import Select
@@ -150,6 +187,10 @@ async def vector_search(
     active-source chunks, ranked by cosine similarity and truncated to
     `config.top_k`.
 
+    On PostgreSQL the ordering and truncation happen inside pgvector;
+    everywhere else the same ranking is computed in Python. See the
+    module docstring — the results are equivalent.
+
     Raises VectorSearchError if the embedding call fails or returns a
     vector of the wrong dimension. Raises EmptyRetrievalError if no
     chunk clears `config.similarity_threshold` — this is a signal for
@@ -157,13 +198,17 @@ async def vector_search(
     structured-only strategy or treat it as ungrounded, not something
     this module decides on the caller's behalf."""
     query_vector = _embed_query_text(embed_query, rewritten.rewritten_text, config=config)
-    candidate_rows = await _fetch_rows(session, _candidate_chunks_statement())
-    ranked = _rank_by_similarity(
-        candidate_rows,
-        query_vector,
-        similarity_threshold=config.similarity_threshold,
-        top_k=config.top_k,
-    )
+
+    if _uses_pgvector(session):
+        ranked = await _rank_in_postgres(session, query_vector, config=config)
+    else:
+        candidate_rows = await _fetch_rows(session, _candidate_chunks_statement())
+        ranked = _rank_by_similarity(
+            candidate_rows,
+            query_vector,
+            similarity_threshold=config.similarity_threshold,
+            top_k=config.top_k,
+        )
     if not ranked:
         raise EmptyRetrievalError(
             message=f"no chunk met similarity_threshold={config.similarity_threshold} for the rewritten query",
@@ -231,14 +276,21 @@ def _rank_by_similarity(
 # ==========================================================================
 
 
-def _candidate_chunks_statement() -> Select:
+def _candidate_chunks_statement(*, include_embedding: bool = True) -> Select:
     """Pure: build (never execute) the statement scoping candidate
-    chunks to currently-live, INDEXED, active-source content."""
+    chunks to currently-live, INDEXED, active-source content.
+
+    ``include_embedding`` is False on the pgvector path: the database
+    does the scoring, so shipping 768 floats per row would be pure waste.
+    """
+    embedding_columns = (
+        (embedding_chunk_table.c.embedding,) if include_embedding else ()
+    )
     return (
         select(
             embedding_chunk_table.c.chunk_id,
             embedding_chunk_table.c.text,
-            embedding_chunk_table.c.embedding,
+            *embedding_columns,
             embedding_chunk_table.c.chunk_index,
             embedding_chunk_table.c.page,
             knowledge_source_version_table.c.version_number,
@@ -289,6 +341,78 @@ def _row_to_retrieved_chunk(row: Row, similarity_score: float) -> RetrievedChunk
         similarity_score=round(similarity_score, 4),
         provenance=provenance,
     )
+
+
+# ==========================================================================
+# Internals — the pgvector path
+# ==========================================================================
+
+
+def _uses_pgvector(session: AsyncSession) -> bool:
+    """Is this session talking to PostgreSQL?
+
+    Determined from the session's own bind rather than from config, so
+    there is no setting that can drift out of sync with reality: a SQLite
+    test session always takes the Python path and a Postgres session
+    always takes the indexed one. Any failure to introspect degrades to
+    the portable Python path, which is correct everywhere.
+    """
+    try:
+        return session.get_bind().dialect.name == "postgresql"
+    except Exception:  # noqa: BLE001 - introspection must never break retrieval
+        return False
+
+
+def _distance_expression(query_vector: tuple[float, ...], *, config: KnowledgeAgentConfig):
+    """Pure: the ``embedding <=> :query_vector`` cosine-distance term.
+
+    The bind carries an explicit ``Vector`` type so pgvector's adapter
+    sends a real vector literal — without it the driver would try to
+    render a Python list and the operator would fail.
+    """
+    query_bind = bindparam(
+        "query_vector",
+        value=list(query_vector),
+        type_=Vector(config.embedding_dimension),
+    )
+    return embedding_chunk_table.c.embedding.op("<=>", return_type=Float)(query_bind)
+
+
+def _pgvector_ranked_statement(
+    query_vector: tuple[float, ...], *, config: KnowledgeAgentConfig
+) -> Select:
+    """Pure: the join contract plus pgvector ordering and truncation.
+
+    ``similarity >= threshold`` becomes ``distance <= 1 - threshold``
+    because ``<=>`` returns cosine *distance*. ORDER BY + LIMIT is the
+    shape pgvector's HNSW index is built to answer.
+    """
+    distance = _distance_expression(query_vector, config=config)
+    return (
+        _candidate_chunks_statement(include_embedding=False)
+        .add_columns(distance.label("distance"))
+        .where(distance <= 1.0 - config.similarity_threshold)
+        .order_by(distance)
+        .limit(config.top_k)
+    )
+
+
+async def _rank_in_postgres(
+    session: AsyncSession,
+    query_vector: tuple[float, ...],
+    *,
+    config: KnowledgeAgentConfig,
+) -> tuple[tuple[Row, float], ...]:
+    """Execute the pgvector statement and convert distance to similarity.
+
+    Returns the same ``(row, similarity)`` pairs `_rank_by_similarity`
+    produces, so everything downstream is oblivious to which path ran.
+    """
+    try:
+        rows = await _fetch_rows(session, _pgvector_ranked_statement(query_vector, config=config))
+    except Exception as exc:  # noqa: BLE001 - surface as this module's own error type
+        raise VectorSearchError(message=f"pgvector similarity search failed: {exc}") from exc
+    return tuple((row, 1.0 - float(row.distance)) for row in rows)
 
 
 # ==========================================================================
