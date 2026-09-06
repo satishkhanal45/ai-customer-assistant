@@ -14,8 +14,12 @@ _VALID_WAIT_STRATEGIES = ("fixed_timeout", "networkidle", "selector")
 class CrawlConfig:
     mode: CrawlMode = CrawlMode.PAGE
     max_depth: int = 2
-    max_pages: int = 5
-    request_timeout: float = 520.0
+    # Restored from the debugging values (max_pages=5, request_timeout=520.0)
+    # that were committed by accident in 02b41a5. A 520-second per-request
+    # timeout means one unresponsive page stalls a crawl for nearly nine
+    # minutes; max_pages=5 silently truncates every site crawl to five pages.
+    max_pages: int = 50
+    request_timeout: float = 15.0
     concurrent_requests: int = 5
     retry_count: int = 2
     delay_between_requests: float = 0.0

@@ -250,6 +250,23 @@ async def run_ingestion(session: AsyncSession, job: JobRef, deps: PipelineDeps |
                 entities_created_count=_entities_created_count(ctx.chunk_extractions),
             )
         case Err(reason, detail):
+            # Discard everything the failed run staged before recording the
+            # failure (P2-3). `_stage_persist` writes chunks and EAV rows with
+            # add/flush and no commit of its own, so without this rollback the
+            # `mark_version_status` call below -- which does commit -- would
+            # carry those partial writes into the database alongside the
+            # FAILED status. The retrieval join contract hides such orphans
+            # from search, so nothing was visibly broken; they simply
+            # accumulated, inflated the chunk counts, and made the tables
+            # confusing to read directly.
+            #
+            # Safe to roll back here: every row this handler needs afterwards
+            # (the job, source and version) was committed before the pipeline
+            # started -- `claim_next_job` commits the RUNNING transition, and
+            # the version row is created by the enqueuing API -- so
+            # `mark_version_status` simply re-reads the version from the
+            # database in the fresh transaction.
+            await session.rollback()
             await job_repo.mark_version_status(session, version.version_id, VersionStatus.FAILED)
             return JobOutcome(
                 job_id=job.job_id,

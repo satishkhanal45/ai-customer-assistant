@@ -21,6 +21,8 @@ from typing import Callable, Optional
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, StateGraph
 
+from timeouts import KNOWLEDGE_NODE_TIMEOUT_S
+
 from .agents_wiring import (
     make_knowledge_agent_node,
     make_ticket_agent_node,
@@ -112,7 +114,7 @@ def build_supervisor_graph(
     knowledge_agent_node: Optional[Callable[[SupervisorState], dict]] = None,
     ticket_agent_node: Optional[Callable[[SupervisorState], dict]] = None,
     knowledge_graph: Optional[Callable] = None,
-    knowledge_timeout_s: float = 120,
+    knowledge_timeout_s: float = KNOWLEDGE_NODE_TIMEOUT_S,
     ticket_ops: Optional[Callable] = None,
     checkpointer: Optional[BaseCheckpointSaver] = None,
 ):

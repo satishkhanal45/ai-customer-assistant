@@ -208,6 +208,7 @@ async def vector_search(
             query_vector,
             similarity_threshold=config.similarity_threshold,
             top_k=config.top_k,
+            relative_score_margin=config.relative_score_margin,
         )
     if not ranked:
         raise EmptyRetrievalError(
@@ -257,18 +258,46 @@ def _cosine_similarity(a: tuple[float, ...], b: tuple[float, ...]) -> float:
     return dot_product / (norm_a * norm_b) if norm_a and norm_b else 0.0
 
 
+def _apply_relative_margin(
+    ranked: Sequence[tuple[Row, float]], *, relative_score_margin: float
+) -> tuple[tuple[Row, float], ...]:
+    """Pure: drop results scoring more than ``relative_score_margin`` below
+    the best hit for this query.
+
+    Applied to both ranking paths (see the module docstring) so the pgvector
+    and Python routes stay equivalent. ``ranked`` must already be sorted
+    descending; a margin of 0.0 disables the filter.
+
+    Why this exists (P2-2): the absolute ``similarity_threshold`` is the only
+    filter this module used to have, and an absolute floor is a weak
+    discriminator over normalised BGE similarities, which compress unrelated
+    English text into roughly the same 0.6-0.7 band as weakly-related text.
+    A query with nothing to say about it would return eight chunks all
+    scoring just over the floor, and the answer prompt could not tell that
+    apart from eight genuinely good hits. Scoring each result against *this
+    query's own best result* uses the signal an absolute cutoff discards.
+    """
+    if not ranked or relative_score_margin <= 0.0:
+        return tuple(ranked)
+    floor = ranked[0][1] - relative_score_margin
+    return tuple(pair for pair in ranked if pair[1] >= floor)
+
+
 def _rank_by_similarity(
     rows: Sequence[Row],
     query_vector: tuple[float, ...],
     *,
     similarity_threshold: float,
     top_k: int,
+    relative_score_margin: float = 0.0,
 ) -> tuple[tuple[Row, float], ...]:
     """Pure: score every candidate row, keep those clearing the
-    threshold, sort descending, truncate to top_k."""
+    threshold, sort descending, truncate to top_k, then apply the
+    relative margin."""
     scored = tuple((row, _cosine_similarity(_parse_embedding(row.embedding), query_vector)) for row in rows)
     above_threshold = tuple(pair for pair in scored if pair[1] >= similarity_threshold)
-    return tuple(sorted(above_threshold, key=lambda pair: pair[1], reverse=True))[:top_k]
+    ordered = tuple(sorted(above_threshold, key=lambda pair: pair[1], reverse=True))[:top_k]
+    return _apply_relative_margin(ordered, relative_score_margin=relative_score_margin)
 
 
 # ==========================================================================
@@ -412,7 +441,13 @@ async def _rank_in_postgres(
         rows = await _fetch_rows(session, _pgvector_ranked_statement(query_vector, config=config))
     except Exception as exc:  # noqa: BLE001 - surface as this module's own error type
         raise VectorSearchError(message=f"pgvector similarity search failed: {exc}") from exc
-    return tuple((row, 1.0 - float(row.distance)) for row in rows)
+    ranked = tuple((row, 1.0 - float(row.distance)) for row in rows)
+    # The relative margin is applied here rather than in SQL: the ORDER BY +
+    # LIMIT has already reduced the set to at most top_k rows, so filtering
+    # them in Python costs nothing, and expressing "within X of the best row"
+    # in SQL would need a window function over the whole candidate set --
+    # which would defeat the LIMIT this path exists to push down.
+    return _apply_relative_margin(ranked, relative_score_margin=config.relative_score_margin)
 
 
 # ==========================================================================

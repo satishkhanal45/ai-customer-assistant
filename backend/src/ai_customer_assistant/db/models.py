@@ -21,6 +21,7 @@ from sqlalchemy import (
     Enum as SAEnum,
     ForeignKey,
     Integer,
+    JSON,
     String,
     Text,
     UniqueConstraint,
@@ -327,6 +328,9 @@ TicketStatusEnum = SAEnum("OPEN", "IN_PROGRESS", "RESOLVED", name="ticket_status
 
 class Ticket(Base):
     __tablename__ = "ticket"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="uq_ticket_idempotency_key"),
+    )
 
     ticket_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
@@ -337,6 +341,66 @@ class Ticket(Base):
     # before collecting the email. Nullable: escalation paths open a ticket
     # without asking, and every row created before this column existed has none.
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Server-derived key ("<thread_id>:<n>") deduplicating a retried create.
+    #
+    # Idempotency used to live only in a Python dict on one TicketStore
+    # instance, which made the guarantee per-process: two API instances, or
+    # one instance restarted between the retry and the original, would each
+    # see an empty dict and book a second ticket for the same request --
+    # and send the customer a second confirmation email. The unique index
+    # below moves the guarantee to the database, where it holds across
+    # processes, restarts and deploys.
+    #
+    # Nullable because callers may omit the key (an escalation path that has
+    # no thread to derive one from); Postgres does not consider two NULLs
+    # equal, so unkeyed tickets are never deduplicated against each other.
+    idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     priority: Mapped[str | None] = mapped_column(String(32), nullable=True)
     status: Mapped[str] = mapped_column(TicketStatusEnum, nullable=False, server_default="OPEN")
     created_at: Mapped[datetime] = mapped_column(nullable=False, server_default=func.now())
+
+
+# ---------------------------------------------------------------------------
+# Crawl discovery review state
+# ---------------------------------------------------------------------------
+
+
+class CrawlDiscovery(Base):
+    """A pending site-crawl discovery, held between `POST /ingest/crawl/discover`
+    and the `.../confirm` that acts on it.
+
+    This was a module-level dict in `api/ingest.py`. That made the review step
+    silently instance-affine: discover on instance A, confirm on instance B,
+    and the confirm returned 404 "unknown or expired discovery_id" even though
+    nothing had expired -- an error message that actively misled whoever hit
+    it. A process restart between the two calls did the same thing.
+
+    Rows are transient by design. `expires_at` carries the TTL that used to be
+    computed from `time.monotonic()`, and expired rows are deleted on the way
+    past rather than by a scheduled job -- the volume is a handful of rows and
+    a sweeper process would be more machinery than the problem deserves.
+    """
+
+    __tablename__ = "crawl_discovery"
+
+    discovery_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # The DiscoveryResult and the CrawlConfig it was produced under, both as
+    # plain JSON. Storing the config alongside the result matters: `confirm`
+    # must crawl with the same settings discovery ran with, and re-deriving
+    # them from the request would let a caller widen the crawl at confirm time.
+    #
+    # `with_variant(JSON, "sqlite")` costs nothing on Postgres -- JSONB is
+    # still what production gets -- and lets the tests create this table on
+    # an in-memory SQLite database. Without it the SQLite compiler cannot
+    # render JSONB at all, and the round-trip would have to be tested against
+    # a mock, which would not exercise the serialisation this table exists for.
+    result: Mapped[dict] = mapped_column(
+        JSONB().with_variant(JSON(), "sqlite"), nullable=False
+    )
+    config: Mapped[dict] = mapped_column(
+        JSONB().with_variant(JSON(), "sqlite"), nullable=False
+    )

@@ -35,15 +35,16 @@ Uploaded-by defaults to the system service account
 from __future__ import annotations
 
 import os
-import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 from uuid import UUID
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from pydantic import BaseModel, Field, model_validator
+from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.engine import get_session
@@ -56,43 +57,116 @@ router = APIRouter(prefix="/ingest", tags=["ingest"])
 
 DEFAULT_USER_ID = UUID("00000000-0000-0000-0000-000000000000")
 
-# Review data is cached server-side (not persisted) just long enough for a
-# human/UI to look at the discovery list and then confirm it.
+# How long a discovery stays confirmable — long enough for a human to read
+# the list and decide, short enough that a stale list is never acted on.
 _DISCOVERY_TTL_SECONDS = 600.0
 
 
 @dataclass(frozen=True)
 class _CachedDiscovery:
-    created_at: float
     result: DiscoveryResult
     config: CrawlConfig
 
 
-_discovery_cache: dict[str, _CachedDiscovery] = {}
+# ---------------------------------------------------------------------------
+# Discovery review state (P2-5)
+#
+# This was a module-level dict. Discovery and confirmation are two separate
+# HTTP requests, so with more than one API instance the confirm had roughly a
+# 50% chance of landing on a process that had never heard of the discovery —
+# and the 404 it returned said "unknown or expired discovery_id", blaming a
+# TTL that had not elapsed. A single instance restarting between the two
+# calls produced the same misleading error.
+#
+# The rows now live in `crawl_discovery` (migration 3d6f8b2c17ae), where
+# every instance can see them, with `expires_at` carrying the TTL that used
+# to be a `time.monotonic()` delta. Expired rows are swept on the way past
+# rather than by a scheduled job: the volume is a handful of rows and the
+# sweep is one indexed DELETE.
+# ---------------------------------------------------------------------------
 
 
-def _cache_discovery(result: DiscoveryResult, config: CrawlConfig) -> str:
-    discovery_id = uuid.uuid4().hex
-    _discovery_cache[discovery_id] = _CachedDiscovery(
-        created_at=time.monotonic(), result=result, config=config
+def _serialize_discovery(result: DiscoveryResult) -> dict:
+    return {
+        "source": result.source,
+        "pages": [
+            {"url": p.url, "kind": p.kind, "file_type": p.file_type} for p in result.pages
+        ],
+    }
+
+
+def _deserialize_discovery(data: dict) -> DiscoveryResult:
+    from ingestion.crawler.models import DiscoveredPage
+
+    return DiscoveryResult(
+        pages=tuple(
+            DiscoveredPage(url=p["url"], kind=p["kind"], file_type=p.get("file_type"))
+            for p in data["pages"]
+        ),
+        source=data["source"],
     )
-    return discovery_id
 
 
-def _evict_expired() -> None:
-    now = time.monotonic()
-    expired = [
-        key
-        for key, cached in _discovery_cache.items()
-        if now - cached.created_at > _DISCOVERY_TTL_SECONDS
-    ]
-    for key in expired:
-        _discovery_cache.pop(key, None)
+def _serialize_config(config: CrawlConfig) -> dict:
+    data = asdict(config)
+    # `mode` is a str-Enum and `allowed_domains` a tuple; both round-trip
+    # through JSON as plain values, so they are normalised explicitly here
+    # rather than relying on the JSON encoder's treatment of subclasses.
+    data["mode"] = config.mode.value
+    data["allowed_domains"] = list(config.allowed_domains)
+    return data
 
 
-def _get_discovery(discovery_id: str) -> _CachedDiscovery | None:
-    _evict_expired()
-    return _discovery_cache.get(discovery_id)
+def _deserialize_config(data: dict) -> CrawlConfig:
+    # Tolerate rows written before a field was added or after one was
+    # removed: a stale discovery is worth degrading to defaults for, not
+    # worth a 500. Unknown keys are dropped, missing ones take their default.
+    known = {f.name for f in fields(CrawlConfig)}
+    kwargs = {k: v for k, v in data.items() if k in known}
+    if "mode" in kwargs:
+        kwargs["mode"] = CrawlMode(kwargs["mode"])
+    if "allowed_domains" in kwargs:
+        kwargs["allowed_domains"] = tuple(kwargs["allowed_domains"])
+    return CrawlConfig(**kwargs)
+
+
+async def _cache_discovery(
+    session: AsyncSession, result: DiscoveryResult, config: CrawlConfig
+) -> str:
+    from db.models import CrawlDiscovery
+
+    discovery_id = uuid.uuid4()
+    session.add(
+        CrawlDiscovery(
+            discovery_id=discovery_id,
+            expires_at=datetime.now(timezone.utc) + timedelta(seconds=_DISCOVERY_TTL_SECONDS),
+            result=_serialize_discovery(result),
+            config=_serialize_config(config),
+        )
+    )
+    await session.flush()
+    return discovery_id.hex
+
+
+async def _get_discovery(session: AsyncSession, discovery_id: str) -> _CachedDiscovery | None:
+    from db.models import CrawlDiscovery
+
+    now = datetime.now(timezone.utc)
+    await session.execute(delete(CrawlDiscovery).where(CrawlDiscovery.expires_at < now))
+
+    try:
+        key = UUID(discovery_id)
+    except ValueError:
+        # A malformed id is a 404 like any other unknown one — never a 500.
+        return None
+
+    row = await session.get(CrawlDiscovery, key)
+    if row is None:
+        return None
+    return _CachedDiscovery(
+        result=_deserialize_discovery(row.result),
+        config=_deserialize_config(row.config),
+    )
 
 
 def _uploaded_by() -> UUID:
@@ -370,18 +444,19 @@ async def crawl(
     result, config = await _run_discovery(
         req.url, wait_strategy=req.wait_strategy, wait_selector=req.wait_selector
     )
-    discovery_id = _cache_discovery(result, config)
+    discovery_id = await _cache_discovery(session, result, config)
     return _review_payload(discovery_id, result)
 
 
 @router.post("/crawl/discover")
 async def crawl_discover(
     req: DiscoverRequest,
+    session: AsyncSession = Depends(get_session),
 ) -> dict:
     result, config = await _run_discovery(
         req.root_url, wait_strategy=req.wait_strategy, wait_selector=req.wait_selector
     )
-    discovery_id = _cache_discovery(result, config)
+    discovery_id = await _cache_discovery(session, result, config)
     return _review_payload(discovery_id, result)
 
 
@@ -393,7 +468,7 @@ async def crawl_confirm(
 ) -> dict:
     from ingestion.crawler.crawler import crawl_confirmed
 
-    cached = _get_discovery(discovery_id)
+    cached = await _get_discovery(session, discovery_id)
     if cached is None:
         raise HTTPException(
             status_code=404,
