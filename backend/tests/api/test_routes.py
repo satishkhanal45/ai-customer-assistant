@@ -67,6 +67,10 @@ async def test_chat_endpoint_returns_reply_and_trace_id(service_app):
 
 @pytest.mark.asyncio
 async def test_chat_roundtrip_persists_thread(service_app):
+    """The ticket flow is three-step: reason -> email -> created.
+
+    State lives behind the checkpointer keyed by thread_id, so each POST
+    carries only the new message and the graph resumes where it paused."""
     client = AsyncClient(
         transport=ASGITransport(app=service_app), base_url="http://test"
     )
@@ -74,13 +78,23 @@ async def test_chat_roundtrip_persists_thread(service_app):
         "/chat",
         json={"thread_id": "thread-t2", "message": "I need a refund"},
     )
-    assert "email" in first.json()["reply"].lower()
+    assert "reason" in first.json()["reply"].lower()
 
     second = await client.post(
         "/chat",
+        json={"thread_id": "thread-t2", "message": "billing issue"},
+    )
+    assert "email" in second.json()["reply"].lower()
+
+    third = await client.post(
+        "/chat",
         json={"thread_id": "thread-t2", "message": "customer@example.com"},
     )
-    second_body = second.json()
-    assert "ticket" in second_body["reply"].lower()
-    assert second_body["trace_id"] != first.json()["trace_id"]
+    third_body = third.json()
+    assert "ticket" in third_body["reply"].lower()
+    assert "created" in third_body["reply"].lower()
+    # The reason the customer gave survives into the confirmation (P0-1).
+    assert "billing issue" in third_body["reply"]
+    # trace_id is generated fresh per request at the API boundary.
+    assert len({first.json()["trace_id"], second.json()["trace_id"], third_body["trace_id"]}) == 3
     await client.aclose()

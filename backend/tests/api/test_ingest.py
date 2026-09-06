@@ -113,7 +113,13 @@ async def test_crawl_rejects_selector_without_wait_selector(ingest):
 
 
 @pytest.mark.asyncio
-async def test_crawl_page_roundtrip_job_status_transitions(ingest, monkeypatch):
+async def test_crawl_page_enqueues_only_and_does_not_run_the_job(ingest, monkeypatch):
+    """The endpoint registers the document and returns 202 with a job_id.
+
+    It must NOT run the pipeline: that belongs to the worker process. This
+    used to `asyncio.create_task(_run_job(...))` inside the request, which
+    ran the embedding model in the web worker and orphaned RUNNING rows on
+    restart. The job therefore stays QUEUED until a worker claims it."""
     job_id = uuid.uuid4()
     job = _FakeJob(job_id, "QUEUED", chunks=0, entities=0, error=None)
     app = _build_app(ingest, _FakeSession([job]))
@@ -143,14 +149,8 @@ async def test_crawl_page_roundtrip_job_status_transitions(ingest, monkeypatch):
     async def _fake_register(session, **kwargs):
         return SimpleNamespace(job_id=job_id, source_id=uuid.uuid4(), version_id=uuid.uuid4())
 
-    async def _fake_run_job(job_id_):
-        job.status = "COMPLETED"
-        job.chunks_created_count = 2
-        job.entities_created_count = 1
-
     monkeypatch.setattr(ingest.httpx, "AsyncClient", _FakeClient)
     monkeypatch.setattr(ingest, "register_document_version", _fake_register)
-    monkeypatch.setattr(ingest, "_run_job", _fake_run_job)
 
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
@@ -159,15 +159,19 @@ async def test_crawl_page_roundtrip_job_status_transitions(ingest, monkeypatch):
             "/ingest/crawl",
             json={"url": "http://example.com/page", "scope": "PAGE"},
         )
-        assert submit.status_code == 200
+        assert submit.status_code == 202
         assert submit.json()["status"] == "submitted"
         assert submit.json()["job_id"] == str(job_id)
 
+        # Give any stray background task a chance to run, then prove none did.
         await asyncio.sleep(0)
 
         status = await client.get(f"/ingest/jobs/{job_id}")
         assert status.status_code == 200
-        body = status.json()
-        assert body["status"] == "COMPLETED"
-        assert body["chunks_created_count"] == 2
-        assert body["entities_created_count"] == 1
+        assert status.json()["status"] == "QUEUED"
+
+
+@pytest.mark.asyncio
+async def test_api_module_exposes_no_inline_job_runner(ingest):
+    """Guard against the fire-and-forget path being reintroduced."""
+    assert not hasattr(ingest, "_run_job")

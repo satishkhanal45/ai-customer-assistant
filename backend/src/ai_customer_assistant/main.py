@@ -11,13 +11,23 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from api.graph import router as graph_router
-from api.ingest import router as ingest_router
-from api.routes import router
-from db.checkpointer import build_checkpointer
-from db.session import get_async_session_factory
-from services.chat_service import build_chat_service
-from services.embeddings import build_shared_embeddings
+# Load backend/.env before importing anything that might read os.environ.
+# This module is the ASGI entry point, so this is the right place for it --
+# and previously the app got its .env only as an accidental side effect of
+# importing agents.ticket_agent.store (see config.load_env for why that was a
+# defect). In Docker this is a no-op: .env is excluded from the image and the
+# environment comes from compose.
+from config import load_env
+
+load_env()
+
+from api.graph import router as graph_router  # noqa: E402
+from api.ingest import router as ingest_router  # noqa: E402
+from api.routes import router  # noqa: E402
+from db.checkpointer import build_checkpointer  # noqa: E402
+from db.engine import dispose_engine, get_session_factory  # noqa: E402
+from services.chat_service import build_chat_service  # noqa: E402
+from services.embeddings import build_shared_embeddings  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +38,7 @@ async def lifespan(app: FastAPI):
     # Phase 6 wiring: the real Knowledge graph is compiled only when BOTH the
     # shared BGE instance and the async session factory are passed in.
     shared_embeddings = build_shared_embeddings()
-    session_factory = get_async_session_factory()
+    session_factory = get_session_factory()
     service = await build_chat_service(
         checkpointer=checkpointer,
         shared_embeddings=shared_embeddings,
@@ -36,10 +46,14 @@ async def lifespan(app: FastAPI):
     )
     app.state.chat_service = service
     yield
+    # Shutdown: release the checkpointer's psycopg pool and the shared
+    # SQLAlchemy engine's pool, so a reload or redeploy does not leave
+    # connections open server-side.
     conn = getattr(checkpointer, "conn", None)
     close = getattr(conn, "aclose", None)
     if close is not None:
         await close()
+    await dispose_engine()
 
 
 app = FastAPI(title="AI Customer Assistant", lifespan=lifespan)

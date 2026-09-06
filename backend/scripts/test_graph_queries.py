@@ -18,13 +18,13 @@ import sys
 from pathlib import Path
 from uuid import UUID
 
-from dotenv import load_dotenv
-
-load_dotenv(Path(__file__).resolve().parents[1] / ".env")
-
 _PKG_ROOT = Path(__file__).resolve().parent.parent / "src" / "ai_customer_assistant"
 if str(_PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(_PKG_ROOT))
+
+from config import load_env  # noqa: E402
+
+load_env()
 
 # Real IDs from your `SELECT * FROM entity` output.
 ANKUR = UUID("98221d4c-6617-4514-a4bc-a4e0c506922a")

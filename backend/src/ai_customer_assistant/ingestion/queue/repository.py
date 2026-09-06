@@ -8,7 +8,7 @@ raw text() SQL used in the first draft.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 from sqlalchemy import func, select
@@ -71,6 +71,39 @@ async def claim_next_job(session: AsyncSession) -> JobRef | None:
         status=JobStatus(row.status),
         triggered_by=row.triggered_by,
     )
+
+
+async def reset_stale_running_jobs(session: AsyncSession, *, older_than_seconds: float) -> int:
+    """Return jobs stuck in RUNNING back to QUEUED, and report how many.
+
+    A worker that is killed mid-job (deploy, OOM, `docker compose down`)
+    leaves its row RUNNING forever. That is not merely untidy: `claim_next_job`
+    skips any source that has a RUNNING job, so one abandoned row blocks every
+    future ingestion for that source permanently, with no error anywhere.
+
+    Called at worker startup. `older_than_seconds` must comfortably exceed the
+    longest legitimate job, or this will yank a job out from under a healthy
+    worker that is still processing it.
+    """
+    cutoff = datetime.now(UTC) - timedelta(seconds=older_than_seconds)
+    stale = (
+        await session.execute(
+            select(KnowledgeInjectionJob).where(
+                KnowledgeInjectionJob.status == "RUNNING",
+                KnowledgeInjectionJob.started_at < cutoff,
+            )
+        )
+    ).scalars().all()
+
+    for job in stale:
+        job.status = "QUEUED"
+        job.started_at = None
+        job.error_details = "requeued: worker did not finish this job"
+
+    if stale:
+        await session.flush()
+        await session.commit()
+    return len(stale)
 
 
 async def load_source(session: AsyncSession, source_id: UUID) -> SourceRef:

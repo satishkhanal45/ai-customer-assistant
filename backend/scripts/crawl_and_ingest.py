@@ -67,10 +67,7 @@ from typing import Literal
 from uuid import UUID
 
 import httpx
-from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-
-load_dotenv(Path(__file__).resolve().parents[1] / ".env")  # backend/.env
 
 # Add src/ai_customer_assistant to sys.path so bare `ingestion.xxx` / `db.xxx`
 # imports work when this script is invoked directly (matches pyproject.toml's
@@ -78,6 +75,11 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env")  # backend/.env
 _PKG_ROOT = Path(__file__).resolve().parent.parent / "src" / "ai_customer_assistant"
 if str(_PKG_ROOT) not in sys.path:
     sys.path.insert(0, str(_PKG_ROOT))
+
+# Entry point: load backend/.env once, explicitly (see config.load_env).
+from config import load_env  # noqa: E402
+
+load_env()
 
 from ingestion.pipeline_types import FileType, JobType
 from ingestion.queue.document_producer import register_document_version
