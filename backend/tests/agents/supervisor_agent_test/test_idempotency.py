@@ -123,25 +123,40 @@ class TestTicketStoreIdempotency:
 
 
 class TestIdempotencyKeyDerivation:
-    def test_request_id_priority(self) -> None:
+    """`_idempotency_key` became a coroutine when the per-thread ordinal moved
+    into the database (P2-5): counting it in process memory restarted at zero
+    after a restart and reissued a key an earlier ticket already held."""
+
+    async def test_request_id_priority(self) -> None:
         from agents.supervisor.agents_wiring import _idempotency_key
 
-        key = _idempotency_key({"request_id": "req-9", "thread_id": "t"})
+        key = await _idempotency_key({"request_id": "req-9", "thread_id": "t"})
         assert key == "request:req-9"
 
     async def test_server_derived_uses_thread_and_sequence(self) -> None:
         from agents.supervisor.agents_wiring import _idempotency_key
 
         store = TicketStore()
-        assert _idempotency_key({"thread_id": "t"}, store=store) == "t:0"
+        assert await _idempotency_key({"thread_id": "t"}, store=store) == "t:0"
         pending = PendingTicket(query="q")
         await store.create_ticket(pending, "a@example.com", idempotency_key="t:0")
-        assert _idempotency_key({"thread_id": "t"}, store=store) == "t:1"
+        assert await _idempotency_key({"thread_id": "t"}, store=store) == "t:1"
 
-    def test_fake_without_sequence_falls_back_to_thread(self) -> None:
+    async def test_fake_without_sequence_falls_back_to_thread(self) -> None:
         from agents.supervisor.agents_wiring import _idempotency_key
 
-        assert _idempotency_key({"thread_id": "t"}, store=object()) == "t"
+        assert await _idempotency_key({"thread_id": "t"}, store=object()) == "t"
+
+    async def test_accepts_a_synchronous_next_sequence(self) -> None:
+        """A hand-rolled fake with a plain `def next_sequence` must keep
+        working — the adapter awaits only what is actually awaitable."""
+        from agents.supervisor.agents_wiring import _idempotency_key
+
+        class _SyncFake:
+            def next_sequence(self, scope: str) -> int:
+                return 7
+
+        assert await _idempotency_key({"thread_id": "t"}, store=_SyncFake()) == "t:7"
 
 
 # ---------------------------------------------------------------------------

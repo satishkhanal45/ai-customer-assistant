@@ -87,7 +87,6 @@ app.include_router(router)
 app.include_router(graph_router)
 # Document ingestion: multipart upload + URL crawl
 app.include_router(ingest_router)
-# NOTE: api.chat is NOT registered — its POST /chat collides with router's.
 # NOTE: ingestion.storage.api (/admin/knowledge-sources) is NOT registered yet —
 #       its get_storage_config / get_db_session / get_current_admin_user_id
 #       dependencies still raise NotImplementedError (storage/api.py:62-83).

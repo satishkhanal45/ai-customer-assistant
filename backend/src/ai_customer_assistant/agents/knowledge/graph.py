@@ -12,8 +12,13 @@ Topology:
         -> structured_lookup                          (structured)
         -> vector_search                               (vector)
         -> structured_lookup + vector_search (parallel) (hybrid)
-    (structured_lookup | vector_search) -> rank -> deduplicate
-        -> build_context -> build_prompt -> llm -> END
+
+    structured_lookup -> [structured_fallback conditional edge]
+        -> vector_search   (structured-only strategy that found nothing)
+        -> rank            (otherwise)
+    vector_search -> rank
+
+    rank -> deduplicate -> build_context -> build_prompt -> llm -> END
 
 `decide_strategy`'s conditional edge (built by
 `nodes.make_decide_strategy_edge`) returns a *list* of next node
@@ -53,6 +58,7 @@ from .nodes import (
     make_llm_node,
     make_rank_node,
     make_rewrite_node,
+    make_structured_fallback_edge,
     make_structured_lookup_node,
     make_vector_search_node,
 )
@@ -113,10 +119,23 @@ def build_knowledge_agent_graph(
         [_STRUCTURED_LOOKUP, _VECTOR_SEARCH],
     )
 
-    # Fan-in: both retrieval nodes converge on rank. When only one of
-    # the two was actually reached (pure structured/vector strategy),
-    # LangGraph runs rank once that single predecessor completes.
-    graph.add_edge(_STRUCTURED_LOOKUP, "rank")
+    # Fan-in, with one detour: `vector_search` always converges on rank, and
+    # `structured_lookup` converges on rank *unless* a structured-only lookup
+    # came up empty, in which case it retries semantically first (P1-6).
+    #
+    # Before this edge existed, a confident extraction naming an entity type
+    # with no matching rows ended retrieval with zero results and the customer
+    # was told nothing was known — while the semantic index held the answer.
+    # The graph reported success throughout, so nothing anywhere logged a
+    # problem. See `hybrid.should_fall_back_to_vector`.
+    #
+    # The hybrid strategy reaches this edge too and always takes the "rank"
+    # branch, because its vector search is already running in parallel.
+    graph.add_conditional_edges(
+        _STRUCTURED_LOOKUP,
+        make_structured_fallback_edge(config=config),
+        [_VECTOR_SEARCH, "rank"],
+    )
     graph.add_edge(_VECTOR_SEARCH, "rank")
 
     graph.add_edge("rank", "deduplicate")

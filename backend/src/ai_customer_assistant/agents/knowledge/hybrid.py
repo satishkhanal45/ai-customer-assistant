@@ -18,25 +18,59 @@ the hybrid branch's fan-out/fan-in logic lives in exactly one place,
 and so this module is fully testable and directly callable without a
 running graph.
 
-Graceful degradation, scoped precisely: the *hybrid* strategy is the
-only place this module treats an arm's expected "found nothing" outcome
-as a value rather than a failure — EntityNotFoundError /
-AmbiguousEntityError / AttributeNotFoundError from the structured arm,
-and EmptyRetrievalError from the vector arm, all degrade to an empty
-tuple for that arm rather than aborting the whole hybrid_retrieve call,
-because hybrid mode explicitly exists to combine two independent
-signals and either one alone can still produce a useful RankedResult.
-Any *other* exception from either arm (a genuine infrastructure
-failure, not "no results") still propagates. The pure single-strategy
-branches (structured-only, vector-only) have no second arm to fall back
-on, so their exceptions always propagate — there's nothing to degrade
-to.
+Graceful degradation, scoped precisely: an arm's expected "found
+nothing" outcome is treated as a value rather than a failure —
+EntityNotFoundError / AmbiguousEntityError / AttributeNotFoundError
+from the structured arm, and EmptyRetrievalError from the vector arm,
+all degrade to an empty tuple for that arm rather than aborting the
+whole call. Any *other* exception (a genuine infrastructure failure,
+not "no results") still propagates.
+
+## The structured-only fallback (P1-6)
+
+A structured-only retrieval that finds nothing now falls back to vector
+search instead of returning an empty result.
+
+This is not a nicety. `decide_strategy` routes to structured-only
+whenever the extractor named an entity type, asked for a specific slot,
+and *was confident*. When that lookup then finds nothing, the old code
+returned an empty RankedResult and the agent told the customer it had
+no information — while the semantic index held the answer the whole
+time. Observed live:
+
+    query:       "Does the company support remote or hybrid work?"
+    extraction:  entity_type='Policy', relation_type='supports', 0.85
+    strategy:    structured   (0.85 clears the confidence threshold)
+    structured:  0 facts      ('Policy' is a real ontology type, but no
+                               Policy entities exist in this graph)
+    vector:      never ran    -- it would have returned the answering
+                               chunk at similarity 0.519
+    answer:      "I'm sorry, I don't have information on ..."
+
+Note what is *not* wrong there: the extraction is defensible and the
+entity type is legitimate. The failure is structural — a confident
+extraction is allowed to switch off the retrieval path that works, and
+the more certain the extractor sounds the more often it happens. So
+the fix belongs here, not in the extractor: whatever the reason a
+structured lookup comes up empty (unknown entity, no instances, missing
+attribute, ambiguity), falling back to semantic search costs one query
+and can only add information.
+
+The fallback deliberately does **not** apply to the hybrid strategy —
+vector search has already run there — nor to a structured lookup that
+did find facts.
+
+`should_fall_back_to_vector` is the single definition of that rule.
+Both entry points call it: `hybrid_retrieve` here, and the conditional
+edge `nodes.make_structured_fallback_edge` that the compiled graph
+actually traverses. They are two doors into the same behaviour, and
+this module exists to keep exactly that kind of logic in one place.
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import Awaitable, Callable, Mapping
+from typing import Awaitable, Callable, Mapping, Sequence
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -99,6 +133,20 @@ def decide_strategy(query: StructuredQuery, *, config: KnowledgeAgentConfig) -> 
     )
 
 
+def should_fall_back_to_vector(strategy: str, structured_facts: Sequence[StructuredFact]) -> bool:
+    """Pure: should an empty structured result be retried semantically?
+
+    True only for the structured-*only* strategy with nothing found. The
+    hybrid strategy has already run vector search concurrently, so falling
+    back there would re-run it; and a lookup that found facts has nothing
+    to fall back from.
+
+    Shared by `hybrid_retrieve` and by the compiled graph's conditional edge
+    so the two cannot drift — see the module docstring.
+    """
+    return strategy == STRATEGY_STRUCTURED and not structured_facts
+
+
 async def hybrid_retrieve(
     query: StructuredQuery,
     rewritten: RewrittenQuery,
@@ -142,8 +190,29 @@ async def _structured_only(
     structured_lookup_fn: StructuredLookupFn,
     vector_search_fn: VectorSearchFn,
 ) -> RankedResult:
-    facts = await structured_lookup_fn(query, session=session)
-    return RankedResult(structured_facts=facts, retrieved_chunks=())
+    """Exact-fact lookup, falling back to semantic search when it finds
+    nothing (P1-6 — see the module docstring)."""
+    try:
+        facts = await structured_lookup_fn(query, session=session)
+    except GRACEFUL_STRUCTURED_MISSES:
+        # "No such entity/attribute" is the commonest way this strategy comes
+        # up empty, and it is exactly the case the fallback exists for. It is
+        # caught rather than propagated so both entry points behave alike:
+        # the graph's structured_lookup node already degrades these to ().
+        facts = ()
+
+    if not should_fall_back_to_vector(STRATEGY_STRUCTURED, facts):
+        return RankedResult(structured_facts=facts, retrieved_chunks=())
+
+    try:
+        chunks = await vector_search_fn(
+            rewritten, config=config, session=session, embed_query=embed_query
+        )
+    except GRACEFUL_VECTOR_MISSES:
+        # Both paths empty: the corpus really has nothing. That is a
+        # legitimate answer, not an error.
+        chunks = ()
+    return RankedResult(structured_facts=facts, retrieved_chunks=chunks)
 
 
 async def _vector_only(

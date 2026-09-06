@@ -100,7 +100,12 @@ from .context_builder import build_context
 from .deduplication import deduplicate
 from .extraction import extract_query
 from .extraction import LLMCompletion as ExtractionLLMCompletion
-from .hybrid import GRACEFUL_STRUCTURED_MISSES, GRACEFUL_VECTOR_MISSES, decide_strategy
+from .hybrid import (
+    GRACEFUL_STRUCTURED_MISSES,
+    GRACEFUL_VECTOR_MISSES,
+    decide_strategy,
+    should_fall_back_to_vector,
+)
 from .llm import LLMCompletion as AnswerLLMCompletion
 from .llm import generate_response
 from .prompt_builder import build_prompt
@@ -114,6 +119,9 @@ from .vector_search import EmbeddingFunction, vector_search
 
 Node = Callable[[KnowledgeAgentState], Awaitable[dict]]
 StrategyEdge = Callable[[KnowledgeAgentState], list[str]]
+# A conditional edge that picks exactly one successor, unlike StrategyEdge's
+# fan-out list.
+SingleEdge = Callable[[KnowledgeAgentState], str]
 
 # next-node-name(s) for each strategy decide_strategy_edge might return;
 # graph.py registers nodes under these exact names (see Module 16).
@@ -122,6 +130,12 @@ _STRATEGY_TO_NODE_NAMES: dict[str, tuple[str, ...]] = {
     "vector": ("vector_search",),
     "hybrid": ("structured_lookup", "vector_search"),
 }
+
+# Targets for the post-structured fallback edge. Named here for the same
+# reason as the table above: graph.py registers nodes under these exact
+# strings, and a typo would be a routing bug rather than an import error.
+_VECTOR_SEARCH_NODE = "vector_search"
+_RANK_NODE = "rank"
 
 
 # ==========================================================================
@@ -175,6 +189,36 @@ def make_decide_strategy_edge(*, config: KnowledgeAgentConfig) -> StrategyEdge:
         return list(_STRATEGY_TO_NODE_NAMES[strategy])
 
     return _decide_strategy_edge
+
+
+def make_structured_fallback_edge(*, config: KnowledgeAgentConfig) -> SingleEdge:
+    """Conditional edge after `structured_lookup`: retry semantically when an
+    exact-fact lookup found nothing (P1-6).
+
+    Without this, a *confident* extraction that names an entity type with no
+    matching rows ended the retrieval phase with zero results, and the
+    customer was told nothing was known about a question the semantic index
+    could answer. Nothing errored — the graph reported success — so the only
+    place the failure was visible was in the answer itself. See
+    `hybrid.should_fall_back_to_vector` for the rule and the worked example.
+
+    The strategy is recomputed rather than read from state because
+    `decide_strategy` is pure and `structured_query` has not changed since the
+    routing decision; LangGraph conditional edges cannot write state, so
+    `KnowledgeAgentState.retrieval_strategy` is not populated to read back.
+
+    Recomputing is also what makes this safe for the hybrid strategy, which
+    reaches this same edge: hybrid returns `"rank"` here because vector search
+    is already running alongside, so the fallback can never double-run it.
+    """
+
+    def _structured_fallback_edge(state: KnowledgeAgentState) -> str:
+        strategy = decide_strategy(state.structured_query, config=config)
+        if should_fall_back_to_vector(strategy, state.structured_facts):
+            return _VECTOR_SEARCH_NODE
+        return _RANK_NODE
+
+    return _structured_fallback_edge
 
 
 # ==========================================================================

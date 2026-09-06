@@ -74,6 +74,7 @@ pnpm-debug.log*
 # Cache
 .eslintcache
 .cache/
+**/.vite/
 
 # Testing
 frontend/coverage/
@@ -85,3 +86,10 @@ frontend/coverage/
 .idea/
 .DS_Store
 Thumbs.db
+
+
+### ---------- Local run artefacts ---------- ###
+
+# Crawler/ingestion scratch output (a crawl writes markdown here); one of
+# these files was committed by accident, which is why it is listed.
+output/

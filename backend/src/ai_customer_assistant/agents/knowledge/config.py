@@ -25,6 +25,7 @@ from .constants import (
     DEFAULT_GROUNDEDNESS_THRESHOLD,
     DEFAULT_MAX_CONTEXT_CHUNKS,
     DEFAULT_MAX_STRUCTURED_FACTS,
+    DEFAULT_RELATIVE_SCORE_MARGIN,
     DEFAULT_SIMILARITY_THRESHOLD,
     DEFAULT_TOP_K,
 )
@@ -47,6 +48,11 @@ class KnowledgeAgentConfig(BaseSettings):
     # -- Vector search -----------------------------------------------------
     top_k: int = DEFAULT_TOP_K
     similarity_threshold: float = DEFAULT_SIMILARITY_THRESHOLD
+    # Relative cutoff applied *after* the absolute floor: a chunk is dropped
+    # when it scores more than this far below the best hit for the same
+    # query. 0.0 disables it. See constants.py for why an absolute floor on
+    # its own is a poor discriminator for normalised BGE similarities.
+    relative_score_margin: float = DEFAULT_RELATIVE_SCORE_MARGIN
     embedding_model_name: str = DEFAULT_EMBEDDING_MODEL_NAME
     embedding_dimension: int = DEFAULT_EMBEDDING_DIMENSION
 
@@ -82,6 +88,7 @@ class KnowledgeAgentConfig(BaseSettings):
 
     @field_validator(
         "similarity_threshold",
+        "relative_score_margin",
         "extraction_confidence_threshold",
         "groundedness_threshold",
     )

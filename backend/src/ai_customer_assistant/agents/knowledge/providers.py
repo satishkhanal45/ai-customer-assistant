@@ -31,14 +31,22 @@ from typing import Callable, Optional, Protocol, TypeAlias
 
 import groq
 
+from timeouts import LLM_CALL_TIMEOUT_S, LLM_RETRY_BUDGET_S
+
 from .config import KnowledgeAgentConfig
 
 # Transient-call budget for the Groq backend: connection blips and 429 rate
 # limits are retried with exponential backoff (honouring Groq's "try again in
 # XmYs" hint when present) before the error is surfaced to the graph.
+#
+# The budget is wall-clock, not a sleep clamp. Clamping each individual sleep
+# to 300s (what this used to do) still let one call sit here for minutes,
+# long after the 45s Knowledge node timeout had already abandoned it — the
+# retries were burning quota for an answer nobody would receive. Now the loop
+# stops as soon as the *next* attempt could not finish inside what is left of
+# LLM_RETRY_BUDGET_S, and surfaces the last error instead.
 _RETRY_ATTEMPTS = 4
 _RETRY_BASE_DELAY = 1.5
-_MAX_COOLDOWN_WAIT = 300.0  # 5 minutes
 
 
 class KnowledgeProvider(Protocol):
@@ -110,7 +118,7 @@ class AnthropicKnowledgeProvider:
         api_key: Optional[str] = None,
         model: str = _DEFAULT_MODEL,
         rewrite_model: str = _DEFAULT_MODEL,
-        timeout: float = 30.0,
+        timeout: float = LLM_CALL_TIMEOUT_S,
         max_tokens: int = 1024,
     ) -> None:
         import anthropic
@@ -162,12 +170,19 @@ class GroqKnowledgeProvider:
 
     _DEFAULT_MODEL = "openai/gpt-oss-120b"
 
+    # Class-level defaults so the retry loop stays correct for an instance
+    # built without __init__ (the test fakes construct via __new__), and so
+    # the ladder in timeouts.py is the single place these are declared.
+    timeout: float = LLM_CALL_TIMEOUT_S
+    retry_budget: float = LLM_RETRY_BUDGET_S
+
     def __init__(
         self,
         api_key: Optional[str] = None,
         model: str = _DEFAULT_MODEL,
         rewrite_model: str = _DEFAULT_MODEL,
-        timeout: float = 15.0,
+        timeout: float = LLM_CALL_TIMEOUT_S,
+        retry_budget: float = LLM_RETRY_BUDGET_S,
     ) -> None:
         resolved_key = api_key or os.environ.get("GROQ_API_KEY")
         if not resolved_key:
@@ -177,6 +192,7 @@ class GroqKnowledgeProvider:
         self.model = model
         self.rewrite_model = rewrite_model
         self.timeout = timeout
+        self.retry_budget = retry_budget
 
     def rewrite_complete(self, prompt: str) -> str:
         return self._complete([{"role": "user", "content": prompt}], model=self.rewrite_model)
@@ -194,6 +210,7 @@ class GroqKnowledgeProvider:
         )
 
     def _complete(self, messages: list[dict], *, model: str) -> str:
+        deadline = time.monotonic() + self.retry_budget
         last_error: Optional[Exception] = None
         for attempt in range(_RETRY_ATTEMPTS):
             try:
@@ -208,15 +225,26 @@ class GroqKnowledgeProvider:
             except Exception as exc:  # noqa: BLE001 - APIError + wrapped connection errors
                 last_error = exc
             if attempt < _RETRY_ATTEMPTS - 1:
-                # Clamp to _MAX_COOLDOWN_WAIT. Groq's "try again in 6m33s"
-                # hint was previously honoured verbatim and unbounded, so a
-                # single rate-limited call could sit here far longer than the
-                # 120s timeout the Supervisor's adapter uses to bound this
-                # agent -- the caller would have given up long before.
                 cooldown = _cooldown_seconds(str(last_error)) or _RETRY_BASE_DELAY
-                time.sleep(min(cooldown * (attempt + 1), _MAX_COOLDOWN_WAIT))
+                if not _sleep_within_budget(cooldown * (attempt + 1), deadline, self.timeout):
+                    break
         assert last_error is not None
         raise last_error
+
+
+def _sleep_within_budget(requested: float, deadline: float, call_timeout: float) -> bool:
+    """Sleep for ``requested`` seconds, but only if a retry still fits.
+
+    Returns False (and sleeps not at all) when the remaining budget cannot
+    hold both this backoff and the attempt it precedes — there is no point
+    waiting for a call the caller will have abandoned before it returns.
+    Otherwise sleeps for at most the remaining budget and returns True.
+    """
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or remaining < requested + call_timeout:
+        return False
+    time.sleep(min(requested, remaining))
+    return True
 
 
 def _cooldown_seconds(message: str) -> float | None:
@@ -260,7 +288,7 @@ class GeminiKnowledgeProvider:
         api_key: Optional[str] = None,
         model: str = _DEFAULT_MODEL,
         rewrite_model: str = _DEFAULT_MODEL,
-        timeout: float = 15.0,
+        timeout: float = LLM_CALL_TIMEOUT_S,
     ) -> None:
         resolved_key = api_key or os.environ.get("GEMINI_API_KEY")
         if not resolved_key:

@@ -3,7 +3,7 @@
 **Repository:** `/mnt/hdd/satish/ai-customer-assistant`
 **Branch analysed:** `features/graph_visualization` (HEAD `ba45956`, with 7 uncommitted files)
 **Report date:** 2026-09-05
-**Last updated:** 2026-09-06 — **P0-1**, **P0-2**, all four **P1** items, and **P2-1** fixed; see the changelog
+**Last updated:** 2026-09-06 — **P0-1**, **P0-2**, the **whole P1 tier** (including the newly-found P1-6) and the **whole P2 tier** fixed; see the changelog
 **Method:** full read of `backend/src` (14.8k LOC), `backend/tests` (4.6k LOC), `frontend/src` (2.8k LOC), migrations, Docker/Make tooling and docs; plus a live run of the test suite.
 
 ---
@@ -18,14 +18,26 @@ This is a **multi-agent RAG customer-support assistant** for Alpinist Studios, b
 |---|---|
 | Architecture & module design | **Strong.** Clean layering, dependency injection everywhere, pure functions separated from I/O, excellent docstrings. |
 | Feature completeness (MVP scope) | **~75%.** Chat, RAG, ingestion, crawling, graph browsing and ticket creation all work. Ticket status lookup and the admin surface do not. |
-| Test suite | **364 passing / 1 failing / 4 erroring / 2 skipped** (371 collected). Everything still non-green needs only a **Playwright browser** — the suite is otherwise deterministic on a clean checkout. |
-| Production readiness | **Low, but the list is shrinking.** Remaining blockers: no authentication, no authorisation, `CORS: *`, debug `print()` of full conversation state, no observability. Secrets are no longer injected by import side effect (P0-2). |
-| Scalability | **Much improved.** All four P1 items are fixed: pgvector-native retrieval, LLM calls off the event loop, one shared connection pool, and ingestion moved out of the web process into a worker service. |
-| Repo hygiene | **Medium.** The duplicated ontology is gone (P2-1). Still open: dead files, an empty README, debug values committed, 20+ stale branches. |
+| Test suite | **443 passing / 1 failing / 4 erroring / 2 skipped** (450 collected). Everything still non-green needs only a **Playwright browser** — the suite is otherwise deterministic on a clean checkout. |
+| Production readiness | **Low, but the list is shrinking.** Remaining blockers: no authentication, no authorisation, `CORS: *`, debug `print()` of full conversation state, no observability. Secrets are no longer injected by import side effect (P0-2), and the client/server timeout ladder no longer inverts (P2-4). |
+| Scalability | **Much improved.** All four P1 items are fixed: pgvector-native retrieval, LLM calls off the event loop, one shared connection pool, and ingestion moved out of the web process into a worker service. Two pieces of per-process state that quietly broke horizontal scaling now live in the database (P2-5). |
+| Repo hygiene | **Good.** The duplicated ontology is gone (P2-1); dead files, the committed AI-assistant note, the crawl artefact and the committed debug values are all gone, and the README is real (P2-6). Only the stale branches are left, deliberately untouched. |
 
-**P0-1, P0-2, the whole P1 tier, and P2-1 are now fixed** — see the changelog. The two remaining P0 items are both security: **P0-3** (no authentication) and **P0-4** (debug `print()` of conversation state). Everything else is the **P2** quality tier.
+**Every P0 except the two security items, and the whole P1 and P2 tiers, are now fixed** — see the changelog. What remains is **P0-3** (no authentication) and **P0-4** (debug `print()` of conversation state). Both are security, both are untouched, and together they are the only thing left in the way of deploying this anywhere real.
 
 ### Changelog
+
+**2026-09-06 — P1-6 structured-only fallback.** A structured-only lookup that finds nothing now retries semantically instead of returning an empty result. The defect was in the *graph topology*, not in any module: every unit test passed while the compiled graph silently never called vector search. Verified against the live database — the query that exposed it now retrieves the answering chunk and carries it into the prompt with citations. Suite 427 → **443 passing**.
+
+**2026-09-06 — P2-2 → P2-6, the whole quality tier.**
+
+- **P2-2 retrieval tuning, measured rather than guessed.** The BGE query instruction is applied to queries only (index-time stays bare, so no re-embedding). A new golden set and `scripts/calibrate_retrieval.py` measure both changes against the live corpus: the instruction moves **recall@1 from 76.9% to 92.3%** and MRR from 0.885 to 0.955. The same measurement showed the shipped `similarity_threshold = 0.70` kept the correct source for only **5 of 26** answerable questions, usually while it sat at rank 1 — so the floor is now **0.50**, and a new **relative score margin** (0.12) does the discriminating: it keeps the correct source for 26/26 while halving the mean result set.
+- **P2-3 partial-commit rollback.** A failed ingestion now rolls back before recording `FAILED`, instead of committing the chunks it had staged.
+- **P2-4 timeout ladder.** One `timeouts.py` declares client 60s > node 45s > completion 25s > call 15s, refuses to start on an inverted ladder, and is enforced by a test that also checks the frontend literal. Fixed along the way: the Supervisor's Groq client stored a `timeout` it never passed to the API, so classification had **no socket deadline at all**.
+- **P2-5 durable state.** Ticket idempotency and crawl-discovery review moved out of per-process dicts into the database (migration `3d6f8b2c17ae`), where a second instance or a restart can see them. Both in-memory structures are now bounded caches rather than the guarantee.
+- **P2-6 hygiene.** `echo`, `store_new.py`, the unregistered `api/chat.py`, the empty `auth/jwt.py` and the committed crawl artefact are deleted; the crawler's committed debug values are restored; the README is a real one.
+
+Suite 364 → **427 passing**. Verified against the live stack; see §2.
 
 **2026-09-06 — P0-2 config loading.** `load_dotenv()` removed from module scope; a single `config.load_env()` is now called by each entry point. This also restored two `skipif` guards that had never worked (they checked for the very variables the import was injecting), so the suite is now deterministic apart from Playwright. Suite 352 → 364 passing, 3 failures → 1.
 
@@ -47,13 +59,32 @@ cd backend && env -u PYTHONPATH ./.venv/bin/python -m pytest -q
 → 10 failed, 268 passed, 6 errors in 170.19s
 ```
 
-**Current, after the P0-1, P0-2, P1 and P2-1 fixes:**
+**Current, after every P0-1, P0-2, P1 and P2 fix:**
 ```
 cd backend && env -u PYTHONPATH ./.venv/bin/python -m pytest -q
-→ 1 failed, 364 passed, 2 skipped, 4 errors in 56.56s
+→ 1 failed, 443 passed, 2 skipped, 4 errors in 54.08s
 ```
 
-Collected: 371 tests. Note the runtime also dropped from ~131s to ~57s: the two opt-in tests that were making real network calls on every run now skip correctly. The 3 remaining failures and 6 errors are unchanged throughout: one is P0-2, the rest need a live Postgres or a Playwright browser.
+Collected: 450 tests. The runtime also dropped from ~131s to ~55s: the two opt-in tests that were making real network calls on every run now skip correctly. **Every remaining failure and error needs only a Playwright browser** (`uv run playwright install --with-deps chromium`); nothing else in the suite is non-deterministic.
+
+### Verified against the live stack
+
+The P1-6 and P2 work was checked against the running Docker stack, not only the test suite:
+
+| Check | Result |
+|---|---|
+| Migration `3d6f8b2c17ae` applied | `crawl_discovery` created with its `expires_at` index; `ticket.idempotency_key` added with `uq_ticket_idempotency_key` |
+| Backend rebuilt and healthy | `GET /health` → `{"status":"ok"}` |
+| Live retrieval config | threshold `0.5`, margin `0.12`, query instruction `'Represent this sentence for searching relevant passages: '` — read out of the running container |
+| A question the old floor rejected | *"What are the payment terms?"* (top score 0.560) → correct answer, cited to `pricing.pdf` |
+| Another | *"How does an engagement begin?"* (0.535) → correct answer, cited to `company_overview.pdf` |
+| The answer-bearing chunk for a third | retrieved at **0.519** — above the new 0.50 floor, impossible under the old 0.70 one |
+| That third question, after P1-6 | *"Does the company support remote or hybrid work?"* → retrieval returns **4 chunks (was 0)**, including the answering one at 0.519, and they reach the prompt with 4 citations |
+| P1-6 regression check | reverting the new graph edge leaves all 14 unit tests passing and fails only the 2 compiled-graph tests — with the customer-visible symptom, *"No relevant documentation was found for this query."* |
+
+**A note on measurement conditions, and a caveat on the last row.** Verification burned through the Groq free-tier budget: first the per-minute limit (the ingestion worker was draining a job backlog against the same quota — stopping it fixed that), and eventually the **daily** 200 000-token limit. The last row above was therefore verified through the real compiled graph against the real database with only the three LLM stages stubbed; the final generation step could not be re-run. Retrieval is what P1-6 changed, and retrieval is what was measured — but that is one step short of a full end-to-end chat turn, and it should be re-run once the quota resets.
+
+Worth knowing generally: **ingestion and chat share one token budget**, so a backlog-draining worker can make the assistant look broken.
 
 **Group A — real regressions.** Seven of the eight were the P0-1 ticket flow and are now **fixed**:
 
@@ -179,16 +210,16 @@ Zero-build vanilla JS (`window.ACA` namespace, classic scripts, hash router), da
 
 | Gap | Evidence |
 |---|---|
-| **Authentication / authorisation** | `auth/jwt.py` is **0 bytes**. Every endpoint is anonymous. |
+| **Authentication / authorisation** | Every endpoint is anonymous. The 0-byte `auth/jwt.py` placeholder was deleted in P2-6 — an empty file was not a plan; P0-3 adds the real module. |
 | **Admin API** | `ingestion/storage/api.py:62-83` — all three dependencies `raise NotImplementedError`; the router is deliberately not registered (`main.py:78-80`). |
 | **Ticket status lookup** | Routed away at classification time with a hardcoded "not available yet" string (`routing.py:_CHECK_STATUS_UNAVAILABLE`). No read path against the `ticket` table. |
 | **Prompt management API** | Frontend edits never reach the server. |
-| **`config.py`** | **0 bytes** — every module reads `os.environ` directly instead. |
-| **README / CHANGELOG** | `README.md` is one line; `CHANGELOG.md` is empty. |
+| **Typed settings** | `config.py` now loads the environment (P0-2), but modules still read `os.environ` directly rather than a typed settings object. `agents/knowledge/config.py` shows the pattern to follow. |
+| **CHANGELOG** | `CHANGELOG.md` is empty. (`README.md` was written in P2-6.) |
 | **CI** | No `.github/`, no lint config, no formatter config, no coverage gate. |
 | ~~**Worker in Docker**~~ | **Done (P1-5)** — a `worker` service now runs `scripts/run_worker.py`; the API only enqueues. |
 | **Observability** | No structured logging, no metrics, no tracing. `trace_id` is generated and threaded but never actually logged anywhere. |
-| **Streaming responses** | `/chat` is request/response only; a 30–60s RAG turn shows a spinner. |
+| **Streaming responses** | `/chat` is request/response only; a long RAG turn shows a spinner. Now a UX gap rather than a correctness one — the budgets no longer contradict each other (P2-4). |
 | **Rate limiting / abuse control** | None, on an endpoint that spends money per call. |
 
 ---
@@ -296,7 +327,7 @@ Suite: **352 → 364 passing**, 3 failed → 1, 6 errors → 4. **Every remainin
 
 ### 🔴 P0-3 — No authentication anywhere
 
-**Location:** `main.py:47-52`, `auth/jwt.py` (empty)
+**Location:** `main.py:47-52` (the `auth/` package was removed in P2-6; this must create it)
 
 ```python
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -307,7 +338,7 @@ Anyone who can reach the port can: run unlimited LLM-billed chat turns, upload a
 `_uploaded_by()` hardcodes the service-account UUID for every ingestion, so there is no attribution either.
 
 **Fix (in order):**
-1. Implement `auth/jwt.py` (issue + verify), add a `get_current_user` dependency.
+1. Create `auth/jwt.py` (issue + verify), add a `get_current_user` dependency.
 2. Split routers: public = `/chat`, `/health`; authenticated = `/ingest/*`, `/graph/*`; admin-only = the future `/admin/*`.
 3. Replace `allow_origins=["*"]` with an env-driven allowlist.
 4. Add an SSRF guard on `/ingest/crawl`: block private/loopback/link-local IP ranges after DNS resolution, and enforce a domain allowlist.
@@ -359,7 +390,7 @@ The gap widens linearly with corpus size — the Python path is `O(n)` transfer 
 
 **Files changed:** `agents/knowledge/vector_search.py`, `alembic/versions/9f1a2b7c4e08_hnsw_index_embedding_chunk.py` (new), `tests/agents/knowledge/test_vector_search.py` (new — 21 tests for a module that previously had **none**, covering the pure scorers, the emitted SQL shape, dialect detection, and a SQLite end-to-end run asserting the join contract excludes non-indexed, inactive and superseded content).
 
-**Still open on retrieval quality:** P2-2 below (the missing BGE query instruction and the uncalibrated 0.70 threshold) is unaffected by this change.
+**Retrieval quality since then:** P2-2 (the missing BGE query instruction and the uncalibrated 0.70 threshold) is now fixed and measured, and **P1-6** — where the router could skip this path entirely — is fixed too. See both entries below.
 
 ---
 
@@ -447,6 +478,61 @@ Five problems in one line: the task reference was dropped so it could be garbage
 
 ---
 
+### ✅ P1-6 — A confident extraction silently disabled semantic search — **FIXED 2026-09-06**
+
+**Was:** `agents/knowledge/graph.py`, `agents/knowledge/hybrid.py`, `agents/knowledge/nodes.py`
+
+Found while verifying P2-2, and worse than the thresholds it was hiding behind.
+
+`decide_strategy` routes to **structured-only** whenever the extractor named an entity type, asked for a specific slot, and *was confident*. When that lookup then found nothing, retrieval ended with zero results — and **there was no fallback to vector search**. Observed live, with everything else working correctly:
+
+```
+query:       "Does the company support remote or hybrid work?"
+extraction:  StructuredQuery(entity_type='Policy', relation_type='supports', confidence=0.85)
+strategy:    structured        (0.85 clears extraction_confidence_threshold 0.55)
+structured:  0 facts
+vector:      never ran
+answer:      "I'm sorry, I don't have information on whether the company
+              supports remote or hybrid work."
+```
+
+Vector search, run directly against the same database, returns the chunk that answers it at **0.519**.
+
+**What was *not* wrong.** This matters for understanding the fix. `Policy` is a legitimate entity type in the shared ontology — the extractor did not hallucinate it, and an ontology-membership check would not have caught this. There simply are no `Policy` entities in this graph. So the defect is structural: **a confident extraction is allowed to switch off the retrieval path that works**, and the more certain the extractor sounds, the more often it fires.
+
+*(This corrects the first write-up of P1-6, which said `'Policy'` "resolves to nothing in the graph" and suggested pairing the fix with an ontology check. The type resolves fine; it has no instances.)*
+
+**The fix.** A structured-only lookup that comes up empty now falls back to vector search — whatever the reason it came up empty (unknown entity, no instances, missing attribute, ambiguity). The fallback costs one query and can only add information.
+
+| Piece | Role |
+|---|---|
+| `hybrid.should_fall_back_to_vector(strategy, facts)` | The single definition of the rule: structured-only **and** nothing found. Both entry points call it, so they cannot drift. |
+| `nodes.make_structured_fallback_edge(config=...)` | The conditional edge the compiled graph traverses: `structured_lookup → vector_search` when the rule holds, `→ rank` otherwise. |
+| `hybrid._structured_only` | The same behaviour for the directly-callable orchestrator, including degrading `EntityNotFoundError` to "found nothing" so both doors behave alike. |
+
+The hybrid strategy reaches the same edge and always routes to `rank`, because its vector search is already running in parallel — so the fallback can never double-run it.
+
+**Why the tests are shaped the way they are.** The bug lived in the *topology*, not in any module: `hybrid_retrieve`, `decide_strategy`, `structured_lookup` and `vector_search` were each individually correct. `tests/agents/knowledge/test_structured_fallback.py` (**new**, 16 tests) therefore drives the **real compiled graph**, not just the helpers. Checked by reverting the edge: the 14 unit tests still passed, and only the two graph tests failed — with exactly the symptom the customer saw, `"No relevant documentation was found for this query."`
+
+**Verified on live data** (the graph and database are real; only the three LLM stages are stubbed, because the Groq daily token quota was exhausted at the time):
+
+```
+strategy:          structured
+structured facts:  0
+retrieved chunks:  4     ← was 0
+   0.534 idx=6                    compnay_vision.pdf
+   0.519 idx=3  ← answers it      compnay_vision.pdf
+   0.501 idx=5                    compnay_vision.pdf
+   0.500 idx=0                    compnay_vision.pdf
+reached the prompt: yes, with 4 citations available
+```
+
+**Files changed:** `agents/knowledge/hybrid.py`, `agents/knowledge/nodes.py`, `agents/knowledge/graph.py`, `tests/agents/knowledge/test_structured_fallback.py` (**new**).
+
+**Small thing left behind.** `KnowledgeAgentState.retrieval_strategy` is declared and documented as "set by the decide_strategy conditional edge" but is never actually populated — LangGraph conditional edges cannot write state. Both edges recompute the (pure, cheap) decision instead. Populating it would need a small `decide_strategy` node and would make the chosen strategy visible in traces; worth doing when observability is added (§7.5).
+
+---
+
 ### ✅ P2-1 — The two ontologies had drifted — **FIXED 2026-09-06**
 
 **Correction to the original report.** The first version of this entry claimed a sweeping divergence, citing `corporation`/`firm`/`startup`/`sector` as present in ingestion and missing from retrieval. **That was wrong** — I had grepped only part of the synonym block; retrieval had them all along. The "463 differing lines" figure was a raw text diff, almost entirely docstrings, comments and ordering.
@@ -496,66 +582,123 @@ That asymmetry is now an explicit `fuzzy: bool` flag on the shared matcher, set 
 
 ---
 
-### 🟡 P2-2 — Retrieval quality is untuned
+### ✅ P2-2 — Retrieval quality was untuned — **FIXED 2026-09-06**
 
-Two concrete items in `agents/knowledge/` and `services/embeddings.py`:
+**Was:** `services/embeddings.py`, `agents/knowledge/constants.py`, `agents/knowledge/vector_search.py`
 
-1. **Missing BGE query instruction.** `SharedEmbeddings.embed_query` (`services/embeddings.py:50-56`) encodes the query with no prefix. BAAI's `bge-*-en-v1.5` models are trained for asymmetric retrieval and document the query-side instruction `"Represent this sentence for searching relevant passages: "`. Index-time passages correctly get no prefix; the query side should get one. Worth A/B testing before adopting — but as written, query and passage embeddings are being produced under a different convention than the model was trained for.
+Two defects that had to be fixed together, because fixing either alone makes the other worse.
 
-2. **Hard absolute similarity cutoff.** `DEFAULT_SIMILARITY_THRESHOLD = 0.70` (`constants.py`) is applied as an absolute floor, and falling below it raises `EmptyRetrievalError`. Normalised BGE cosine scores for *unrelated* text commonly land around 0.6–0.7, so this threshold is simultaneously too permissive (noise passes) and too strict (valid answers are dropped). No evaluation set exists to calibrate it against.
+**1. The query side had no instruction.** `bge-*-en-v1.5` is trained for *asymmetric* retrieval: passages are encoded bare, queries carry a fixed instruction. This project encoded both sides bare, so every query was embedded under a convention the weights were never trained on. Index-time was already correct, which is why the fix needs **no re-embedding** — only the query side changes, and it changes toward what the model expects.
 
-**Fix:** Add the query instruction behind a config flag; build a ~50-question golden set from the ingested Alpinist Studios corpus; measure recall@k and answer groundedness; then set the threshold from data. Consider relative scoring (keep results within X% of the top score) instead of an absolute floor.
+**2. `similarity_threshold = 0.70` was chosen with nothing behind it.** An absolute floor is genuinely hard to pick by intuition here, because normalised BGE similarity is compressed: unrelated English text does not score near zero, it scores in the same 0.6–0.7 band as weakly-relevant text.
 
----
+**What the measurement showed.** `backend/scripts/calibrate_retrieval.py` and a golden set of 26 answerable + 10 unanswerable questions (`backend/tests/data/golden_retrieval.json`), run against the live 27-chunk corpus:
 
-### 🟡 P2-3 — Failed ingestion can commit partial data
+| | recall@1 | recall@8 | MRR |
+|---|---|---|---|
+| Without the query instruction (previous behaviour) | 76.9% | 100% | 0.885 |
+| **With it** | **92.3%** | 100% | **0.955** |
 
-**Location:** `ingestion/pipeline.py:172-259`
+And the floor, with the instruction applied:
 
-`_stage_persist` writes chunks and EAV rows through `session.add`/`flush` without committing. If a later stage fails, the `Err` branch calls `job_repo.mark_version_status(session, ..., FAILED)` — which calls `session.commit()`, **committing the pending partial writes** along with the status change.
-
-Impact is bounded: the retrieval join contract filters on `current_version_id` + `INDEXED`, so these orphan chunks are invisible to search. But they consume storage, distort `chunks_created_count` reporting, and will confuse anyone reading the tables directly.
-
-**Fix:** Wrap the pipeline in an explicit transaction and `await session.rollback()` before writing the `FAILED` status — or write the status through a separate short-lived session.
-
----
-
-### 🟡 P2-4 — Frontend/backend timeout mismatch
-
-`frontend/src/pages/chat.js:298` sends `/chat` with a 60 000 ms timeout. The backend's Knowledge node timeout is `knowledge_timeout_s = 120` (`agents/supervisor/graph.py`), and the Groq provider's own retry ceiling is 300 s.
-
-A turn taking 60–120 s is aborted in the browser while the server completes it and writes the checkpoint. The user sees "Request timed out", the answer is lost, and the next message resumes from a state they never saw.
-
-**Fix:** Make the backend budget strictly smaller than the client budget (e.g. node 45 s, client 60 s), and/or stream the response so the connection stays alive.
-
----
-
-### 🟡 P2-5 — In-memory state defeats horizontal scaling
-
-| State | Location | Consequence |
+| threshold | answerable questions kept | unanswerable leaked |
 |---|---|---|
-| `_discovery_cache` | `api/ingest.py:59` | A `POST /crawl/discover` on instance A cannot be confirmed on instance B → 404 |
-| `TicketStore._by_key` | `store.py:791` | Idempotency guarantee holds per-process only; two instances can double-create |
-| `TicketStore.rows` | `store.py:792` | Unbounded in-memory growth for the process lifetime |
+| 0.50 | **25/26** | 2/10 |
+| 0.55 | 22/26 | 1/10 |
+| 0.60 | 15/26 | 0/10 |
+| **0.70 (what shipped)** | **5/26** | 0/10 |
 
-**Fix:** Move discovery caching to Redis or a `crawl_discovery` table with a TTL column; move ticket idempotency to a unique index on `ticket.idempotency_key` and let the database enforce it.
+**The 0.70 floor was rejecting the correct source for 21 of 26 answerable questions — and in most of those the correct document was already ranked first.** The system had the answer and refused to use it. Note also that the instruction *lowers* absolute scores (median top score 0.681 → 0.637) while improving ranking, so it could not have been adopted without moving the floor.
+
+**What changed:**
+
+| Change | Detail |
+|---|---|
+| Query instruction | `SharedEmbeddings` prepends it to queries only. Resolved per model family — `bge-*-en-v1.5` gets BAAI's documented string, anything else (`bge-m3`, `e5`) gets nothing, because the wrong prefix is worse than none. `EMBEDDING_QUERY_INSTRUCTION` overrides; empty disables. |
+| Threshold | 0.70 → **0.50**, from the table above. It is now a *sanity* floor — it rejects "what is the recipe for sourdough bread" (0.388), not near-misses. |
+| **Relative score margin** (new) | Drops results scoring more than 0.12 below the query's own best hit. This is the signal an absolute cutoff throws away: a chunk at 0.66 is noise when the top hit is 0.83 and relevant when the top hit is 0.71. Swept over the golden set, 0.12 keeps the correct source for **26/26** while cutting the mean result set from 8 chunks to 4.5. |
+| Both ranking paths | The margin is applied identically to the pgvector and Python paths, so they stay equivalent by construction. |
+
+**Why prefer recall.** The two errors are not symmetrical. An irrelevant chunk that gets through still has to survive the answer prompt and the groundedness check. A rejected chunk has no second chance — the turn simply fails and the customer is told nothing is known about a question the corpus answers.
+
+**Files changed:** `services/embeddings.py`, `agents/knowledge/constants.py`, `agents/knowledge/config.py`, `agents/knowledge/vector_search.py`, `scripts/calibrate_retrieval.py` (**new**), `tests/data/golden_retrieval.json` (**new**), `tests/agents/knowledge/test_retrieval_tuning.py` (**new**, 20 tests).
+
+**Honest limits.** The golden set is sized to a 27-chunk corpus. It is enough to place the floor and catch a regression; it is **not** enough to justify fine claims about small differences in recall. Re-run the script after any corpus or model change — the numbers are specific to both.
 
 ---
 
-### 🟡 P2-6 — Repository hygiene
+### ✅ P2-3 — Failed ingestion could commit partial data — **FIXED 2026-09-06**
 
-| Item | Detail |
+**Was:** `ingestion/pipeline.py`
+
+`_stage_persist` wrote chunks and EAV rows with `add`/`flush` and no commit. On failure the `Err` branch called `mark_version_status(..., FAILED)` — which *does* commit — carrying the partial writes into the database alongside the failure.
+
+**Fix:** `await session.rollback()` before recording `FAILED`. Safe because every row the handler still needs (job, source, version) was committed before the pipeline started, so the status update simply re-reads in a fresh transaction.
+
+`tests/ingestion/test_partial_commit_rollback.py` (**new**, 3 tests) asserts the *ordering* — `flush → rollback → commit` — because a rollback after the commit would be a no-op on already-durable rows.
+
+---
+
+### ✅ P2-4 — Frontend/backend timeout mismatch — **FIXED 2026-09-06**
+
+**Was:** `frontend/src/pages/chat.js`, `agents/supervisor/graph.py`, `agents/knowledge/providers.py`, `agents/supervisor/llm_client.py`
+
+The browser gave up after 60s, the Knowledge node was allowed 120, and a rate-limited Groq call could sleep up to 300. A 60–120s turn was abandoned in the browser while the server finished it and checkpointed it: the customer saw "Request timed out" and their next message resumed from a state they had never seen. Nothing logged an error, because every layer behaved exactly as configured.
+
+**Fix:** one `backend/src/ai_customer_assistant/timeouts.py` declaring the ladder, each rung strictly inside the one waiting on it:
+
+```
+client 60s  >  knowledge node 45s  >  one LLM completion 25s  >  one HTTP call 15s
+```
+
+It raises at import on an inverted ladder — a misconfiguration here produces no runtime error, so a loud failure at boot is the only cheap moment to notice it.
+
+**Two related defects fixed alongside:**
+
+- **The Supervisor's Groq client stored a `timeout` it never passed to the API call.** Classification had no socket deadline whatsoever; a stalled connection held the chat turn open indefinitely.
+- **The Groq retry budget is now wall-clock, not a per-sleep clamp.** Clamping each sleep at 300s still allowed several clamped sleeps in a row. The loop now stops as soon as the next attempt could not finish within what is left.
+
+`tests/test_timeout_ladder.py` (**new**, 11 tests) covers the ordering, the boot-time refusal, the retry budget, the classify deadline, and — by reading `chat.js` — that the frontend literal still agrees.
+
+---
+
+### ✅ P2-5 — In-memory state defeated horizontal scaling — **FIXED 2026-09-06**
+
+**Was:** `api/ingest.py`, `agents/ticket_agent/store.py`
+
+Both problems had the same shape: a documented guarantee that was only ever true inside one process.
+
+| State | What actually happened | Now |
+|---|---|---|
+| `_discovery_cache` | Discovery and confirmation are two HTTP requests with a human review between them. With two instances the confirm was roughly a coin flip, and its 404 said *"unknown or expired discovery_id"* — blaming a TTL that had not elapsed. A restart did the same. | `crawl_discovery` table with `expires_at`; expired rows swept on lookup. The `CrawlConfig` is stored with the result, so `confirm` cannot be made to crawl under wider settings than discovery ran with. |
+| `TicketStore._by_key` | Two instances each held their own empty dict, so a retried request booked a **second ticket and sent a second confirmation email**. So did one instance restarted between the request and its retry. | `ticket.idempotency_key` + `uq_ticket_idempotency_key`. The insert catches the conflict, reads back the row that won, and returns it — **without notifying**, so the loser of the race sends no second email. |
+| `TicketStore.rows` | Grew without bound for the process lifetime. | Bounded deque; an observability window, never the source of truth. |
+| `next_sequence` | Counted the in-memory map, so a restarted process restarted the ordinal at zero and reissued a key an earlier ticket already held — the customer's *new* ticket would be deduplicated against their previous one and they would see the wrong confirmation. | Counted in the database, with `autoescape` so a `thread_id` containing `%` or `_` is not read as a LIKE wildcard. |
+
+Migration `3d6f8b2c17ae` is additive: nothing dropped, no row changed, exact downgrade. `_idempotency_key` became a coroutine to await the database-backed ordinal, and still accepts a synchronous `next_sequence` so hand-rolled test fakes keep working.
+
+**A latent bug surfaced by the tests.** `Ticket.ticket_id` is a `str` while the column is `UUID`. psycopg happens to accept the string, so Postgres never complained — but SQLAlchemy's portable `Uuid` type calls `.hex` on it, so the same insert failed on any other dialect. The store now coerces explicitly rather than leaving a driver coincidence load-bearing.
+
+**Files changed:** `db/models.py`, `agents/ticket_agent/store.py`, `agents/supervisor/agents_wiring.py`, `api/ingest.py`, `alembic/versions/3d6f8b2c17ae_durable_state_for_scale_out.py` (**new**), `tests/agents/ticket_agent/test_durable_idempotency.py` (**new**, 16 tests), `tests/api/test_crawl_discovery_persistence.py` (**new**, 13 tests).
+
+---
+
+### ✅ P2-6 — Repository hygiene — **FIXED 2026-09-06**
+
+| Item | Action |
 |---|---|
-| `echo` (repo root) | **Tracked in git.** Contains a stray AI-assistant summary: *"Task complete. The ticket agent now has: 1. Database persistence…"*. Should be deleted. |
-| `backend/store_new.py` | 190-line near-duplicate of `agents/ticket_agent/store.py`. Dead. Delete. |
-| `api/chat.py` | An entire unused router (`ChatRequest`/`ChatResponse`/`answer()`), never registered — `main.py:77` explains it collides with the real `/chat`. Delete. |
-| `config.py`, `auth/jwt.py` | 0 bytes. Either implement or remove. |
-| `output/docs.md` | Tracked 8-line crawl artefact from `example.com`. Should be gitignored. |
-| `frontend/app/.vite/deps_temp_*` | Stray Vite temp directory in a project with no build step. |
-| **Debug values committed to `CrawlConfig`** | `request_timeout: 520.0` (was 15.0) and `max_pages: 5` (was 50) — uncommitted working-tree edits that look like debugging leftovers, not intentional configuration. |
-| `README.md` | One line: `# AI Customer Assistant`. No setup instructions exist anywhere except scattered docstrings. |
-| Branches | 13 local + 24 remote branches, many long-merged. |
-| `.pytest_cache` | Present at repo root (gitignored, but noise). |
+| `echo` (repo root) | Deleted. Contained a stray AI-assistant summary: *"Task complete. The ticket agent now has…"*. |
+| `backend/store_new.py` | Deleted — a 190-line dead near-duplicate of the real store. |
+| `api/chat.py` | Deleted — an entire unused router, never registered; the explanatory note in `main.py` went with it. |
+| `auth/jwt.py` | Deleted. It was 0 bytes; an empty file is not a plan. **P0-3 will add a real module.** |
+| `output/docs.md` | Deleted and `output/` gitignored — a tracked crawl artefact from `example.com`. |
+| `frontend/app/.vite/deps_temp_*` | Deleted and `**/.vite/` gitignored. |
+| **Committed debug values** | `CrawlConfig.request_timeout` 520.0 → **15.0** and `max_pages` 5 → **50**, the values from before commit `02b41a5`. A 520-second per-request timeout stalls a crawl for nearly nine minutes on one unresponsive page; `max_pages=5` silently truncated every site crawl to five pages. |
+| `README.md` | Rewritten. **The report was wrong about this one**: it was not the one-line `# AI Customer Assistant`, it contained a single stray absolute path. It is now real setup documentation — requirements, first run, the two-`.env` split, every make target, ingestion, tests, layout, and an explicit "there is no authentication" warning. |
+| `.pytest_cache` | Removed from disk (already gitignored). |
+| Branches | **Deliberately not touched.** 13 local + 24 remote branches remain. Deleting branches is irreversible and is the user's call, not a hygiene sweep's. |
+
+`config.py` is no longer 0 bytes — P0-2 gave it `load_env()`.
 
 ---
 
@@ -566,7 +709,8 @@ A turn taking 60–120 s is aborted in the browser while the server completes it
 2. ~~Remove import-time `load_dotenv()` (P0-2).~~ **Done 2026-09-06**
 3. Implement JWT auth + CORS allowlist + SSRF guard on the crawler (P0-3).
 4. Replace `print()` node logging with redacted structured logging (P0-4).
-5. Mark DB/Playwright tests with `@pytest.mark.integration` and add a `-m "not integration"` default so the unit suite is green on a clean checkout.
+5. ~~Fall back to vector search when a structured-only lookup returns nothing (P1-6).~~ **Done 2026-09-06**
+6. Mark DB/Playwright tests with `@pytest.mark.integration` and add a `-m "not integration"` default so the unit suite is green on a clean checkout.
 
 ### 7.2 Performance & scale
 6. ~~pgvector `<=>` + HNSW index (P1-1).~~ **Done 2026-09-05** — see the P1-1 entry.
@@ -578,40 +722,42 @@ A turn taking 60–120 s is aborted in the browser while the server completes it
 
 ### 7.3 Quality
 12. ~~Unify the ontologies with a drift test (P2-1).~~ **Done 2026-09-06**
-13. Build a golden Q&A evaluation set; calibrate `similarity_threshold` and `top_k` against it (P2-2).
+13. ~~Build a golden Q&A evaluation set; calibrate `similarity_threshold` against it (P2-2).~~ **Done 2026-09-06** — 26+10 questions, `scripts/calibrate_retrieval.py`; threshold 0.70 → 0.50, relative margin added. Grow the set as the corpus grows.
 14. Add a re-ranking stage (cross-encoder) — currently ranking is a weighted score with no second pass.
-15. Wrap ingestion in a proper transaction boundary (P2-3).
+14b. Populate `KnowledgeAgentState.retrieval_strategy`. It is declared and documented but never set, because LangGraph conditional edges cannot write state; both routing edges recompute the decision instead. A small `decide_strategy` node would fix it and make the chosen strategy visible in traces — pair it with §7.5's observability work.
+15. ~~Wrap ingestion in a proper transaction boundary (P2-3).~~ **Done 2026-09-06**
 16. Add `ruff` + `mypy` and a GitHub Actions workflow: lint → type-check → unit tests → coverage gate.
 
 ### 7.4 Features
 17. **Ticket status lookup** — the `ticket` table exists and the `CHECK_TICKET_STATUS` intent is already classified; only the read path is missing. Cheapest remaining MVP feature.
 18. **Admin API** — implement the three `NotImplementedError` dependencies in `ingestion/storage/api.py`, add `/admin/sources|jobs|stats|tickets`, and register the router. The frontend page is already written and waiting.
 19. **Prompt management endpoint** so the Prompt page's edits persist server-side and are versioned.
-20. **Streaming `/chat`** via SSE — eliminates the timeout mismatch and transforms perceived latency.
+20. **Streaming `/chat`** via SSE — transforms perceived latency. (The timeout *mismatch* is fixed by P2-4; streaming is now a UX win rather than a correctness one.)
 21. **Ticket lifecycle** — `updated_at`, `resolved_at`, assignee, a `thread_id` FK linking a ticket back to its conversation, and inbound email replies.
 
 ### 7.5 Operations
 22. Structured JSON logging that actually emits the `trace_id` already threaded through every node.
 23. Prometheus metrics: chat latency by stage, retrieval hit rate, LLM token spend, job queue depth.
 24. `/health` should check Postgres, MinIO and Tika — it currently returns `{"status": "ok"}` unconditionally.
-25. A stale-job reaper (see P1-5).
+25. ~~A stale-job reaper.~~ **Done 2026-09-05** with P1-5.
 26. Move secrets to a secret manager; `backend/.env` currently holds a live `GROQ_API_KEY` and SMTP password in plaintext on disk (correctly gitignored, but not protected).
-27. Write the README: prerequisites, `make up`, migrations, `playwright install chromium`, the `env -u PYTHONPATH` test invocation, and the architecture diagram.
+27. ~~Write the README.~~ **Done 2026-09-06** with P2-6 — requirements, first run, the two-`.env` split, make targets, ingestion, tests and layout. An architecture diagram is still missing.
 
 ---
 
 ## 8. Quick wins (under an hour each, high value)
 
 - [x] ~~Add the missing `f` to the email subject~~ — **done** (P0-1)
-- [ ] `git rm echo backend/store_new.py backend/src/ai_customer_assistant/api/chat.py`
-- [ ] Delete the `?` splitting block — `chat_service.py:138-194`
-- [ ] Guard `_log_node` behind `if os.environ.get("DEBUG_GRAPH")` — `graph.py:56`
-- [ ] `allow_origins` from an env var — `main.py:49`
-- [ ] Revert `CrawlConfig.request_timeout` to 15.0 and `max_pages` to 50
-- [ ] Add `output/`, `frontend/app/` to `.gitignore`
+- [x] ~~`git rm echo backend/store_new.py backend/src/ai_customer_assistant/api/chat.py`~~ — **done** (P2-6)
+- [x] ~~Delete the `?` splitting block~~ — **done** (P1-3)
+- [ ] Guard `_log_node` behind `if os.environ.get("DEBUG_GRAPH")` — `graph.py:56` (P0-4)
+- [ ] `allow_origins` from an env var — `main.py:49` (P0-3)
+- [x] ~~Revert `CrawlConfig.request_timeout` to 15.0 and `max_pages` to 50~~ — **done** (P2-6)
+- [x] ~~Add `output/`, `frontend/app/.vite/` to `.gitignore`~~ — **done** (P2-6)
 - [x] ~~Use `self._session_factory` in `TicketStore.create_ticket`~~ — **done** (P0-1)
 - [ ] Make `/health` check the database
-- [ ] Write a real README
+- [x] ~~Write a real README~~ — **done** (P2-6)
+- [ ] Log the swallowed exception in `classify_and_route` — `node.py:79` catches every failure and returns the safe fallback **without logging anything**, which is why a Groq 429 during verification looked like an unexplained "something went wrong". One `logger.warning(..., exc_info=True)`.
 
 ---
 
@@ -628,7 +774,7 @@ env -u PYTHONPATH ./.venv/bin/python -m pytest -q
 make up                      # postgres + minio + tika + backend
 make worker                  # ingestion worker (separate terminal)
 make ingest URL=... SITE=N   # crawl + ingest a URL
-make chat                    # open http://127.0.0.1:8002/#/chat
+make chat                    # open the chat UI (port from APP_PORT in ./.env)
 make verify                  # list knowledge sources
 ```
 
@@ -642,7 +788,15 @@ POSTGRES_HOST=localhost POSTGRES_PORT=5433 \
 
 **Codebase size:** backend `src` 14 809 lines · tests 4 628 lines · frontend 2 773 lines.
 
-**Largest modules:** `ingestion/extraction/ontology.py` (762) · `agents/knowledge/ontology.py` (738) · `frontend/src/pages/graph.js` (930) · `frontend/src/pages/ingest.js` (509) · `agents/knowledge/structured_lookup.py` (455) · `api/ingest.py` (432).
+**Largest modules:** `frontend/src/pages/graph.js` (930) · `ontology/vocabulary.py` (596) · `frontend/src/pages/ingest.js` (509) · `agents/knowledge/structured_lookup.py` (455) · `api/ingest.py` (~470).
+
+**Re-run the retrieval calibration** after changing the corpus, the embedding model or the thresholds:
+```bash
+cd backend
+set -a && . ./.env && set +a
+POSTGRES_HOST=localhost POSTGRES_PORT=5433 \
+  env -u PYTHONPATH ./.venv/bin/python scripts/calibrate_retrieval.py --detail
+```
 
 ---
 
@@ -650,6 +804,10 @@ POSTGRES_HOST=localhost POSTGRES_PORT=5433 \
 
 The engineering *discipline* in this codebase is unusually good: consistent dependency injection, pure functions isolated from I/O, immutable data types, dispatch tables in place of conditional chains, and docstrings that explain *why* rather than *what*. Whoever wrote the Knowledge Agent and the ingestion pipeline knew what they were doing.
 
-What is missing is the last mile. The system was built module-by-module against a plan document, and the seams show where the modules meet: the ticket flow half-migrated to async and broke (now repaired), the two ontologies forked and drifted, four database engines accumulated, and every cross-cutting concern that no single module owns — auth, logging, config, CI, the README — is simply absent.
+What is missing is the last mile. The system was built module-by-module against a plan document, and the seams show where the modules meet: the ticket flow half-migrated to async and broke, the two ontologies forked and drifted, four database engines accumulated, the timeout budgets contradicted each other across the client/server boundary, state that had to be shared was left in per-process dictionaries, and the retrieval graph had a branch with no way out. All of those are now fixed. What is still absent is the set of concerns no single module owns: **auth, logging and CI**.
 
-**With P0 + P1 addressed (roughly 2–3 focused weeks), this becomes a genuinely deployable internal product.**
+A pattern worth naming, because it recurs and it is the hardest kind of defect to notice: **most of the bugs found here failed silently rather than loudly.** A threshold rejected four-fifths of answerable questions. An idempotency guarantee held only inside one process. A timeout abandoned requests the server went on to complete. A classifier swallowed every exception and returned a friendly apology. A retrieval branch skipped the only search that would have worked. In each case every component behaved exactly as written, so nothing errored and no log line appeared — the damage was only visible in the relationship *between* components, or by measuring the output against what it should have been.
+
+P1-6 is the sharpest illustration, and the reason it is worth changing how this codebase is tested. Every module involved was individually correct and individually well tested; the defect was one missing edge in the graph that connects them. Unit tests could not have found it, and did not. The fixes that catch this class of bug are the ones that assert across boundaries: the golden set that measures retrieval end to end, the ladder assertion in `timeouts.py`, the ontology drift tests, and the compiled-graph tests added with P1-6.
+
+**With the two P0 security items addressed (roughly one focused week), this becomes a genuinely deployable internal product.**

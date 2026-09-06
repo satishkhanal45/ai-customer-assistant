@@ -8,6 +8,8 @@ from typing import Callable, Optional, Protocol
 import groq
 from groq import Groq
 
+from timeouts import LLM_CALL_TIMEOUT_S
+
 from .schema import ConversationTurn
 
 
@@ -86,7 +88,7 @@ class GeminiSupervisorLLMClient:
         self,
         api_key: Optional[str] = None,
         model: str = "gemini-2.0-flash",
-        timeout: float = 15.0,
+        timeout: float = LLM_CALL_TIMEOUT_S,
     ) -> None:
         resolved_key = api_key or os.environ.get("GEMINI_API_KEY")
         if not resolved_key:
@@ -151,7 +153,7 @@ class GroqSupervisorLLMClient:
         self,
         api_key: Optional[str] = None,
         model: str = "openai/gpt-oss-120b",
-        timeout: float = 15.0,
+        timeout: float = LLM_CALL_TIMEOUT_S,
     ) -> None:
         resolved_key = api_key or os.environ.get("GROQ_API_KEY")
         if not resolved_key:
@@ -186,18 +188,27 @@ class GroqSupervisorLLMClient:
             },
         ]
 
+        # `timeout=self.timeout` was stored but never passed to the API call,
+        # so classification had no socket deadline at all: a stalled connection
+        # held the chat turn open indefinitely while the browser gave up at 60s.
+        # See timeouts.py for the ladder this belongs to.
         last_error: Optional[groq.APIError] = None
-        for attempt in range(3):
+        attempts = 3
+        for attempt in range(attempts):
             try:
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
                     temperature=0,
+                    timeout=self.timeout,
                     response_format={"type": "json_object"},
                 )
                 return response.choices[0].message.content or "{}"
             except groq.APIError as exc:
                 last_error = exc
+            # No sleep after the final attempt — it delayed the error by a
+            # second and a half without buying another try.
+            if attempt < attempts - 1:
                 time.sleep(0.5 * (attempt + 1))
 
         raise last_error

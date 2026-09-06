@@ -69,7 +69,10 @@ class TestPersistence:
 
         (statement,) = factory.statements
         values = statement.compile().params
-        assert values["ticket_id"] == ticket.ticket_id
+        # Bound as a real UUID, not the domain type's string form: psycopg
+        # accepts the string but SQLAlchemy's portable Uuid type does not,
+        # so the coercion is what keeps this insert dialect-independent.
+        assert str(values["ticket_id"]) == ticket.ticket_id
         assert values["email"] == "a@example.com"
         assert values["query"] == "I was double charged"
         assert values["reason"] == "billing issue"

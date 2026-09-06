@@ -4,10 +4,24 @@ Idempotent ticket persistence boundary for the Supervisor adapter.
 ``create_ticket`` itself is pure and immutable (see ticket_agent.py) — it
 cannot dedupe because it has no memory. Deduplication lives here instead, in
 the one place the adapter hands a created ``Ticket`` to something stateful.
-A ``TicketStore`` records every ``(idempotency_key -> Ticket)`` it has
-produced; a retried create with the same key returns the previously created
-``Ticket`` instead of booking a second one, so the caller renders the
+A retried create with the same ``idempotency_key`` returns the previously
+created ``Ticket`` instead of booking a second one, so the caller renders the
 *existing* ticket's confirmation rather than a fresh row.
+
+**The database is the authority for that guarantee, not this object** (P2-5).
+Deduplication used to live only in a Python dict on one ``TicketStore``
+instance, which made the promise per-process: two API instances behind a load
+balancer each held their own empty dict, so a retried request booked a second
+ticket and sent the customer a second confirmation email. Restarting a single
+instance between the original and the retry did the same thing. The
+``uq_ticket_idempotency_key`` unique constraint (migration ``3d6f8b2c17ae``)
+now enforces it where every instance can see it; the in-process map is kept
+only as a bounded cache that saves a round trip on the common case.
+
+The same reasoning applies to ``next_sequence``: the per-thread ordinal that
+forms the server-derived key is counted in the ``ticket`` table, because a
+count from a fresh process would restart at zero and silently dedupe a
+genuinely new ticket against an old one.
 
 Collaborators are injected, never constructed here — the same convention the
 rest of this codebase follows, and the reason a bare ``TicketStore()`` is
@@ -37,10 +51,13 @@ import asyncio
 import logging
 import os
 import smtplib
+import uuid
+from collections import OrderedDict, deque
 from email.message import EmailMessage
 from typing import Callable, Optional
 
-from sqlalchemy import insert
+from sqlalchemy import func, insert, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agents.ticket_agent.ticket_agent import call as _call
@@ -49,10 +66,31 @@ from agents.ticket_agent.types import PendingTicket, Ticket
 
 logger = logging.getLogger(__name__)
 
+# Caps on the two in-process structures. Both used to grow without bound for
+# the lifetime of the process: a long-running API instance accumulated every
+# ticket it had ever created, in full, forever. Neither is load-bearing any
+# more -- the database enforces idempotency -- so they can be small.
+_KEY_CACHE_MAX = 512
+_ROWS_MAX = 512
+
 # What ``TicketStore`` calls after a ticket is booked. Sync by design: it is
 # blocking SMTP I/O, and the store runs it off the event loop via
 # ``asyncio.to_thread``.
 EmailNotifier = Callable[[Ticket], None]
+
+
+def _as_uuid(ticket_id: str) -> uuid.UUID:
+    """Coerce the domain ticket id to a real ``UUID`` for the database.
+
+    ``Ticket.ticket_id`` is a ``str`` (``str(uuid.uuid4())``) while
+    ``ticket.ticket_id`` is a ``UUID`` column. psycopg happens to accept the
+    string form, so Postgres never complained — but SQLAlchemy's portable
+    ``Uuid`` implementation calls ``.hex`` on the bound value, so the same
+    insert failed on any other dialect. Converting here keeps the domain type
+    a plain string (nothing else wants a UUID object) without leaving a
+    driver-specific coincidence load-bearing.
+    """
+    return ticket_id if isinstance(ticket_id, uuid.UUID) else uuid.UUID(str(ticket_id))
 
 
 def _get_smtp_config() -> dict[str, str | int | None]:
@@ -154,20 +192,24 @@ class TicketStore:
 
     ``create_ticket(pending, email, idempotency_key)``:
 
-    - With an ``idempotency_key`` already seen: returns the previously
-      created ``Ticket`` — no second row, no second email, no state change.
-    - Otherwise: builds a fresh ``Ticket``, records it in memory keyed by
-      ``idempotency_key`` when supplied, appends to ``rows`` so tests can
-      count created rows, inserts into the ``ticket`` table when a
-      ``session_factory`` was injected, and notifies the customer when an
-      ``send_email`` notifier was injected.
+    - With an ``idempotency_key`` this process has already seen: returns the
+      cached ``Ticket`` immediately — no round trip, no second email.
+    - With a key *another* process has already used: the insert loses the
+      race against ``uq_ticket_idempotency_key``, and the row that won is
+      read back and returned. Still no second row and no second email — this
+      is the case the in-memory map could not cover.
+    - Otherwise: books the ticket, remembers it, and notifies the customer.
 
-    ``next_sequence(scope)`` returns the count of tickets already recorded
-    under an idempotency-key scope prefix (e.g. a ``thread_id``) — the
-    server-derived part of the idempotency key (§2.3).
+    ``next_sequence(scope)`` returns how many tickets already exist under an
+    idempotency-key scope prefix (e.g. a ``thread_id``) — the server-derived
+    part of the idempotency key (§2.3). It is a coroutine because that count
+    comes from the database; a hand-rolled sync fake is still accepted by the
+    adapter (see ``agents_wiring._idempotency_key``).
 
-    ``rows`` is the observable "table" the adapter's persistence step and
-    the tests assert against.
+    ``rows`` is the observable "table" the adapter's persistence step and the
+    tests assert against. It is bounded: it is an observability window, never
+    the source of truth, and an unbounded one leaked memory for the lifetime
+    of the process.
     """
 
     def __init__(
@@ -175,8 +217,10 @@ class TicketStore:
         session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
         send_email: Optional[EmailNotifier] = None,
     ) -> None:
-        self._by_key: dict[str, Ticket] = {}
-        self.rows: list[Ticket] = []
+        # A bounded LRU, not the guarantee. Evicting an entry costs one extra
+        # database round trip on a retry, never a duplicate ticket.
+        self._by_key: OrderedDict[str, Ticket] = OrderedDict()
+        self.rows: deque[Ticket] = deque(maxlen=_ROWS_MAX)
         self._session_factory = session_factory
         self._send_email = send_email
 
@@ -185,10 +229,30 @@ class TicketStore:
         ``ticket_ops`` for the Supervisor adapter."""
         return _call(query, reason)
 
-    def next_sequence(self, scope: str) -> int:
+    async def next_sequence(self, scope: str) -> int:
         """Number of tickets already created under an idempotency-key
-        ``scope`` prefix (for server-derived keys like ``thread_id``)."""
-        return sum(1 for key in self._by_key if key.startswith(f"{scope}:"))
+        ``scope`` prefix (for server-derived keys like ``thread_id``).
+
+        Counted in the database rather than in memory. A fresh process
+        counting its own empty map would restart the ordinal at zero and
+        hand back a key an earlier ticket in the same thread already used —
+        so the customer's genuinely new ticket would be deduplicated against
+        their previous one and they would be shown the wrong confirmation.
+        """
+        if self._session_factory is None:
+            return sum(1 for key in self._by_key if key.startswith(f"{scope}:"))
+
+        from db.models import Ticket as _DbTicket
+
+        async with self._session_factory() as session:
+            count = await session.scalar(
+                select(func.count())
+                .select_from(_DbTicket)
+                # autoescape, because a thread_id containing % or _ would
+                # otherwise be read as LIKE wildcards and count the wrong rows.
+                .where(_DbTicket.idempotency_key.startswith(f"{scope}:", autoescape=True))
+            )
+        return int(count or 0)
 
     async def create_ticket(
         self,
@@ -196,42 +260,108 @@ class TicketStore:
         email: str,
         idempotency_key: str | None = None,
     ) -> Ticket:
-        if idempotency_key is not None and idempotency_key in self._by_key:
-            return self._by_key[idempotency_key]
+        if idempotency_key is not None:
+            cached = self._by_key.get(idempotency_key)
+            if cached is not None:
+                self._by_key.move_to_end(idempotency_key)
+                return cached
 
         ticket = _build_ticket(pending, email)
-        self.rows.append(ticket)
-        if idempotency_key is not None:
-            self._by_key[idempotency_key] = ticket
+        stored, is_new = await self._persist(ticket, idempotency_key)
+        self._remember(idempotency_key, stored, is_new=is_new)
+        if is_new:
+            # Only the writer notifies. Whoever lost the race must not send a
+            # second confirmation email for a ticket that already exists.
+            await self._notify(stored)
+        return stored
 
-        await self._persist(ticket)
-        await self._notify(ticket)
-        return ticket
+    def _remember(self, idempotency_key: str | None, ticket: Ticket, *, is_new: bool) -> None:
+        if is_new:
+            self.rows.append(ticket)
+        if idempotency_key is None:
+            return
+        self._by_key[idempotency_key] = ticket
+        self._by_key.move_to_end(idempotency_key)
+        while len(self._by_key) > _KEY_CACHE_MAX:
+            self._by_key.popitem(last=False)
 
-    async def _persist(self, ticket: Ticket) -> None:
+    async def _persist(
+        self, ticket: Ticket, idempotency_key: str | None
+    ) -> tuple[Ticket, bool]:
         """Insert the ticket through the *injected* session factory.
 
-        Uses ``self._session_factory`` rather than reaching for the module-level
-        factory in ``db.async_session``, so a caller (or a test) that injects a
-        factory actually gets the one it passed in.
+        Returns ``(ticket, is_new)``. ``is_new`` is False when a row with this
+        idempotency key already existed, in which case the returned ``Ticket``
+        is rebuilt from *that* row — the one the customer was already told
+        about — rather than the one this call constructed.
+
+        Uses ``self._session_factory`` rather than reaching for the
+        module-level factory in ``db.async_session``, so a caller (or a test)
+        that injects a factory actually gets the one it passed in.
+
+        The conflict is caught rather than expressed as ``ON CONFLICT``: the
+        insert then stays dialect-neutral, so this path behaves identically on
+        the SQLite session the tests use and on Postgres in production. The
+        constraint does the work either way.
         """
         if self._session_factory is None:
-            return
+            return ticket, True
 
         from db.models import Ticket as _DbTicket
 
         async with self._session_factory() as session:
-            await session.execute(
-                insert(_DbTicket).values(
-                    ticket_id=ticket.ticket_id,
-                    email=ticket.email,
-                    query=ticket.query,
-                    reason=ticket.reason,
-                    priority=ticket.priority,
-                    status=ticket.status,
+            try:
+                await session.execute(
+                    insert(_DbTicket).values(
+                        ticket_id=_as_uuid(ticket.ticket_id),
+                        email=ticket.email,
+                        query=ticket.query,
+                        reason=ticket.reason,
+                        idempotency_key=idempotency_key,
+                        priority=ticket.priority,
+                        status=ticket.status,
+                    )
                 )
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                existing = await self._load_by_key(session, idempotency_key)
+                if existing is None:
+                    # The conflict was on something other than the idempotency
+                    # key (a duplicate ticket_id, say). Nothing to hand back,
+                    # and swallowing it would hide a real defect.
+                    raise
+                logger.info(
+                    "ticket for idempotency_key %s already existed; returning it",
+                    idempotency_key,
+                )
+                return existing, False
+
+        return ticket, True
+
+    @staticmethod
+    async def _load_by_key(session: AsyncSession, idempotency_key: str | None) -> Ticket | None:
+        """Rebuild the domain ``Ticket`` for an existing idempotency key."""
+        if idempotency_key is None:
+            return None
+
+        from db.models import Ticket as _DbTicket
+
+        row = (
+            await session.execute(
+                select(_DbTicket).where(_DbTicket.idempotency_key == idempotency_key)
             )
-            await session.commit()
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        return Ticket(
+            ticket_id=str(row.ticket_id),
+            email=row.email,
+            query=row.query,
+            reason=row.reason,
+            priority=row.priority,
+            status=row.status,
+        )
 
     async def _notify(self, ticket: Ticket) -> None:
         """Run the blocking SMTP send on a worker thread.

@@ -17,10 +17,13 @@ the Supervisor graph.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from typing import Any, Callable, Mapping, Optional
 
 from langgraph.config import get_config
 from langgraph.types import interrupt
+
+from timeouts import KNOWLEDGE_NODE_TIMEOUT_S
 
 from ..contracts import ConversationTurn
 from .routing import _SAFE_FALLBACK_RESPONSE
@@ -31,7 +34,7 @@ KnowledgeGraph = Callable[[Mapping[str, Any]], Any]
 
 def make_knowledge_agent_node(
     knowledge_graph: KnowledgeGraph,
-    timeout_s: float = 120,
+    timeout_s: float = KNOWLEDGE_NODE_TIMEOUT_S,
 ) -> Callable[[SupervisorState], Any]:
     """Build the Knowledge Agent adapter node.
 
@@ -131,7 +134,7 @@ def _error_result(reason: str) -> dict:
 TicketOps = Callable[[], Any]
 
 
-def _idempotency_key(
+async def _idempotency_key(
     configurable: Mapping[str, Any],
     store: Optional[Any] = None,
 ) -> str:
@@ -148,6 +151,12 @@ def _idempotency_key(
 
     The key is NOT a ticket id — it identifies the *request* a Ticket row is
     being created for, which is exactly what ``TicketStore`` de-dupes on.
+
+    A coroutine because the real store now counts the ordinal in the database
+    (P2-5): counting it in process memory restarted at zero after a restart
+    and reissued a key an earlier ticket in the same thread already held.
+    Sync ``next_sequence`` implementations are still accepted so hand-rolled
+    test fakes keep working.
     """
     request_id = configurable.get("request_id") or configurable.get(
         "idempotency_key"
@@ -158,7 +167,10 @@ def _idempotency_key(
     thread_id = configurable.get("thread_id", "unknown-thread")
     next_sequence = getattr(store, "next_sequence", None)
     if callable(next_sequence):
-        return f"{thread_id}:{next_sequence(thread_id)}"
+        sequence = next_sequence(thread_id)
+        if inspect.isawaitable(sequence):
+            sequence = await sequence
+        return f"{thread_id}:{sequence}"
     return thread_id
 
 
@@ -221,7 +233,7 @@ def make_ticket_agent_node(
 
         # Step 3 — book the ticket.
         configurable = (get_config() or {}).get("configurable", {})
-        key = _idempotency_key(configurable, ticket_ops)
+        key = await _idempotency_key(configurable, ticket_ops)
         ticket = await ticket_ops.create_ticket(
             pending, _resume_text(email, key="email"), idempotency_key=key
         )

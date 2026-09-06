@@ -3,6 +3,17 @@
   'use strict';
 
   var LS_KEY = 'aca.chat.threads.v1';
+
+  // How long we wait for POST /chat before giving up. This is the OUTERMOST
+  // rung of the server's timeout ladder and must stay strictly larger than
+  // every server-side budget (backend/src/ai_customer_assistant/timeouts.py:
+  // KNOWLEDGE_NODE_TIMEOUT_S = 45s). When it was smaller than the backend's
+  // 120s Knowledge budget, a slow turn was abandoned here while the server
+  // finished the answer and checkpointed it — the user saw "Request timed
+  // out" and the next message resumed from a state they were never shown.
+  // backend/tests/test_timeout_ladder.py asserts this literal still agrees
+  // with CLIENT_REQUEST_TIMEOUT_S.
+  var CHAT_REQUEST_TIMEOUT_MS = 60000;
   var threads = [];
   var activeId = null;
   var pendingRetry = null;   // { threadId, message } when the last send failed
@@ -295,7 +306,7 @@
 
   function send(threadId, message) {
     setBusy(true);
-    NS.api.post('/chat', { thread_id: threadId, message: message }, { timeout: 60000 }).then(function (res) {
+    NS.api.post('/chat', { thread_id: threadId, message: message }, { timeout: CHAT_REQUEST_TIMEOUT_MS }).then(function (res) {
       var t = ensureThread(threadId);
       t.messages.push({ role: 'assistant', content: res.reply || '', traceId: res.trace_id, citations: res.citations || [] });
       t.updatedAt = Date.now();
