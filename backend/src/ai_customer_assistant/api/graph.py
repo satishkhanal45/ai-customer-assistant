@@ -7,26 +7,21 @@ in queries.py instead.
 
 All GET, all read-only -- no auth/mutation concerns to design around yet.
 
-ASSUMPTION (unconfirmed -- I haven't seen your actual FastAPI app or how
-it currently obtains a per-request AsyncSession): `get_session` below
-builds its own engine/sessionmaker independently, the same stopgap
-pattern used in scripts/run_worker.py and crawl_and_ingest.py. If your
-app already has a shared session dependency (e.g. in api/deps.py or
-similar), delete get_session here and import that one instead -- having
-two independently-constructed engines in the same process is wasteful and
-possibly wrong if they end up with different pool settings.
+Sessions come from `db.engine`, the single shared engine for the process.
+This module previously built its own engine and sessionmaker at import
+time, which is exactly the "two independently-constructed engines in the
+same process" the note here used to warn about.
 """
 
 from __future__ import annotations
 
-from typing import AsyncGenerator
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.session import database_url
+from db.engine import get_session
 from ingestion.graph.queries import (
     EntityDetail,
     EntityRef,
@@ -41,20 +36,6 @@ from ingestion.graph.queries import (
 )
 
 router = APIRouter(prefix="/graph", tags=["graph"])
-
-def _async_database_url() -> str:
-    sync_url = database_url()
-    return sync_url.replace("postgresql+psycopg://", "postgresql+psycopg_async://")
-
-# See module docstring's ASSUMPTION note -- swap this block for your app's
-# real session dependency if one already exists.
-_engine = create_async_engine(_async_database_url())
-_session_factory = async_sessionmaker(bind=_engine, expire_on_commit=False)
-
-
-async def get_session() -> AsyncGenerator[AsyncSession, None]:
-    async with _session_factory() as session:
-        yield session
 
 
 # ---------------------------------------------------------------------------

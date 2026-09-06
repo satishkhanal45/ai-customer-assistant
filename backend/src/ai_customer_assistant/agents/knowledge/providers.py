@@ -208,8 +208,13 @@ class GroqKnowledgeProvider:
             except Exception as exc:  # noqa: BLE001 - APIError + wrapped connection errors
                 last_error = exc
             if attempt < _RETRY_ATTEMPTS - 1:
-                cooldown = _cooldown_seconds(str(last_error))
-                time.sleep((cooldown or _RETRY_BASE_DELAY) * (attempt + 1))
+                # Clamp to _MAX_COOLDOWN_WAIT. Groq's "try again in 6m33s"
+                # hint was previously honoured verbatim and unbounded, so a
+                # single rate-limited call could sit here far longer than the
+                # 120s timeout the Supervisor's adapter uses to bound this
+                # agent -- the caller would have given up long before.
+                cooldown = _cooldown_seconds(str(last_error)) or _RETRY_BASE_DELAY
+                time.sleep(min(cooldown * (attempt + 1), _MAX_COOLDOWN_WAIT))
         assert last_error is not None
         raise last_error
 

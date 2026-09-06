@@ -49,6 +49,26 @@ and in Postgres alike). A session-per-call factory sidesteps this
 entirely while still letting the two branches run genuinely in
 parallel.
 
+Blocking work inside async nodes: the three LLM nodes (`rewrite`,
+`extract`, `llm`) call injected provider callables that are synchronous
+and blocking -- the Groq SDK and `requests` under the hood, including
+`time.sleep` backoff on a 429. Those calls are wrapped in
+`asyncio.to_thread`.
+
+This matters precisely because these nodes are `async def`. LangGraph
+runs a *sync* node function in a thread executor, so blocking inside one
+is harmless; an *async* node runs directly on the event loop, so blocking
+inside one freezes the whole process -- every other user's request, the
+health check, and any concurrently running ingestion job -- for the full
+duration of the call. Three sequential LLM calls per Knowledge turn made
+that a multi-second freeze on every question, and minutes long whenever
+Groq rate-limited. `ingestion/pipeline.py` already used `to_thread` for
+exactly this reason; these nodes now match it.
+
+The pure stage functions stay synchronous and unchanged: the concurrency
+concern belongs at the graph boundary, not inside `rewriting.py` or
+`llm.py`, which remain trivially testable without an event loop.
+
 Graceful-miss handling at the node level: `structured_lookup_node` and
 `vector_search_node` both catch their respective "expected miss"
 exceptions (`hybrid.GRACEFUL_STRUCTURED_MISSES` /
@@ -70,6 +90,7 @@ to handle as a real error.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Awaitable, Callable
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -110,7 +131,13 @@ _STRATEGY_TO_NODE_NAMES: dict[str, tuple[str, ...]] = {
 
 def make_rewrite_node(*, config: KnowledgeAgentConfig, llm_complete: RewriteLLMCompletion) -> Node:
     async def _rewrite_node(state: KnowledgeAgentState) -> KnowledgeAgentState:
-        rewritten = rewrite_query(state.raw_query, state.conversation_history, config=config, llm_complete=llm_complete)
+        # to_thread: `llm_complete` is a blocking provider call (Groq SDK /
+        # requests). This node is `async def`, so LangGraph runs it directly
+        # on the event loop -- calling it inline would freeze every other
+        # request in the process for the duration. See the module docstring.
+        rewritten = await asyncio.to_thread(
+            rewrite_query, state.raw_query, state.conversation_history, config=config, llm_complete=llm_complete
+        )
         return {"rewritten_query": rewritten}
 
     return _rewrite_node
@@ -123,7 +150,9 @@ def make_rewrite_node(*, config: KnowledgeAgentConfig, llm_complete: RewriteLLMC
 
 def make_extract_node(*, config: KnowledgeAgentConfig, llm_complete: ExtractionLLMCompletion) -> Node:
     async def _extract_node(state: KnowledgeAgentState) -> KnowledgeAgentState:
-        structured_query = extract_query(state.rewritten_query, config=config, llm_complete=llm_complete)
+        structured_query = await asyncio.to_thread(
+            extract_query, state.rewritten_query, config=config, llm_complete=llm_complete
+        )
         return {"structured_query": structured_query}
 
     return _extract_node
@@ -250,7 +279,9 @@ def make_build_prompt_node(*, config: KnowledgeAgentConfig) -> Node:
 
 def make_llm_node(*, llm_complete: AnswerLLMCompletion) -> Node:
     async def _llm_node(state: KnowledgeAgentState) -> KnowledgeAgentState:
-        response = generate_response(state.prompt, context=state.context, llm_complete=llm_complete)
+        response = await asyncio.to_thread(
+            generate_response, state.prompt, context=state.context, llm_complete=llm_complete
+        )
         return {"response": response}
 
     return _llm_node

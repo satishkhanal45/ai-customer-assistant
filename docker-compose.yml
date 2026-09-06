@@ -72,6 +72,9 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    # Named so the worker can reuse this exact image instead of building a
+    # second, byte-identical copy of the same 3 GB context.
+    image: ai-customer-assistant:local
     container_name: ai-customer-assistant-backend
     restart: unless-stopped
     env_file:
@@ -93,6 +96,43 @@ services:
     volumes:
       - ./backend/alembic/versions:/app/alembic/versions
       - ./frontend:/app/frontend
+
+  # Ingestion runs here, not in the API process. The API only enqueues a job
+  # row; this consumer claims it and runs the pipeline (Tika, the embedding
+  # model, LLM entity extraction). Keeping the heavy work out of the web
+  # process is why /ingest/* returns 202 instead of doing the work inline.
+  #
+  # Deliberately not scaled past one replica by default: claim_next_job takes
+  # a FOR UPDATE SKIP LOCKED row lock and guards one job per source, so extra
+  # replicas are safe, but each one loads its own copy of the 400 MB
+  # embedding model.
+  worker:
+    # Same image as the backend - same code, different entrypoint. Reusing it
+    # avoids a duplicate build and guarantees the API and the worker can never
+    # drift onto different versions of the pipeline.
+    image: ai-customer-assistant:local
+    container_name: ai-customer-assistant-worker
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    environment:
+      POSTGRES_HOST: postgres
+      MINIO_ENDPOINT: minio:9000
+      TIKA_BASE_URL: http://tika:9998
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      tika:
+        condition: service_healthy
+      # Migrations run in the backend's entrypoint; wait for it so the worker
+      # never queries a table that does not exist yet.
+      backend:
+        condition: service_started
+    # Bypasses the backend entrypoint's migrate-and-serve path: the worker
+    # neither migrates nor serves HTTP.
+    entrypoint: ["python", "scripts/run_worker.py"]
 
 volumes:
   postgres_data:

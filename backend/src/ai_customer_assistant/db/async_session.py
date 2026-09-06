@@ -1,38 +1,49 @@
-"""Shared async SQLAlchemy engine/session for read paths (chat, ingest).
+"""Backwards-compatible shim over ``db.engine``.
 
-Mirrors the one-off pattern used in ``api/graph.py`` so every API module
-doesn't build its own engine. Graph/graph.py keeps its own instance to
-avoid disturbing the working viewer path.
+This module used to construct its own engine and session factory at import
+time. It no longer does: ``db/engine.py`` owns the single engine for the
+process (see its docstring for why four independent pools was a problem).
+
+Everything here is a thin re-export so existing imports keep working:
+
+    from db.async_session import get_session, session_factory
+
+Prefer importing from ``db.engine`` directly in new code.
 """
 
 from __future__ import annotations
 
-from typing import AsyncGenerator
 
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.session import database_url
-
-
-def async_database_url() -> str:
-    return database_url().replace("postgresql+psycopg://", "postgresql+psycopg_async://")
+from db.engine import async_database_url, get_session, get_session_factory
 
 
-_engine = create_async_engine(async_database_url())
-session_factory = async_sessionmaker(bind=_engine, expire_on_commit=False)
+class _LazySessionFactory:
+    """Callable that resolves the shared factory on first use.
 
-
-async def get_session() -> AsyncGenerator[AsyncSession, None]:
-    """FastAPI dependency yielding a request-scoped AsyncSession.
-
-    Commits on success so pipeline work (chunks, entities, version
-    status) isn't silently rolled back at request end. If the request
-    raises, the session context manager rolls back on close.
+    ``session_factory`` was previously a module-level ``async_sessionmaker``
+    built at import time, and callers use it as ``async with
+    session_factory() as session``. Keeping that exact call shape while
+    deferring construction means importing this module no longer opens a
+    connection pool as a side effect — which matters because importing it
+    used to be enough to create an engine even in tests that never touch a
+    database.
     """
-    async with session_factory() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
+
+    def __call__(self) -> AsyncSession:
+        return get_session_factory()()
+
+    def __getattr__(self, name: str):
+        # Delegate anything else (e.g. `.kw`, `.begin`) to the real factory.
+        return getattr(get_session_factory(), name)
+
+
+session_factory = _LazySessionFactory()
+
+__all__ = [
+    "async_database_url",
+    "get_session",
+    "get_session_factory",
+    "session_factory",
+]

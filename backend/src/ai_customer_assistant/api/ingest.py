@@ -1,9 +1,22 @@
 """HTTP ingestion endpoints.
 
-Both paths reuse the exact orchestration the CLI worker uses
-(``scripts/crawl_and_ingest.py``): register a document version (checksum
-dedup, MinIO storage, queue row) then run ``run_ingestion`` immediately so
-the result is indexable without a separate worker process.
+Every path here **enqueues only**. Registering a document (checksum dedup,
+MinIO storage, queue row) is fast and happens inline; the actual ingestion
+-- Tika extraction, the 400 MB embedding model, LLM entity extraction -- is
+picked up by the worker process (``scripts/run_worker.py``, run as the
+``worker`` service in docker-compose).
+
+These endpoints used to `asyncio.create_task(_run_job(...))` and run the
+pipeline inside the web process. That was wrong in four separate ways: the
+task reference was dropped so it could be garbage-collected mid-run, there
+was no concurrency limit so N uploads meant N concurrent pipelines, the
+heavy model ran inside the request worker, and a restart orphaned in-flight
+jobs as permanently RUNNING rows that blocked the source forever. It also
+duplicated the worker's execution path, so the same job could be run twice.
+
+Callers get ``202 Accepted`` with a ``job_id`` and poll
+``GET /ingest/jobs/{job_id}`` for the outcome -- which the frontend already
+did, because the work was always effectively asynchronous anyway.
 
   POST /ingest/upload            multipart file (PDF / DOCX / Markdown)
   POST /ingest/crawl             JSON {"url", "scope"} — single page by
@@ -21,7 +34,6 @@ Uploaded-by defaults to the system service account
 
 from __future__ import annotations
 
-import asyncio
 import os
 import time
 import uuid
@@ -34,10 +46,10 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.async_session import get_session, session_factory
+from db.engine import get_session
 from ingestion.crawler.config import CrawlConfig, CrawlMode
 from ingestion.crawler.models import DiscoveryResult
-from ingestion.pipeline_types import FileType, JobType, JobRef, JobStatus
+from ingestion.pipeline_types import FileType
 from ingestion.queue.document_producer import register_document_version
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
@@ -117,48 +129,7 @@ def _resolve_file_type(content_type: str) -> FileType | None:
     return _CRAWL_DOC_MIME_TO_FILE_TYPE.get(base)
 
 
-async def _run_job(job_id: UUID) -> None:
-    """Execute a queued ingestion job synchronously (mirrors the CLI worker)."""
-    from db.models import KnowledgeInjectionJob
-    from ingestion.pipeline import run_ingestion
-    from ingestion.queue import repository as job_repo
-
-    async with session_factory() as session:
-        row = await session.get(KnowledgeInjectionJob, job_id)
-        if row is None:
-            return
-        job = JobRef(
-            job_id=row.job_id,
-            source_id=row.source_id,
-            version_id=row.version_id,
-            job_type=JobType(row.job_type),
-            status=JobStatus(row.status),
-            triggered_by=row.triggered_by,
-        )
-        try:
-            outcome = await run_ingestion(session, job)
-        except Exception as exc:  # noqa: BLE001
-            await job_repo.complete_job(
-                session,
-                job_id=job.job_id,
-                status=JobStatus.FAILED,
-                chunks_created_count=0,
-                entities_created_count=0,
-                error_details=f"unhandled_exception: {exc}",
-            )
-        else:
-            await job_repo.complete_job(
-                session,
-                job_id=outcome.job_id,
-                status=outcome.status,
-                chunks_created_count=outcome.chunks_created_count,
-                entities_created_count=outcome.entities_created_count,
-                error_details=outcome.error_details,
-            )
-        await session.commit()
-
-
-async def _register_and_run(
+async def _register_and_enqueue(
     session: AsyncSession,
     *,
     url: str,
@@ -178,7 +149,6 @@ async def _register_and_run(
     )
     if job is None:
         return {"status": "duplicate_skipped"}
-    asyncio.create_task(_run_job(job.job_id))
     return {
         "status": "submitted",
         "job_id": str(job.job_id),
@@ -203,7 +173,7 @@ async def job_status(job_id: UUID, session: AsyncSession = Depends(get_session))
     }
 
 
-@router.post("/upload")
+@router.post("/upload", status_code=202)
 async def upload(
     file: UploadFile,
     category_id: UUID | None = None,
@@ -220,7 +190,7 @@ async def upload(
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="Empty file.")
-    return await _register_and_run(
+    return await _register_and_enqueue(
         session,
         url=f"manual_upload://{name}",
         raw_bytes=data,
@@ -322,7 +292,7 @@ async def _ingest_documents(
         if doc.error is not None:
             outcomes.append({"url": doc.url, "status": "failed", "error": doc.error})
             continue
-        outcome = await _register_and_run(
+        outcome = await _register_and_enqueue(
             session,
             url=doc.url,
             raw_bytes=doc.content if doc.file_type else doc.markdown.encode("utf-8"),
@@ -361,7 +331,7 @@ async def _crawl_single_page(req: CrawlRequest, session: AsyncSession) -> dict:
             markdown = extract_markdown(html, final_url)
         except ExtractionError as exc:
             raise HTTPException(status_code=502, detail=f"Crawl failed: {exc}") from exc
-        return await _register_and_run(
+        return await _register_and_enqueue(
             session,
             url=final_url,
             raw_bytes=markdown.encode("utf-8"),
@@ -387,7 +357,7 @@ async def _crawl_single_page(req: CrawlRequest, session: AsyncSession) -> dict:
     return await _ingest_documents(session, documents, req.category_id)
 
 
-@router.post("/crawl")
+@router.post("/crawl", status_code=202)
 async def crawl(
     req: CrawlRequest,
     session: AsyncSession = Depends(get_session),
@@ -415,7 +385,7 @@ async def crawl_discover(
     return _review_payload(discovery_id, result)
 
 
-@router.post("/crawl/{discovery_id}/confirm")
+@router.post("/crawl/{discovery_id}/confirm", status_code=202)
 async def crawl_confirm(
     discovery_id: str,
     req: ConfirmRequest,

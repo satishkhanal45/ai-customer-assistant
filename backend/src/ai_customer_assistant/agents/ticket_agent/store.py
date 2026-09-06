@@ -22,6 +22,13 @@ database I/O (``AsyncSession``). The Supervisor's ticket adapter node is
 therefore async too, which means the compiled Supervisor graph must be
 driven with ``ainvoke`` — already true in production, since the Knowledge
 Agent's adapter node is async for the same reason.
+
+SMTP settings are read from ``os.environ`` when a mail is actually sent. This
+module does **not** load ``backend/.env`` — it used to call ``load_dotenv()``
+at import scope, which mutated the whole process's environment as a side
+effect of importing a ticket module and made unrelated code (the Knowledge
+provider resolver) behave differently depending on import order. Loading
+configuration belongs to the entry point; see ``config.load_env``.
 """
 
 from __future__ import annotations
@@ -33,19 +40,12 @@ import smtplib
 from email.message import EmailMessage
 from typing import Callable, Optional
 
-from dotenv import load_dotenv
 from sqlalchemy import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agents.ticket_agent.ticket_agent import call as _call
 from agents.ticket_agent.ticket_agent import create_ticket as _build_ticket
 from agents.ticket_agent.types import PendingTicket, Ticket
-
-# Load environment variables from .env file.
-# NOTE: this import-time side effect is a known defect (see status.md, P0-2)
-# and is left in place deliberately — removing it is a separate change that
-# has to move .env loading to the process entry points first.
-load_dotenv()
 
 logger = logging.getLogger(__name__)
 

@@ -41,6 +41,10 @@ class WorkerDeps:
     session_factory: async_sessionmaker
     settings: PGQueueSettings
     handlers: dict[JobType, JobHandler] | None = None
+    # A job still RUNNING after this long belongs to a worker that died.
+    # Must exceed the longest legitimate job or a healthy worker's job gets
+    # requeued underneath it. 30 minutes is generous for a single document.
+    stale_job_seconds: float = 1800.0
 
     def resolved_handlers(self) -> dict[JobType, JobHandler]:
         return self.handlers or _HANDLERS
@@ -87,12 +91,29 @@ async def poll_once(deps: WorkerDeps) -> JobOutcome | None:
         return await _record_outcome(session, outcome)
 
 
+async def reap_stale_jobs(deps: WorkerDeps) -> int:
+    """Requeue jobs abandoned by a previous worker. Returns the count.
+
+    Runs once at startup. Without it a worker killed mid-job leaves a row
+    RUNNING forever, and `claim_next_job`'s one-job-per-source guard then
+    blocks that source's ingestion permanently.
+    """
+    async with deps.session_factory() as session:
+        requeued = await repository.reset_stale_running_jobs(
+            session, older_than_seconds=deps.stale_job_seconds
+        )
+    if requeued:
+        logger.warning("requeued %d job(s) abandoned by a previous worker", requeued)
+    return requeued
+
+
 async def run_worker(deps: WorkerDeps, *, max_iterations: int | None = None) -> None:
     """
     The long-running consumer entry point (see scripts/run_worker.py).
     `max_iterations` exists purely so tests can bound the loop; production
     callers leave it None and run until the process is stopped.
     """
+    await reap_stale_jobs(deps)
     iterations = 0
     while max_iterations is None or iterations < max_iterations:
         outcome = await poll_once(deps)

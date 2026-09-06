@@ -28,33 +28,10 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from config import load_env
 from db.session import database_url  # read-only import, not modified
 from ingestion.queue.config import PGQueueSettings
 from ingestion.queue.worker import WorkerDeps, run_worker
-
-
-def _load_dotenv_if_available() -> None:
-    """Running this script directly means backend/.env is never sourced
-    automatically -- see the matching function in crawl_and_ingest.py."""
-    import os
-    from pathlib import Path
-
-    env_path = Path(__file__).resolve().parents[1] / ".env"
-    if not env_path.exists():
-        return
-    try:
-        from dotenv import load_dotenv
-
-        load_dotenv(env_path)
-        return
-    except ImportError:
-        pass
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        os.environ.setdefault(key.strip(), value.strip())
 
 
 def _async_database_url() -> str:
@@ -82,7 +59,7 @@ def _silence_noisy_loggers() -> None:
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     _silence_noisy_loggers()  # ADDED
-    _load_dotenv_if_available()
+    load_env()
 
     engine = create_async_engine(_async_database_url())
     session_factory = async_sessionmaker(bind=engine, expire_on_commit=False)

@@ -128,70 +128,16 @@ class ChatService:
         dict with ``source_name`` / ``page`` / ``version_number`` /
         ``category_name``), empty when the turn produced no retrieval.
 
-        If the message contains multiple ``?``-delimited questions, each is
-        processed sequentially and replies are concatenated with ``\n``."""
+        The message is always sent to the graph **whole**. An earlier version
+        split it on ``?`` and ran the graph once per fragment, which shredded
+        any message that merely contained a question mark: ``"Can you help?
+        Thanks!"`` became two billed graph runs, a URL with a query string
+        was cut in half, and ``"Really?!"`` was split. Compound questions are
+        the LLM's job — that is what the prompts are for — not ``str.split``.
+        """
         config = {"configurable": {"thread_id": thread_id}}
         if trace_id:
             config["configurable"]["trace_id"] = trace_id
-
-        # Split multi‑question messages by "?" and process each part
-        parts = [p.strip() for p in user_message.split("?") if p.strip()]
-        if len(parts) > 1:
-            combined_replies: list[str] = []
-            all_citations: list[dict] = []
-            had_interrupt = False
-            for part in parts:
-                snapshot = await self.graph.aget_state(config)
-                history = list(snapshot.values.get("conversation_history") or [])
-                pending = snapshot.next or any(
-                    getattr(task, "interrupts", ()) for task in snapshot.tasks
-                )
-
-                if pending:
-                    result = await self.graph.ainvoke(
-                        Command(resume=part), config=config
-                    )
-                else:
-                    result = await self.graph.ainvoke(
-                        {
-                            "user_message": part,
-                            "conversation_history": history,
-                        },
-                        config=config,
-                    )
-
-                if "__interrupt__" in result:
-                    reply = self._render_interrupt(result["__interrupt__"])
-                    citations = []
-                    had_interrupt = True
-                else:
-                    reply = result.get("final_response") or result.get(
-                        "clarification_question"
-                    ) or ""
-                    citations = _citations_from_result(result)
-
-                combined_replies.append(reply)
-                all_citations.extend(citations)
-
-                if not had_interrupt:
-                    user_turn = ConversationTurn(role="user", content=part)
-                    assistant_turn = ConversationTurn(
-                        role="assistant", content=reply
-                    )
-                    await self.graph.aupdate_state(
-                        config,
-                        {
-                            "conversation_history": [
-                                *history,
-                                user_turn,
-                                assistant_turn,
-                            ]
-                        },
-                    )
-
-            reply = "\n".join(combined_replies)
-            citations = all_citations
-            return reply, citations
 
         snapshot = await self.graph.aget_state(config)
         history = list(snapshot.values.get("conversation_history") or [])

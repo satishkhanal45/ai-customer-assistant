@@ -3,7 +3,7 @@
 **Repository:** `/mnt/hdd/satish/ai-customer-assistant`
 **Branch analysed:** `features/graph_visualization` (HEAD `ba45956`, with 7 uncommitted files)
 **Report date:** 2026-09-05
-**Last updated:** 2026-09-05 — **P0-1 (ticket flow)** and **P1-1 (pgvector retrieval)** fixed; see the changelog
+**Last updated:** 2026-09-06 — **P0-1**, **P0-2**, all four **P1** items, and **P2-1** fixed; see the changelog
 **Method:** full read of `backend/src` (14.8k LOC), `backend/tests` (4.6k LOC), `frontend/src` (2.8k LOC), migrations, Docker/Make tooling and docs; plus a live run of the test suite.
 
 ---
@@ -18,14 +18,20 @@ This is a **multi-agent RAG customer-support assistant** for Alpinist Studios, b
 |---|---|
 | Architecture & module design | **Strong.** Clean layering, dependency injection everywhere, pure functions separated from I/O, excellent docstrings. |
 | Feature completeness (MVP scope) | **~75%.** Chat, RAG, ingestion, crawling, graph browsing and ticket creation all work. Ticket status lookup and the admin surface do not. |
-| Test suite | **307 passing / 3 failing / 6 erroring** (316 collected). Of what remains, 1 failure is P0-2 and the other 8 need a live Postgres or a Playwright browser. |
-| Production readiness | **Low.** No authentication, no authorisation, `CORS: *`, secrets read ad hoc, debug `print()` of full conversation state, no observability. |
-| Scalability | **Improving.** Vector search now ranks inside pgvector (P1-1 fixed). Still open: blocking LLM calls on the event loop, and ingestion running inside the API process. |
-| Repo hygiene | **Medium.** Dead files, duplicated modules, an empty README, debug values committed, 20+ stale branches. |
+| Test suite | **364 passing / 1 failing / 4 erroring / 2 skipped** (371 collected). Everything still non-green needs only a **Playwright browser** — the suite is otherwise deterministic on a clean checkout. |
+| Production readiness | **Low, but the list is shrinking.** Remaining blockers: no authentication, no authorisation, `CORS: *`, debug `print()` of full conversation state, no observability. Secrets are no longer injected by import side effect (P0-2). |
+| Scalability | **Much improved.** All four P1 items are fixed: pgvector-native retrieval, LLM calls off the event loop, one shared connection pool, and ingestion moved out of the web process into a worker service. |
+| Repo hygiene | **Medium.** The duplicated ontology is gone (P2-1). Still open: dead files, an empty README, debug values committed, 20+ stale branches. |
 
-The **ticket flow (P0-1)** and **pgvector-native retrieval (P1-1)** are now fixed — see the changelog. The next most important items are **P0-2 (import-time `load_dotenv()`)**, **P0-3 (no authentication)**, **P0-4 (debug `print()` of conversation state)**, and then **P1-2 (blocking LLM calls on the event loop)**.
+**P0-1, P0-2, the whole P1 tier, and P2-1 are now fixed** — see the changelog. The two remaining P0 items are both security: **P0-3** (no authentication) and **P0-4** (debug `print()` of conversation state). Everything else is the **P2** quality tier.
 
 ### Changelog
+
+**2026-09-06 — P0-2 config loading.** `load_dotenv()` removed from module scope; a single `config.load_env()` is now called by each entry point. This also restored two `skipif` guards that had never worked (they checked for the very variables the import was injecting), so the suite is now deterministic apart from Playwright. Suite 352 → 364 passing, 3 failures → 1.
+
+**2026-09-06 — P2-1 shared ontology.** The two forked ~750-line vocabularies replaced by one shared `ontology` package both pipelines import; three real divergences resolved. The deliberate fuzzy-vs-exact policy difference between reading and writing is preserved and now test-enforced. Ontology code 1500 → 1183 lines. Suite 321 → 352 passing. **Note:** this entry also corrects the original report, which overstated the drift.
+
+**2026-09-05 — P1-2 / P1-3 / P1-4 / P1-5.** LLM calls moved off the event loop (`asyncio.to_thread`); the `?`-splitting in `chat_service` deleted; four database engines consolidated into one pooled engine (`db/engine.py`); ingestion moved out of the API into a `worker` compose service, with a stale-job reaper. Suite 307 → 321 passing.
 
 **2026-09-05 — P1-1 pgvector retrieval.** Ranking pushed into the database with `ORDER BY embedding <=> :q LIMIT :top_k`; embeddings no longer cross the wire. HNSW index added (migration `9f1a2b7c4e08`). Both paths verified identical on live data. 21 tests added to a module that previously had none. Suite 286 → 307 passing.
 
@@ -41,13 +47,13 @@ cd backend && env -u PYTHONPATH ./.venv/bin/python -m pytest -q
 → 10 failed, 268 passed, 6 errors in 170.19s
 ```
 
-**Current, after the ticket-flow and pgvector fixes:**
+**Current, after the P0-1, P0-2, P1 and P2-1 fixes:**
 ```
 cd backend && env -u PYTHONPATH ./.venv/bin/python -m pytest -q
-→ 3 failed, 307 passed, 6 errors in 135.12s
+→ 1 failed, 364 passed, 2 skipped, 4 errors in 56.56s
 ```
 
-Collected: 316 tests — `tests/agents` 134, `tests/chunk_embed` 97, `tests/ingestion` 63, `tests/services` 16, `tests/api` 6, `tests/db` 4.
+Collected: 371 tests. Note the runtime also dropped from ~131s to ~57s: the two opt-in tests that were making real network calls on every run now skip correctly. The 3 remaining failures and 6 errors are unchanged throughout: one is P0-2, the rest need a live Postgres or a Playwright browser.
 
 **Group A — real regressions.** Seven of the eight were the P0-1 ticket flow and are now **fixed**:
 
@@ -62,16 +68,27 @@ Collected: 316 tests — `tests/agents` 134, `tests/chunk_embed` 97, `tests/inge
 | `test_idempotency.py::test_server_derived_uses_thread_and_sequence` | `assert 't:0' == 't:1'` | ✅ fixed |
 | `test_providers.py::test_config_default_anthropic_without_key_falls_back_to_stub` | got `GroqKnowledgeProvider`, expected stub | ❌ **still failing — this is P0-2**, not a ticket-flow defect |
 
-**Group B — environment-dependent, no skip markers (should be marked, not "fixed"):**
+**Group B — environment-dependent.** This list was six entries; **P0-2 reduced it to one cause.**
 
-| Test | Cause |
+| Test | Status |
 |---|---|
-| `tests/db/test_checkpointer.py::test_postgres_checkpointer_builds` | needs a live Postgres |
-| `tests/api/test_routes.py` (2 errors) | needs a live Postgres |
 | `tests/ingestion/test_fetcher.py` (4 errors) | needs a Playwright Chromium binary |
 | `tests/ingestion/test_crawler.py::test_discover_bfs_traversal_integration` | needs Playwright |
+| ~~`tests/db/test_checkpointer.py::test_postgres_checkpointer_builds`~~ | **now skips correctly** — its `skipif` on `POSTGRES_*` finally works |
+| ~~`tests/api/test_routes.py` (2 errors)~~ | **now pass** |
+| ~~`test_supervisor.py::test_groq_live_classifies_a_greeting`~~ | **now skips correctly** — no longer makes a billed Groq call on every run |
 
-**Also observed:** running `pytest` without `env -u PYTHONPATH` picks up a conda `pytest` and collapses into 24 collection errors. The correct invocation must go through the project venv.
+**Why those guards were broken.** Three of them already had `skipif` decorators; they never fired, because `store.py`'s module-scope `load_dotenv()` injected the very variables the guards check for (`POSTGRES_*`, `GROQ_API_KEY`). The tests believed the environment was configured when it was only polluted. Fixing P0-2 fixed the guards.
+
+**What remains.** Only Playwright. Install the browser once and the suite is fully green:
+
+```bash
+cd backend && uv run playwright install --with-deps chromium
+```
+
+Marking those five `@pytest.mark.integration` (item 5 in §7.1) is still worth doing so a clean checkout is green without a browser at all, but the suite is no longer sensitive to ambient database, credential or rate-limit state.
+
+**Also observed:** running `pytest` without `env -u PYTHONPATH` picks up a conda `pytest` and collapses into 24 collection errors. The correct invocation must go through the project venv — `make test` now does this for you.
 
 ---
 
@@ -94,10 +111,12 @@ Collected: 316 tests — `tests/agents` 134, `tests/chunk_embed` 97, `tests/inge
    │                     └── assemble_response
    │
    ├── /graph/*   read-only EAV graph browser (own engine)
-   └── /ingest/*  upload | crawl | discover | confirm
+   └── /ingest/*  upload | crawl | discover | confirm  → 202 Accepted
                     └─► register_document_version → MinIO + job row
-                        └─► run_ingestion: fetch → Tika → chunk+embed
-                             → EAV extraction (Groq) → persist → cutover
+                                                          │
+ worker service (scripts/run_worker.py) ◄─────────────────┘ claims the job
+   └─► run_ingestion: fetch → Tika → chunk+embed
+        → EAV extraction (Groq) → persist → cutover
 ```
 
 **Stack:** Python 3.12, FastAPI, LangGraph 1.x, SQLAlchemy 2 (async, psycopg3), Alembic, Postgres 16 + pgvector, MinIO, Apache Tika, Playwright, `sentence-transformers` (BAAI/bge-base-en-v1.5, 768-dim), Groq (`openai/gpt-oss-120b`) as the live LLM.
@@ -167,7 +186,7 @@ Zero-build vanilla JS (`window.ACA` namespace, classic scripts, hash router), da
 | **`config.py`** | **0 bytes** — every module reads `os.environ` directly instead. |
 | **README / CHANGELOG** | `README.md` is one line; `CHANGELOG.md` is empty. |
 | **CI** | No `.github/`, no lint config, no formatter config, no coverage gate. |
-| **Worker in Docker** | `docker-compose.yml` has no worker service; ingestion only runs inside the API process or via a manual `make worker`. |
+| ~~**Worker in Docker**~~ | **Done (P1-5)** — a `worker` service now runs `scripts/run_worker.py`; the API only enqueues. |
 | **Observability** | No structured logging, no metrics, no tracing. `trace_id` is generated and threaded but never actually logged anywhere. |
 | **Streaming responses** | `/chat` is request/response only; a 30–60s RAG turn shows a spinner. |
 | **Rate limiting / abuse control** | None, on an endpoint that spends money per call. |
@@ -222,23 +241,56 @@ Four distinct defects, introduced by the last two commits, all now resolved:
 
 ---
 
-### 🔴 P0-2 — `load_dotenv()` runs at module import
+### ✅ P0-2 — `load_dotenv()` ran at module import — **FIXED 2026-09-06**
 
-**Location:** `agents/ticket_agent/store.py` (top of module)
+**Was:** `agents/ticket_agent/store.py` (top of module)
 
 ```python
-import os
 from dotenv import load_dotenv
-load_dotenv()          # ← executes on import, before any imports below it
+load_dotenv()          # executed on import
 ```
 
-Importing a ticket-persistence module mutates the process environment. Consequences, both observed:
-- `tests/agents/knowledge/test_providers.py` fails because `GROQ_API_KEY` leaks into the test environment from `backend/.env` and the provider resolver returns Groq instead of the expected stub.
-- Behaviour depends on the current working directory, so tests pass or fail depending on where `pytest` is launched.
+`load_dotenv()` returns nothing useful — it **mutates `os.environ` for the whole process**. So importing a ticket-persistence module silently injected `GROQ_API_KEY`, `SMTP_PASSWORD` and every other secret in `backend/.env` into global state, as a side effect nobody asked for. Three consequences, all reproduced:
 
-**Status:** left in place deliberately during the P0-1 fix (it is a separate change), and now flagged with a comment at the call site. It is the *only* remaining non-environmental test failure in the suite.
+1. **Behaviour depended on import order.** The Knowledge provider resolver picks a backend by asking which API keys exist, so its answer changed depending on whether an unrelated module had been imported first. `test_providers.py` **passed alone and failed alongside the ticket tests** — same code, same machine.
+2. **Behaviour depended on the working directory.** Bare `load_dotenv()` searches upward from the CWD, so config changed based on where the process was launched.
+3. **Secrets entered `os.environ` unintentionally**, putting them in scope for anything that dumps the environment on error.
 
-**Fix:** Delete the call. Load `.env` exactly once, explicitly, at the process entry points (`main.py` lifespan, `scripts/run_worker.py`, `scripts/crawl_and_ingest.py`). `scripts/run_worker.py` already does this correctly — copy that pattern.
+**What changed.** The previously-empty `config.py` now holds one `load_env()`: path-anchored to `backend/.env` (never the CWD), idempotent, `override=False` so a real environment variable always beats the file, with the manual `KEY=value` fallback `run_worker.py` used to carry inlined for environments without python-dotenv. Loading is now an *entry point's* job:
+
+| Entry point | Before | After |
+|---|---|---|
+| `main.py` (FastAPI) | **nothing** — relied on `store.py`'s side effect | `load_env()` before project imports |
+| `scripts/run_worker.py` | own 20-line loader | `load_env()` |
+| `scripts/crawl_and_ingest.py` | own one-liner | `load_env()` |
+| `scripts/test_graph_queries.py` | own one-liner | `load_env()` |
+| `agents/supervisor/cli.py` | module-scope, CWD-based | `load_env()` inside `main()` |
+| `agents/ticket_agent/store.py` | **module-scope `load_dotenv()`** | removed — reads `os.environ` only |
+
+Five ad-hoc implementations became one. No `load_dotenv()` call remains outside `config.py`.
+
+**The result was larger than one test.** Two "opt-in" tests carried `skipif` guards that had never actually worked, because `load_dotenv()` injected the very variables they check for:
+
+| Test | Before | After |
+|---|---|---|
+| `test_providers.py::...falls_back_to_stub` | FAILED | **passes** |
+| `test_checkpointer.py::test_postgres_checkpointer_builds` | FAILED (psycopg) | **skips correctly** |
+| `test_supervisor.py::test_groq_live_classifies_a_greeting` | FAILED under load | **skips correctly** — no longer makes a billed network call on a normal run |
+| `test_routes.py` (2 tests) | 2 ERRORS (psycopg) | **pass** |
+
+Suite: **352 → 364 passing**, 3 failed → 1, 6 errors → 4. **Every remaining non-green test now needs only a Playwright browser** — the suite is otherwise deterministic on a clean checkout, which was item 5 of §7.1.
+
+**One thing this unmasked.** `test_routes.py::test_chat_roundtrip_persists_thread` then failed on a stale assertion: it still expected the *two*-step ticket flow, which P0-1 replaced with three steps (reason → email → created). The psycopg connection error had been hiding it before it could run. It is a P0-1 leftover, not a P0-2 regression, and has been updated to assert the real flow — including that the customer's stated reason reaches the confirmation.
+
+**Verified at runtime**, since removing an implicit config load is exactly the change that breaks silently:
+- Host app boots, `/health` OK, `/graph/search` returns live rows (POSTGRES_* reached it), a real chat turn returns a grounded answer (GROQ_API_KEY reached it).
+- `scripts/run_worker.py` starts and claims a job with `POSTGRES_USER`/`PASSWORD`/`DB` supplied **only** by `load_env()` — run with those explicitly unset in the shell.
+- Docker rebuilt and healthy; confirmed `/app/.env` **does not exist** in the image (`.dockerignore` excludes it) and `POSTGRES_HOST=postgres` comes from compose, so the container path never depended on the Python-side load.
+- A subprocess probe asserts importing `store`, `cli`, `providers` and `chat_service` injects **no** key from `.env`.
+
+**Files changed:** `config.py` (was 0 bytes), `agents/ticket_agent/store.py`, `agents/supervisor/cli.py`, `main.py`, `scripts/run_worker.py`, `scripts/crawl_and_ingest.py`, `scripts/test_graph_queries.py`, `tests/api/test_routes.py`, `tests/test_config_env_loading.py` (new, 10 tests including a guard that fails if a module-scope `load_dotenv()` is reintroduced anywhere).
+
+**Still open:** `config.py` holds only env loading. Modules continue to read `os.environ` directly; turning that into a typed `pydantic-settings` object — the pattern `agents/knowledge/config.py` already uses well — remains a separate improvement (§7.3).
 
 ---
 
@@ -311,27 +363,32 @@ The gap widens linearly with corpus size — the Python path is `O(n)` transfer 
 
 ---
 
-### 🟠 P1-2 — Blocking LLM calls run on the event loop
+### ✅ P1-2 — Blocking LLM calls ran on the event loop — **FIXED 2026-09-05**
 
-**Location:** `agents/knowledge/nodes.py` (all nine node factories), `agents/knowledge/providers.py`
+**Was:** `agents/knowledge/nodes.py`
 
-Every Knowledge node is declared `async def`, but the work inside is synchronous and blocking:
-- `rewrite_query`, `extract_query`, `generate_response` are plain sync functions.
-- `GroqKnowledgeProvider._complete` uses the blocking Groq SDK and `time.sleep()` for backoff (up to a **300-second** cooldown, `providers.py:41`).
-- `GeminiKnowledgeProvider._generate` uses blocking `requests.post`.
-- `GroqSupervisorLLMClient.classify` likewise, plus `time.sleep()` retries.
+**Correction to the original diagnosis.** The first version of this report also blamed `GroqSupervisorLLMClient.classify`. That was wrong, and the distinction turned out to be the whole point. Measured directly against LangGraph:
 
-A single chat turn therefore freezes the **entire** FastAPI process — health checks, ingestion jobs, every other user's request — for the full duration of 3 sequential LLM calls. If Groq rate-limits, the server is unresponsive for up to five minutes.
+| Node style | Where it runs |
+|---|---|
+| `def` (sync) | a **thread executor** — blocking inside is harmless |
+| `async def` | **directly on the event loop** — blocking inside freezes the process |
 
-The ingestion pipeline already gets this right (`pipeline.py:158-164` wraps its LLM call in `asyncio.to_thread`) — the same pattern just needs applying here.
+The Supervisor's `classify_and_route` is a sync `def`, so LangGraph was already offloading it. The real defect was narrower: the three Knowledge LLM nodes (`rewrite`, `extract`, `llm`) are `async def` and called blocking provider code inline. Three sequential LLM calls per Knowledge turn therefore froze every other request in the process — health checks, other users, concurrent ingestion — for the full duration, and for minutes whenever Groq rate-limited.
 
-**Fix:** Wrap each provider call in `asyncio.to_thread(...)`, or switch to the async SDK clients (`groq.AsyncGroq`, `httpx.AsyncClient`) and make the completion callables awaitable. Replace `time.sleep` with `await asyncio.sleep`. Add a hard per-call timeout — the 300s cooldown ceiling is longer than the 120s node timeout that is supposed to bound it.
+**What changed.** Those three calls are wrapped in `asyncio.to_thread`, matching what `ingestion/pipeline.py` already did. The pure stage functions stay synchronous and untouched — the concurrency concern belongs at the graph boundary, not inside `rewriting.py` or `llm.py`, which remain testable without an event loop.
+
+Also fixed: `_MAX_COOLDOWN_WAIT = 300.0` in `providers.py` was **dead** — defined and never referenced, so Groq's "try again in 6m33s" hint was honoured verbatim and unbounded, far exceeding the 120s timeout meant to bound the agent. The backoff is now clamped to it.
+
+**Verified in the running app:** during a real 33-second chat turn the server answered **97** health checks, only 1 of them slower than 1s. The new tests assert the property rather than the implementation — that the completion runs on a non-loop thread, and that a deliberately slow completion does not starve other coroutines — and were confirmed to **fail** when the old inline call is restored.
+
+**Files changed:** `agents/knowledge/nodes.py`, `agents/knowledge/providers.py`, `tests/agents/knowledge/test_event_loop_offload.py` (new, 6 tests).
 
 ---
 
-### 🟠 P1-3 — Multi-question splitting on `?` corrupts messages
+### ✅ P1-3 — Multi-question splitting on `?` corrupted messages — **FIXED 2026-09-05**
 
-**Location:** `services/chat_service.py:138-194`
+**Was:** `services/chat_service.py`
 
 ```python
 parts = [p.strip() for p in user_message.split("?") if p.strip()]
@@ -339,65 +396,103 @@ if len(parts) > 1:
     # run the whole graph once per part
 ```
 
-Any message containing a `?` anywhere is shredded:
-- `"Can you help? Thanks!"` → two graph invocations, two LLM classification calls, two billed turns.
-- `"What is the URL for https://x.com/a?b=1"` → split mid-URL.
-- `"Really?!"` → split.
+Any message containing a `?` anywhere was shredded: `"Can you help? Thanks!"` became two full graph runs and two billed classifications, a URL with a query string was cut in half, `"Really?!"` was split. The interrupt interaction was fragile too — once `had_interrupt` was set it stayed set for every remaining part, silently dropping their history.
 
-Each part is also a full graph run, so an N-`?` message costs N× latency and N× tokens. The interrupt interaction is fragile too: once `had_interrupt` is set it stays set for all remaining parts, so history for those parts is silently dropped.
+**What changed.** The splitting block is deleted; the message always goes to the graph whole. Compound questions are the LLM's job — that is what the prompts are for — not `str.split`. This removes ~55 lines and, on any multi-`?` message, cuts latency and token spend by the number of fragments.
 
-**Fix:** Delete the splitting. Send the message whole and let the LLM handle compound questions — that is what the prompt is for. If genuine multi-question handling is wanted later, do it inside the Knowledge Agent with a proper decomposition step, not with `str.split`.
+**Files changed:** `services/chat_service.py`.
 
 ---
 
-### 🟠 P1-4 — Three separate database engines in one process
+### ✅ P1-4 — Three separate database engines in one process — **FIXED 2026-09-05**
 
-| Engine | Location |
+**Was:** engines in `db/session.py` (×2, `lru_cache`d), `db/async_session.py` (module-level), and `api/graph.py` (module-level, built at **import** time) — plus the checkpointer's own pool. None set `pool_size`, `max_overflow` or `pool_pre_ping`, so the real connection ceiling was whatever they happened to add up to, and exhaustion surfaced as an unexplained hang.
+
+Both `api/graph.py` and `db/async_session.py` carried comments asking for this consolidation.
+
+**What changed.** New `db/engine.py` owns the single async engine and session factory for the process, with explicit, env-tunable pool settings (`DB_POOL_SIZE`, `DB_MAX_OVERFLOW`, `DB_POOL_TIMEOUT`, `DB_POOL_RECYCLE`) and `pool_pre_ping`. Everything else delegates:
+
+| Module | Now |
 |---|---|
-| Sync engine | `db/session.py:22` (`lru_cache`) |
-| Async engine #1 | `db/session.py:44` (`lru_cache`) |
-| Async engine #2 | `db/async_session.py:24` (module-level) |
-| Async engine #3 | `api/graph.py:51` (module-level, created **at import time**) |
-| Connection pool #4 | `db/checkpointer.py` — a separate `AsyncConnectionPool` for LangGraph |
+| `db/async_session.py` | thin shim re-exporting from `db.engine`; `session_factory` is lazy, so importing it no longer opens a pool as a side effect |
+| `db/session.py` | async helpers are delegating aliases; keeps only the **sync** engine, which is a different driver stack used by Alembic |
+| `api/graph.py` | uses the shared `get_session`; its import-time engine is gone |
+| `main.py` | disposes the pool on shutdown so a reload does not leak connections |
 
-Both `api/graph.py:10-17` and `db/async_session.py:5-8` contain comments acknowledging the duplication and asking for it to be consolidated. None of the extra engines set `pool_size`, `max_overflow` or `pool_pre_ping`, so pool exhaustion under load is likely and hard to diagnose.
+The LangGraph checkpointer keeps its own psycopg pool — raw psycopg, not SQLAlchemy, so it genuinely cannot share this one.
 
-**Fix:** One `db/engine.py` owning a single async engine with explicit pool settings; every module takes the session factory by injection. Delete the module-level engines in `api/graph.py` and `db/async_session.py`.
+**Verified:** `grep` confirms one `create_async_engine` in the codebase; the app boots and `/graph/search` returns live rows through the shared engine.
 
----
-
-### 🟠 P1-5 — Fire-and-forget ingestion inside the API process
-
-**Location:** `api/ingest.py:181`
-
-```python
-asyncio.create_task(_run_job(job.job_id))
-```
-
-Problems:
-- The task reference is not retained, so it can be garbage-collected mid-run (a documented `asyncio` footgun).
-- Unbounded concurrency: 50 uploads spawn 50 concurrent jobs.
-- Runs the 400 MB BGE model, Tika calls and Groq extraction inside the web worker.
-- On restart, in-flight jobs are lost — the row stays `RUNNING` forever, and the one-job-per-source guard then blocks that source permanently.
-- Fully duplicates the `scripts/run_worker.py` execution path, so there are two ways for a job to run and they can race.
-
-**Fix:** Delete `_run_job` from the API. The endpoint should enqueue only and return `202` with the `job_id`; the frontend already polls `GET /ingest/jobs/{job_id}`. Add a `worker` service to `docker-compose.yml` running `scripts/run_worker.py`. Add a startup reaper that resets stale `RUNNING` jobs (`started_at` older than N minutes) back to `QUEUED`.
+**Files changed:** `db/engine.py` (new), `db/async_session.py`, `db/session.py`, `api/graph.py`, `api/ingest.py`, `main.py`.
 
 ---
 
-### 🟡 P2-1 — The two ontologies have already drifted
+### ✅ P1-5 — Fire-and-forget ingestion inside the API process — **FIXED 2026-09-05**
 
-`agents/knowledge/ontology.py` (738 lines) and `ingestion/extraction/ontology.py` (762 lines) are forked copies — `diff` reports 463 differing lines. The ingestion copy's docstring says the fork is intentional ("ingestion never depends on the agent package"), but the vocabularies are no longer in sync:
+**Was:** `api/ingest.py` — `asyncio.create_task(_run_job(job.job_id))`
 
-| Synonym | Ingestion | Knowledge |
+Five problems in one line: the task reference was dropped so it could be garbage-collected mid-run; concurrency was unbounded (50 uploads meant 50 concurrent pipelines); the 400 MB embedding model, Tika and Groq extraction all ran inside the web worker; a restart orphaned in-flight jobs as permanently `RUNNING` rows, which `claim_next_job`'s one-job-per-source guard then treated as a permanent block on that source; and it duplicated `scripts/run_worker.py`, so the same job had two possible executors.
+
+**What changed.**
+
+1. **The API enqueues only.** `_run_job` is gone; `/ingest/upload`, `/ingest/crawl` and `/ingest/crawl/{id}/confirm` return **202 Accepted** with a `job_id`. The response body shape is unchanged, and the frontend already polled `GET /ingest/jobs/{job_id}` and handled a `pending` result — so no UI change was needed.
+2. **A `worker` service in `docker-compose.yml`** runs `scripts/run_worker.py`, waits on postgres/minio/tika, and starts after `backend` so migrations have run. It overrides the entrypoint, since the worker neither migrates nor serves HTTP. Backend and worker share one named image (`ai-customer-assistant:local`) rather than building the same 3 GB context twice — which also makes it impossible for the API and the worker to drift onto different versions of the pipeline.
+3. **A stale-job reaper.** `repository.reset_stale_running_jobs` returns jobs stuck `RUNNING` past a threshold back to `QUEUED`; `run_worker` calls it once at startup. Without it, one worker crash blocked a source's ingestion forever with no error anywhere.
+
+**Verified in the live stack.** On first start the worker's reaper found and requeued **7 genuinely abandoned jobs** in the development database — rows left `RUNNING` by earlier crashes that had been permanently blocking ingestion for their sources, silently and with no error recorded anywhere. The worker then claimed and processed them.
+
+**Deployment note:** ingestion now requires the worker to be running. `make up` starts it; if you run the API by hand, run `make worker` alongside it or jobs will sit `QUEUED`.
+
+**Files changed:** `api/ingest.py`, `ingestion/queue/repository.py`, `ingestion/queue/worker.py`, `docker-compose.yml`, `tests/api/test_ingest.py`, `tests/ingestion/test_stale_job_reaper.py` (new, 7 tests).
+
+---
+
+### ✅ P2-1 — The two ontologies had drifted — **FIXED 2026-09-06**
+
+**Correction to the original report.** The first version of this entry claimed a sweeping divergence, citing `corporation`/`firm`/`startup`/`sector` as present in ingestion and missing from retrieval. **That was wrong** — I had grepped only part of the synonym block; retrieval had them all along. The "463 differing lines" figure was a raw text diff, almost entirely docstrings, comments and ordering.
+
+A programmatic comparison of the actual data structures found exactly **three** divergences, not a table's worth. The *class* of bug was real and the impact was real; the *extent* was overstated.
+
+**The three real divergences:**
+
+| Divergence | Ingestion wrote | Retrieval resolved | Consequence |
+|---|---|---|---|
+| `"data engineer"` | `Person` | **raised `UnknownEntityTypeError`** | a question phrased that way matched nothing |
+| `"mobile developer"` | `Person` | `Mobile App` at **0.88 confidence** | a *confident wrong answer* — worse than a failure |
+| `Person.salary` | allowed | **raised `UnknownAttributeError`** | a fact that could be stored but never asked for |
+
+None of these raised anywhere in production. They silently lost facts.
+
+**What changed.** A new project-level `ontology` package, belonging to neither `agents` nor `ingestion`, so both import it without depending on each other — preserving the isolation the fork was created for while removing the duplication that made drift possible:
+
+| Module | Role |
+|---|---|
+| `ontology/vocabulary.py` | the tables — entity types, synonyms, per-type attributes, value types, relations. One copy. |
+| `ontology/matching.py` | the pure resolution engine, returning a neutral `Match` and raising nothing |
+| `agents/knowledge/ontology.py` | thin adapter: 738 → **154** lines |
+| `ingestion/extraction/ontology.py` | thin adapter: 762 → **214** lines |
+
+Total ontology code: **1500 → 1183 lines**, with zero duplicated tables (`MappingProxyType` count: 11 in the shared module, 0 in both adapters).
+
+**A policy difference I nearly destroyed.** The first version of this refactor pushed fuzzy matching into the shared engine for both callers — and broke `test_extraction_tools.py`. Investigating the failure surfaced a deliberate, well-reasoned asymmetry documented in the old ingestion code:
+
+| | Knowledge (reads) | Ingestion (writes) |
 |---|---|---|
-| `corporation`, `firm`, `startup` → `Company` | ✅ | ❌ |
-| `sector`, `non-profit`, `nonprofits` → `Industry` | ✅ | ❌ |
-| `market segment` → `Industry` | ✅ | ❌ |
+| entity type / attribute | exact + **fuzzy** | **exact + synonym only** |
+| relation type | exact + fuzzy + slug fallback | same |
 
-**This silently breaks retrieval.** Ingestion canonicalises `"startup"` to entity type `Company` and writes that row; a user asking *"which startups do you work with?"* goes through the *knowledge* ontology, which cannot canonicalise `"startup"`, so `structured_lookup` misses a fact that is sitting in the database.
+Ingestion refuses to guess because it *writes to the database*, where a wrong canonical type merges two different real-world entities permanently. `difflib` is false-positive prone on short strings — the codebase's own example is `"customer"` → `"Cluster"`. Retrieval only reads, so a wrong guess costs nothing but an unhelpful answer.
 
-**Fix:** Extract the shared vocabulary into one module (`ontology/vocabulary.py`) that both import, keeping any genuinely stage-specific behaviour as thin wrappers. Add a test asserting `ingestion.canonical_types ⊆ knowledge.canonical_types` so drift fails CI.
+That asymmetry is now an explicit `fuzzy: bool` flag on the shared matcher, set by each adapter, with a test that fails if anyone "harmonises" it away. Both packages also keep their own exception types and the ingestion `safe_*` non-raising variants.
+
+**Verified:**
+- Both modules now resolve to the *same table objects* — asserted by identity, not equality, so re-forking the tables fails the build even if the copies start out identical.
+- All three divergences resolve identically on both sides.
+- Exhaustive sweeps: every entity type and every per-type attribute that ingestion can write is resolvable by retrieval; every synonym resolves to the same term on both sides.
+- Suite **321 → 352 passing** (31 new tests), same 3 pre-existing failures.
+- Live end-to-end chat turn against the running app returns a grounded answer.
+
+**Files changed:** `ontology/__init__.py`, `ontology/vocabulary.py`, `ontology/matching.py` (all new), `agents/knowledge/ontology.py`, `ingestion/extraction/ontology.py`, `tests/ontology/test_shared_vocabulary.py` (new, 31 tests).
 
 ---
 
@@ -468,21 +563,21 @@ A turn taking 60–120 s is aborted in the browser while the server completes it
 
 ### 7.1 Correctness & safety (do first)
 1. ~~Fix the ticket flow (P0-1).~~ **Done 2026-09-05** — 7 regressions cleared, 11 tests added.
-2. Remove import-time `load_dotenv()` (P0-2) — now the only non-environmental failure left.
+2. ~~Remove import-time `load_dotenv()` (P0-2).~~ **Done 2026-09-06**
 3. Implement JWT auth + CORS allowlist + SSRF guard on the crawler (P0-3).
 4. Replace `print()` node logging with redacted structured logging (P0-4).
 5. Mark DB/Playwright tests with `@pytest.mark.integration` and add a `-m "not integration"` default so the unit suite is green on a clean checkout.
 
 ### 7.2 Performance & scale
 6. ~~pgvector `<=>` + HNSW index (P1-1).~~ **Done 2026-09-05** — see the P1-1 entry.
-7. Non-blocking LLM calls (P1-2).
-8. Remove the `?` splitter (P1-3) — cuts LLM cost immediately.
-9. Consolidate to one database engine with explicit pool sizing (P1-4).
-10. Move ingestion out of the API into the worker; add it to `docker-compose` (P1-5).
+7. ~~Non-blocking LLM calls (P1-2).~~ **Done 2026-09-05**
+8. ~~Remove the `?` splitter (P1-3).~~ **Done 2026-09-05**
+9. ~~Consolidate to one database engine with explicit pool sizing (P1-4).~~ **Done 2026-09-05**
+10. ~~Move ingestion out of the API into the worker; add it to `docker-compose` (P1-5).~~ **Done 2026-09-05**
 11. Add a Redis cache for repeated identical queries (embedding + answer) — support traffic is heavily repetitive.
 
 ### 7.3 Quality
-12. Unify the ontologies with a drift test (P2-1).
+12. ~~Unify the ontologies with a drift test (P2-1).~~ **Done 2026-09-06**
 13. Build a golden Q&A evaluation set; calibrate `similarity_threshold` and `top_k` against it (P2-2).
 14. Add a re-ranking stage (cross-encoder) — currently ranking is a weighted score with no second pass.
 15. Wrap ingestion in a proper transaction boundary (P2-3).
