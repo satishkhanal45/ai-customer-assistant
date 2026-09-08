@@ -1,5 +1,9 @@
 # Agent Integration Plan — Supervisor · Knowledge · Ticket · Safety
 
+> **Historical — superseded planning document.** Written before the agent
+> work began and superseded by `agents_integration_plan_new.md`, which was
+> itself then implemented. For what exists today, see `status.md`.
+
 Status: **planning only — no code changed.**
 Scope: `backend/src/ai_customer_assistant/agents/` plus the layers that will
 eventually call it (`services/chat_service.py`, `api/routes.py`, `main.py`).

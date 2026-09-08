@@ -26,14 +26,15 @@ from api.ingest import router as ingest_router  # noqa: E402
 from api.routes import router  # noqa: E402
 from db.checkpointer import build_checkpointer  # noqa: E402
 from db.engine import dispose_engine, get_session_factory  # noqa: E402
+from logging_config import configure_logging  # noqa: E402
 from services.chat_service import build_chat_service  # noqa: E402
 from services.embeddings import build_shared_embeddings  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    configure_logging()
     checkpointer = await build_checkpointer()
     # Phase 6 wiring: the real Knowledge graph is compiled only when BOTH the
     # shared BGE instance and the async session factory are passed in.

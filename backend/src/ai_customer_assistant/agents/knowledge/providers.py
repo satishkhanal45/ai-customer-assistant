@@ -31,7 +31,13 @@ from typing import Callable, Optional, Protocol, TypeAlias
 
 import groq
 
-from timeouts import LLM_CALL_TIMEOUT_S, LLM_RETRY_BUDGET_S
+from timeouts import (
+    LLM_ANSWER_RETRY_BUDGET_S,
+    LLM_ANSWER_TIMEOUT_S,
+    LLM_SHORT_RETRY_BUDGET_S,
+    LLM_SHORT_TIMEOUT_S,
+    sleep_within_budget,
+)
 
 from .config import KnowledgeAgentConfig
 
@@ -44,7 +50,7 @@ from .config import KnowledgeAgentConfig
 # long after the 45s Knowledge node timeout had already abandoned it — the
 # retries were burning quota for an answer nobody would receive. Now the loop
 # stops as soon as the *next* attempt could not finish inside what is left of
-# LLM_RETRY_BUDGET_S, and surfaces the last error instead.
+# the stage's retry budget, and surfaces the last error instead.
 _RETRY_ATTEMPTS = 4
 _RETRY_BASE_DELAY = 1.5
 
@@ -118,7 +124,8 @@ class AnthropicKnowledgeProvider:
         api_key: Optional[str] = None,
         model: str = _DEFAULT_MODEL,
         rewrite_model: str = _DEFAULT_MODEL,
-        timeout: float = LLM_CALL_TIMEOUT_S,
+        timeout: float = LLM_SHORT_TIMEOUT_S,
+        answer_timeout: float = LLM_ANSWER_TIMEOUT_S,
         max_tokens: int = 1024,
     ) -> None:
         import anthropic
@@ -131,6 +138,7 @@ class AnthropicKnowledgeProvider:
         self.model = model
         self.rewrite_model = rewrite_model
         self.timeout = timeout
+        self.answer_timeout = answer_timeout
         self.max_tokens = max_tokens
 
     def rewrite_complete(self, prompt: str) -> str:
@@ -140,10 +148,14 @@ class AnthropicKnowledgeProvider:
         return self._single_turn(prompt, model=self.rewrite_model)
 
     def answer_complete(self, system_instructions: str, user_prompt: str) -> str:
+        # `timeout` was stored here and never passed to the SDK, so these
+        # calls had no deadline at all — the same defect the Supervisor's
+        # Groq client carried. Generation gets the answer-stage budget.
         response = self.client.messages.create(
             model=self.model,
             max_tokens=self.max_tokens,
             temperature=0,
+            timeout=self.answer_timeout,
             system=system_instructions,
             messages=[{"role": "user", "content": user_prompt}],
         )
@@ -154,6 +166,7 @@ class AnthropicKnowledgeProvider:
             model=model,
             max_tokens=self.max_tokens,
             temperature=0,
+            timeout=self.timeout,
             messages=[{"role": "user", "content": prompt}],
         )
         return _extract_text(response.content)
@@ -173,16 +186,25 @@ class GroqKnowledgeProvider:
     # Class-level defaults so the retry loop stays correct for an instance
     # built without __init__ (the test fakes construct via __new__), and so
     # the ladder in timeouts.py is the single place these are declared.
-    timeout: float = LLM_CALL_TIMEOUT_S
-    retry_budget: float = LLM_RETRY_BUDGET_S
+    #
+    # Two pairs, not one: rewrite and extraction emit a few tokens of JSON,
+    # while answer generation emits paragraphs and legitimately takes an
+    # order of magnitude longer. A single shared timeout was cutting off
+    # healthy generations as failures — see timeouts.py for the measurements.
+    timeout: float = LLM_SHORT_TIMEOUT_S
+    retry_budget: float = LLM_SHORT_RETRY_BUDGET_S
+    answer_timeout: float = LLM_ANSWER_TIMEOUT_S
+    answer_retry_budget: float = LLM_ANSWER_RETRY_BUDGET_S
 
     def __init__(
         self,
         api_key: Optional[str] = None,
         model: str = _DEFAULT_MODEL,
         rewrite_model: str = _DEFAULT_MODEL,
-        timeout: float = LLM_CALL_TIMEOUT_S,
-        retry_budget: float = LLM_RETRY_BUDGET_S,
+        timeout: float = LLM_SHORT_TIMEOUT_S,
+        retry_budget: float = LLM_SHORT_RETRY_BUDGET_S,
+        answer_timeout: float = LLM_ANSWER_TIMEOUT_S,
+        answer_retry_budget: float = LLM_ANSWER_RETRY_BUDGET_S,
     ) -> None:
         resolved_key = api_key or os.environ.get("GROQ_API_KEY")
         if not resolved_key:
@@ -193,6 +215,8 @@ class GroqKnowledgeProvider:
         self.rewrite_model = rewrite_model
         self.timeout = timeout
         self.retry_budget = retry_budget
+        self.answer_timeout = answer_timeout
+        self.answer_retry_budget = answer_retry_budget
 
     def rewrite_complete(self, prompt: str) -> str:
         return self._complete([{"role": "user", "content": prompt}], model=self.rewrite_model)
@@ -207,10 +231,27 @@ class GroqKnowledgeProvider:
                 {"role": "user", "content": user_prompt},
             ],
             model=self.model,
+            timeout=self.answer_timeout,
+            retry_budget=self.answer_retry_budget,
         )
 
-    def _complete(self, messages: list[dict], *, model: str) -> str:
-        deadline = time.monotonic() + self.retry_budget
+    def _complete(
+        self,
+        messages: list[dict],
+        *,
+        model: str,
+        timeout: Optional[float] = None,
+        retry_budget: Optional[float] = None,
+    ) -> str:
+        """One logical completion, retried within a wall-clock budget.
+
+        ``timeout`` / ``retry_budget`` default to this provider's *short*
+        stage values; ``answer_complete`` passes its own, larger pair.
+        """
+        timeout = self.timeout if timeout is None else timeout
+        retry_budget = self.retry_budget if retry_budget is None else retry_budget
+
+        deadline = time.monotonic() + retry_budget
         last_error: Optional[Exception] = None
         for attempt in range(_RETRY_ATTEMPTS):
             try:
@@ -218,7 +259,7 @@ class GroqKnowledgeProvider:
                     model=model,
                     messages=messages,
                     temperature=0,
-                    timeout=self.timeout,
+                    timeout=timeout,
                     response_format={"type": "json_object"},
                 )
                 return response.choices[0].message.content or "{}"
@@ -226,25 +267,10 @@ class GroqKnowledgeProvider:
                 last_error = exc
             if attempt < _RETRY_ATTEMPTS - 1:
                 cooldown = _cooldown_seconds(str(last_error)) or _RETRY_BASE_DELAY
-                if not _sleep_within_budget(cooldown * (attempt + 1), deadline, self.timeout):
+                if not sleep_within_budget(cooldown * (attempt + 1), deadline, timeout):
                     break
         assert last_error is not None
         raise last_error
-
-
-def _sleep_within_budget(requested: float, deadline: float, call_timeout: float) -> bool:
-    """Sleep for ``requested`` seconds, but only if a retry still fits.
-
-    Returns False (and sleeps not at all) when the remaining budget cannot
-    hold both this backoff and the attempt it precedes — there is no point
-    waiting for a call the caller will have abandoned before it returns.
-    Otherwise sleeps for at most the remaining budget and returns True.
-    """
-    remaining = deadline - time.monotonic()
-    if remaining <= 0 or remaining < requested + call_timeout:
-        return False
-    time.sleep(min(requested, remaining))
-    return True
 
 
 def _cooldown_seconds(message: str) -> float | None:
@@ -288,7 +314,8 @@ class GeminiKnowledgeProvider:
         api_key: Optional[str] = None,
         model: str = _DEFAULT_MODEL,
         rewrite_model: str = _DEFAULT_MODEL,
-        timeout: float = LLM_CALL_TIMEOUT_S,
+        timeout: float = LLM_SHORT_TIMEOUT_S,
+        answer_timeout: float = LLM_ANSWER_TIMEOUT_S,
     ) -> None:
         resolved_key = api_key or os.environ.get("GEMINI_API_KEY")
         if not resolved_key:
@@ -298,6 +325,7 @@ class GeminiKnowledgeProvider:
         self.model = model
         self.rewrite_model = rewrite_model
         self.timeout = timeout
+        self.answer_timeout = answer_timeout
 
     def rewrite_complete(self, prompt: str) -> str:
         return self._generate(
@@ -318,16 +346,17 @@ class GeminiKnowledgeProvider:
                 "contents": [{"role": "user", "parts": [{"text": user_prompt}]}],
             },
             model=self.model,
+            timeout=self.answer_timeout,
         )
 
-    def _generate(self, payload: dict, *, model: str) -> str:
+    def _generate(self, payload: dict, *, model: str, timeout: Optional[float] = None) -> str:
         import requests
 
         response = requests.post(
             self._ENDPOINT_TEMPLATE.format(model=model),
             params={"key": self.api_key},
             json=payload,
-            timeout=self.timeout,
+            timeout=self.timeout if timeout is None else timeout,
         )
         if response.status_code != 200:
             raise RuntimeError(

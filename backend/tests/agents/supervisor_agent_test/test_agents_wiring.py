@@ -209,7 +209,10 @@ async def test_wired_knowledge_node_runs_under_ainvoke():
     result = await graph.ainvoke(
         {"user_message": "What is the refund policy?", "conversation_history": [], "clarification_attempts": 0}
     )
-    assert result["downstream_result"]["status"] == "GROUNDED"
+    # The fake reports `is_grounded=False`, and the status now says so. This
+    # assertion used to read "GROUNDED" — the node hardcoded it, so a refusal
+    # was reported as a success and the test pinned that in place (F9).
+    assert result["downstream_result"]["status"] == "UNGROUNDED"
     assert result["downstream_result"]["response"] == "answer"
     assert result["final_response"] == "answer"
 

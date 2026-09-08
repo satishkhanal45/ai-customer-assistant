@@ -44,6 +44,71 @@ _SAFE_FALLBACK_RESPONSE = (
     "Sorry, something went wrong on my end. Thank you for your patience, and please try again later."
 )
 
+# Shown instead of the generic apology when the failure was a provider rate
+# limit. Being rate limited is not "something went wrong" — it is a wait, and
+# telling the customer to retry *now* is actionable where the generic message
+# is not. Both failures used to render identically, so a customer hitting a
+# quota ceiling was told the product was broken.
+_BUSY_RESPONSE = (
+    "I'm handling more requests than I can keep up with at the moment, so I couldn't "
+    "get to yours. Please try again in a minute."
+)
+
+# The server ran out of its own turn budget (F1). Distinct from the generic
+# apology because it is *not* an internal fault: the work was progressing,
+# just too slowly to finish inside the time the browser is willing to wait.
+# Retrying is genuinely worth the customer's while, and saying so beats
+# implying the product is broken.
+_TURN_TIMEOUT_RESPONSE = (
+    "Sorry, that one took longer than I could wait for. Please try asking again — "
+    "a shorter or more specific question usually comes back faster."
+)
+
+# Rate limits arrive wrapped: the Knowledge stages re-raise as
+# LLMGenerationError with the provider text in the message, so the cause
+# chain has to be walked rather than the outermost type inspected. Matching
+# is on type name and message text rather than on an imported exception class
+# so this stays provider-agnostic (groq / anthropic / gemini all differ).
+# Matched loosely on purpose: providers name these differently
+# (`groq.RateLimitError`, `RateLimitExceeded`, `TooManyRequests`), and a
+# vendor renaming its exception class should not silently turn every rate
+# limit back into "something went wrong".
+_RATE_LIMIT_TYPE_FRAGMENTS = ("ratelimit", "toomanyrequests")
+_RATE_LIMIT_MARKERS = ("rate limit", "rate_limit", "too many requests", "error code: 429")
+
+
+def _looks_like_a_rate_limit_type(exc: BaseException) -> bool:
+    normalized = type(exc).__name__.lower().replace("_", "")
+    return any(fragment in normalized for fragment in _RATE_LIMIT_TYPE_FRAGMENTS)
+
+
+def is_rate_limited(exc: Optional[BaseException]) -> bool:
+    """Pure: does this failure (or anything that caused it) look like a
+    provider rate limit?"""
+    seen: set[int] = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if _looks_like_a_rate_limit_type(current):
+            return True
+        if getattr(current, "status_code", None) == 429:
+            return True
+        text = str(current).lower()
+        if any(marker in text for marker in _RATE_LIMIT_MARKERS):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def failure_response(exc: Optional[BaseException]) -> str:
+    """Pure: the customer-facing text for a failed turn."""
+    return _BUSY_RESPONSE if is_rate_limited(exc) else _SAFE_FALLBACK_RESPONSE
+
+
+def failure_reason(exc: Optional[BaseException]) -> str:
+    """Pure: the machine-facing label recorded alongside the failure."""
+    return "rate_limited" if is_rate_limited(exc) else "error"
+
 
 def confidence_tier(confidence: float) -> ConfidenceTier:
     """Map a raw confidence score onto HIGH / MEDIUM / LOW."""

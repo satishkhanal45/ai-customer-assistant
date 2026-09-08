@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 from typing import Any, Callable, Mapping, Optional
 
 from langgraph.config import get_config
@@ -26,8 +27,10 @@ from langgraph.types import interrupt
 from timeouts import KNOWLEDGE_NODE_TIMEOUT_S
 
 from ..contracts import ConversationTurn
-from .routing import _SAFE_FALLBACK_RESPONSE
+from .routing import _SAFE_FALLBACK_RESPONSE, failure_reason, failure_response
 from .schema import SupervisorState
+
+logger = logging.getLogger(__name__)
 
 KnowledgeGraph = Callable[[Mapping[str, Any]], Any]
 
@@ -71,17 +74,34 @@ def make_knowledge_agent_node(
                 timeout=timeout_s,
             )
         except asyncio.TimeoutError:
+            # Not silent: a node that runs out of budget is the single most
+            # useful thing to see in a latency investigation.
+            logger.warning(
+                "knowledge agent exceeded its %.0fs budget and was cancelled",
+                timeout_s,
+            )
             return _error_result("timeout")
-        except Exception:
-            return _error_result("error")
+        except Exception as exc:  # noqa: BLE001 - the turn degrades rather
+            # than failing, but the cause has to reach the log. Previously
+            # this produced a bare `"error": "error"` and nothing else, which
+            # is not enough to distinguish a rate limit from a real defect.
+            logger.warning(
+                "knowledge agent failed (%s)", type(exc).__name__, exc_info=True
+            )
+            return _error_result(failure_reason(exc), response=failure_response(exc))
 
         response = result.get("response")
         if response is None:
             return _error_result("missing_response")
 
+        # `is_grounded` is the model's own verdict on whether it could answer
+        # from the material. It was parsed, validated, carried all the way
+        # here — and then discarded in favour of a hardcoded "GROUNDED", so a
+        # refusal was logged as a success. Reporting it costs nothing and
+        # makes an over-refusal visible without reading the answer text.
         return {
             "downstream_result": {
-                "status": "GROUNDED",
+                "status": "GROUNDED" if response.is_grounded else "UNGROUNDED",
                 "response": response.answer_text,
                 "citations": list(response.citations),
             }
@@ -117,15 +137,17 @@ def _bounded_history(history: list[ConversationTurn]) -> tuple[str, ...]:
     return tuple(kept)
 
 
-def _error_result(reason: str) -> dict:
+def _error_result(reason: str, response: Optional[str] = None) -> dict:
     """DownstreamResult-shaped marker for a failed retrieval.
 
     The failed turn is surfaced as a safe fallback rather than propagated
-    to the customer. ``reason`` is kept for observability."""
+    to the customer. ``reason`` is kept for observability; ``response``
+    overrides the wording so a rate limit can say so instead of claiming
+    something is broken."""
     return {
         "downstream_result": {
             "status": "ERROR",
-            "response": _SAFE_FALLBACK_RESPONSE,
+            "response": response or _SAFE_FALLBACK_RESPONSE,
             "error": reason,
         }
     }
