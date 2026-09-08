@@ -8,7 +8,7 @@ from typing import Callable, Optional, Protocol
 import groq
 from groq import Groq
 
-from timeouts import LLM_CALL_TIMEOUT_S
+from timeouts import CLASSIFY_BUDGET_S, LLM_SHORT_TIMEOUT_S, sleep_within_budget
 
 from .schema import ConversationTurn
 
@@ -88,7 +88,7 @@ class GeminiSupervisorLLMClient:
         self,
         api_key: Optional[str] = None,
         model: str = "gemini-2.0-flash",
-        timeout: float = LLM_CALL_TIMEOUT_S,
+        timeout: float = LLM_SHORT_TIMEOUT_S,
     ) -> None:
         resolved_key = api_key or os.environ.get("GEMINI_API_KEY")
         if not resolved_key:
@@ -149,11 +149,17 @@ class GeminiSupervisorLLMClient:
 class GroqSupervisorLLMClient:
     """Groq-backed implementation."""
 
+    # Class-level defaults, so an instance built without __init__ (the test
+    # fakes construct via __new__) still has a bounded retry loop.
+    timeout: float = LLM_SHORT_TIMEOUT_S
+    retry_budget: float = CLASSIFY_BUDGET_S
+
     def __init__(
         self,
         api_key: Optional[str] = None,
         model: str = "openai/gpt-oss-120b",
-        timeout: float = LLM_CALL_TIMEOUT_S,
+        timeout: float = LLM_SHORT_TIMEOUT_S,
+        retry_budget: float = CLASSIFY_BUDGET_S,
     ) -> None:
         resolved_key = api_key or os.environ.get("GROQ_API_KEY")
         if not resolved_key:
@@ -162,6 +168,7 @@ class GroqSupervisorLLMClient:
         self.client = Groq(api_key=resolved_key)
         self.model = model
         self.timeout = timeout
+        self.retry_budget = retry_budget
 
     def classify(
         self,
@@ -188,10 +195,19 @@ class GroqSupervisorLLMClient:
             },
         ]
 
+        # Two separate bugs lived in this loop.
+        #
         # `timeout=self.timeout` was stored but never passed to the API call,
         # so classification had no socket deadline at all: a stalled connection
         # held the chat turn open indefinitely while the browser gave up at 60s.
-        # See timeouts.py for the ladder this belongs to.
+        #
+        # And the loop was bounded by attempt count only, so its worst case was
+        # 3 x 10s of socket timeout plus backoff — about 31s — for a call that
+        # measures 1.1s. That was the unbounded term in `classify + knowledge
+        # node + checkpointing`, and it is why a turn could reach ~76s while
+        # every individual rung honoured its own budget (F1). It is now bounded
+        # by wall clock, like the Knowledge provider's loop.
+        deadline = time.monotonic() + self.retry_budget
         last_error: Optional[groq.APIError] = None
         attempts = 3
         for attempt in range(attempts):
@@ -207,9 +223,12 @@ class GroqSupervisorLLMClient:
             except groq.APIError as exc:
                 last_error = exc
             # No sleep after the final attempt — it delayed the error by a
-            # second and a half without buying another try.
+            # second and a half without buying another try. And no sleep at
+            # all once the remaining budget could not hold the retry it
+            # precedes: waiting for a call nobody will wait for is pure cost.
             if attempt < attempts - 1:
-                time.sleep(0.5 * (attempt + 1))
+                if not sleep_within_budget(0.5 * (attempt + 1), deadline, self.timeout):
+                    break
 
         raise last_error
 

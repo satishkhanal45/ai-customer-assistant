@@ -1,5 +1,11 @@
 # Agent Implementation and Integration
 
+> **Historical — a record of the six-phase build, not current behaviour.**
+> Accurate for what was implemented at the time. Substantial parts have
+> since changed: retrieval routing, the timeout budgets, deduplication,
+> node logging, and the chat API (which now also streams). See
+> `status.md` for the current state and `test.md` for how it behaves live.
+
 Status: **All phases of the agent integration have been implemented.** This
 document records what was built across the six phases, where each piece lives
 in the codebase, how the pieces are wired together in the serving layer, and

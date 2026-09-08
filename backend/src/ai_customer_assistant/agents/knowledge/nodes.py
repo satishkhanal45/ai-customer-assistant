@@ -91,7 +91,8 @@ to handle as a real error.
 from __future__ import annotations
 
 import asyncio
-from typing import Awaitable, Callable
+import logging
+from typing import Awaitable, Callable, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -100,6 +101,7 @@ from .context_builder import build_context
 from .deduplication import deduplicate
 from .extraction import extract_query
 from .extraction import LLMCompletion as ExtractionLLMCompletion
+from .fact_relevance import relevant_facts
 from .hybrid import (
     GRACEFUL_STRUCTURED_MISSES,
     GRACEFUL_VECTOR_MISSES,
@@ -116,6 +118,8 @@ from .state import KnowledgeAgentState
 from .structured_lookup import structured_lookup
 from .types import RankedResult
 from .vector_search import EmbeddingFunction, vector_search
+
+logger = logging.getLogger(__name__)
 
 Node = Callable[[KnowledgeAgentState], Awaitable[dict]]
 StrategyEdge = Callable[[KnowledgeAgentState], list[str]]
@@ -177,6 +181,49 @@ def make_extract_node(*, config: KnowledgeAgentConfig, llm_complete: ExtractionL
 # ==========================================================================
 
 
+def make_route_node(*, config: KnowledgeAgentConfig) -> Node:
+    """Record the retrieval strategy in state before the fan-out (F5).
+
+    `KnowledgeAgentState.retrieval_strategy` has been declared and
+    documented as "set by the decide_strategy conditional edge" since the
+    beginning, and was never actually set: LangGraph conditional edges
+    return a route, they cannot write state. So the one decision that
+    explains why two runs of the same question retrieved different things
+    was invisible in every trace and every checkpoint — the variance could
+    only be inferred from the answers.
+
+    A node can write state, so the decision is made once here and the two
+    conditional edges downstream read it instead of each recomputing it.
+    """
+
+    async def _route_node(state: KnowledgeAgentState) -> KnowledgeAgentState:
+        strategy = decide_strategy(state.structured_query, config=config)
+        query = state.structured_query
+        # Ontology vocabulary and a number — no customer text, so this stays
+        # safe to log while P0-4 (conversation state on stdout) is open.
+        logger.info(
+            "retrieval strategy=%s entity_type=%s attribute=%s relation=%s confidence=%.2f",
+            strategy,
+            getattr(query, "entity_type", None),
+            getattr(query, "attribute", None),
+            getattr(query, "relation_type", None),
+            getattr(query, "confidence", 0.0),
+        )
+        return {"retrieval_strategy": strategy}
+
+    return _route_node
+
+
+def _strategy_of(state: KnowledgeAgentState, config: KnowledgeAgentConfig) -> str:
+    """The strategy `route` recorded, recomputed only if it is missing.
+
+    The fallback keeps the edges usable when a test drives them directly
+    without running the `route` node first; in the compiled graph the value
+    is always present.
+    """
+    return state.retrieval_strategy or decide_strategy(state.structured_query, config=config)
+
+
 def make_decide_strategy_edge(*, config: KnowledgeAgentConfig) -> StrategyEdge:
     """Returns a LangGraph conditional-edge function: given the current
     state, returns the list of next node name(s) to route to — a single
@@ -185,8 +232,7 @@ def make_decide_strategy_edge(*, config: KnowledgeAgentConfig) -> StrategyEdge:
     field-disjoint, KnowledgeAgentState)."""
 
     def _decide_strategy_edge(state: KnowledgeAgentState) -> list[str]:
-        strategy = decide_strategy(state.structured_query, config=config)
-        return list(_STRATEGY_TO_NODE_NAMES[strategy])
+        return list(_STRATEGY_TO_NODE_NAMES[_strategy_of(state, config)])
 
     return _decide_strategy_edge
 
@@ -202,19 +248,21 @@ def make_structured_fallback_edge(*, config: KnowledgeAgentConfig) -> SingleEdge
     place the failure was visible was in the answer itself. See
     `hybrid.should_fall_back_to_vector` for the rule and the worked example.
 
-    The strategy is recomputed rather than read from state because
-    `decide_strategy` is pure and `structured_query` has not changed since the
-    routing decision; LangGraph conditional edges cannot write state, so
-    `KnowledgeAgentState.retrieval_strategy` is not populated to read back.
+    Reads the strategy the `route` node recorded (F5), so this edge and the
+    fan-out edge can never disagree about which plan is running.
 
-    Recomputing is also what makes this safe for the hybrid strategy, which
-    reaches this same edge: hybrid returns `"rank"` here because vector search
-    is already running alongside, so the fallback can never double-run it.
+    That is what makes this safe for the hybrid strategy, which reaches this
+    same edge: hybrid returns `"rank"` here because vector search is already
+    running alongside, so the fallback can never double-run it.
+
+    Since F5 removed structured-only as a routing outcome, this branch no
+    longer fires in the compiled graph. It is kept as a backstop for
+    `hybrid_retrieve`'s callers and against anything that routes there
+    again — see `hybrid.decide_strategy`.
     """
 
     def _structured_fallback_edge(state: KnowledgeAgentState) -> str:
-        strategy = decide_strategy(state.structured_query, config=config)
-        if should_fall_back_to_vector(strategy, state.structured_facts):
+        if should_fall_back_to_vector(_strategy_of(state, config), state.structured_facts):
             return _VECTOR_SEARCH_NODE
         return _RANK_NODE
 
@@ -233,9 +281,27 @@ def make_structured_lookup_node(*, session_factory: async_sessionmaker[AsyncSess
                 facts = await structured_lookup(state.structured_query, session=session)
             except GRACEFUL_STRUCTURED_MISSES:
                 facts = ()
+        # Filtered here, at the point the dump is produced, rather than
+        # downstream: ranking.py deliberately does not carry the originating
+        # StructuredQuery forward, and context_builder.py deliberately does
+        # not re-rank. An unslotted lookup returns everything known about the
+        # entity, and shipping that to the prompt caused refusals on questions
+        # the documentation answered (F4 — see fact_relevance.py).
+        facts = relevant_facts(
+            facts,
+            query=state.structured_query,
+            query_text=_rewritten_text(state),
+        )
         return {"structured_facts": facts}
 
     return _structured_lookup_node
+
+
+def _rewritten_text(state: KnowledgeAgentState) -> Optional[str]:
+    """The question as retrieval saw it, falling back to the raw query when
+    the rewrite stage was skipped (some tests drive nodes directly)."""
+    rewritten = state.rewritten_query
+    return getattr(rewritten, "rewritten_text", None) or state.raw_query
 
 
 # ==========================================================================

@@ -1,5 +1,8 @@
 # Crawler — Frontend Integration Guide
 
+> **Current.** Every endpoint documented here was verified against
+> `api/ingest.py` on 2026-09-06 and still matches.
+
 How the web frontend integrates with the AI Customer Assistant's document
 crawler/ingestion API. This covers every endpoint you need, the request/response
 shapes, and the recommended frontend flows.
