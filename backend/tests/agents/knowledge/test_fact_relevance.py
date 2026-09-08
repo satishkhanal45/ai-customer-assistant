@@ -18,6 +18,7 @@ nothing reads as evidence of absence.
 from __future__ import annotations
 
 import pytest
+from conftest import fake_session_factory
 
 from agents.knowledge.fact_relevance import (
     fact_terms,
@@ -167,8 +168,8 @@ class TestTheMatchingRule:
 
 
 class TestTheWholeRetrievalPathAppliesIt:
-    """The filter is worthless if the production path skips it. Both the
-    compiled graph's node and `hybrid_retrieve` must apply it."""
+    """The filter is worthless if the production path skips it — so it is
+    asserted on the node the graph runs and on the compiled graph itself."""
 
     async def test_the_structured_lookup_node_filters_the_dump(self, monkeypatch):
         from agents.knowledge import nodes
@@ -180,14 +181,7 @@ class TestTheWholeRetrievalPathAppliesIt:
 
         monkeypatch.setattr(nodes, "structured_lookup", _lookup)
 
-        class _Session:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *exc):
-                return False
-
-        node = nodes.make_structured_lookup_node(session_factory=lambda: _Session())
+        node = nodes.make_structured_lookup_node(session_factory=fake_session_factory())
         question = "What are the core values of the company?"
         state = KnowledgeAgentState(
             raw_query=question,
@@ -196,68 +190,6 @@ class TestTheWholeRetrievalPathAppliesIt:
         )
 
         assert (await node(state))["structured_facts"] == ()
-
-    async def test_hybrid_retrieve_filters_the_dump(self):
-        from agents.knowledge.config import KnowledgeAgentConfig
-        from agents.knowledge.hybrid import hybrid_retrieve
-        from agents.knowledge.types import RewrittenQuery
-
-        question = "What are the core values of the company?"
-
-        async def structured(query, *, session):
-            return THE_DUMP
-
-        async def vector(rewritten, *, config, session, embed_query):
-            return ()
-
-        result = await hybrid_retrieve(
-            UNSLOTTED,
-            RewrittenQuery(rewritten_text=question, original_text=question),
-            config=KnowledgeAgentConfig(), session=object(), embed_query=lambda t: (),
-            structured_lookup_fn=structured, vector_search_fn=vector,
-        )
-        assert result.structured_facts == ()
-
-    async def test_an_emptied_dump_now_triggers_the_semantic_fallback(self):
-        """A pleasing interaction with P1-6: a structured-only lookup whose
-        dump is entirely irrelevant now falls back to vector search instead of
-        poisoning the prompt with it."""
-        from agents.knowledge.config import KnowledgeAgentConfig
-        from agents.knowledge.hybrid import hybrid_retrieve
-        from agents.knowledge.types import ChunkProvenance, RetrievedChunk, RewrittenQuery
-
-        slotted_but_irrelevant = StructuredQuery(
-            entity_type="Company", entity_label="company", attribute=None,
-            relation_type=None, filters=(), confidence=0.9,
-        )
-        question = "What are the core values of the company?"
-        chunk = RetrievedChunk(
-            chunk_id="c1", chunk_text="our core values are integrity and ...",
-            similarity_score=0.6,
-            provenance=ChunkProvenance(
-                source_name="compnay_vision.pdf", source_type="EXTERNAL_INTEGRATION",
-                category_name=None, version_number=1, page=None, chunk_index=7,
-                entity_type=None, entity_label=None,
-            ),
-        )
-        called = []
-
-        async def structured(query, *, session):
-            return THE_DUMP
-
-        async def vector(rewritten, *, config, session, embed_query):
-            called.append("vector")
-            return (chunk,)
-
-        result = await hybrid_retrieve(
-            slotted_but_irrelevant,
-            RewrittenQuery(rewritten_text=question, original_text=question),
-            config=KnowledgeAgentConfig(), session=object(), embed_query=lambda t: (),
-            structured_lookup_fn=structured, vector_search_fn=vector,
-        )
-        assert result.structured_facts == ()
-        assert called == ["vector"]
-        assert result.retrieved_chunks == (chunk,)
 
     async def test_the_compiled_graph_falls_back_when_the_dump_is_filtered_out(
         self, monkeypatch
@@ -313,20 +245,13 @@ class TestTheWholeRetrievalPathAppliesIt:
             ),
         )
 
-        class _Session:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *exc):
-                return False
-
         config = KnowledgeAgentConfig()
         graph = build_knowledge_agent_graph(
             config=config,
             rewrite_llm_complete=lambda p: "{}",
             extraction_llm_complete=lambda p: "{}",
             answer_llm_complete=lambda s, u: "{}",
-            session_factory=lambda: _Session(),
+            session_factory=fake_session_factory(),
             embed_query=lambda text: (0.0,) * config.embedding_dimension,
         )
 

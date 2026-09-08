@@ -18,7 +18,7 @@ This is a **multi-agent RAG customer-support assistant** for Alpinist Studios, b
 |---|---|
 | Architecture & module design | **Strong.** Clean layering, dependency injection everywhere, pure functions separated from I/O, excellent docstrings. |
 | Feature completeness (MVP scope) | **~75%.** Chat, RAG, ingestion, crawling, graph browsing and ticket creation all work. Ticket status lookup and the admin surface do not. |
-| Test suite | **642 passing / 0 failing / 0 erroring / 2 skipped** (644 collected). **Fully green** — the Playwright browser is now installed, so the last non-deterministic gap is closed. |
+| Test suite | **638 passing / 0 failing / 0 erroring / 2 skipped** (640 collected). **Fully green** — the Playwright browser is now installed, so the last non-deterministic gap is closed. |
 | Production readiness | **One blocker left.** No authentication, no authorisation, `CORS: *` (P0-3). Conversation state no longer reaches the logs (P0-4). Secrets are no longer injected by import side effect (P0-2), and the client/server timeout ladder no longer inverts (P2-4). |
 | Scalability | **Much improved.** All four P1 items are fixed: pgvector-native retrieval, LLM calls off the event loop, one shared connection pool, and ingestion moved out of the web process into a worker service. Two pieces of per-process state that quietly broke horizontal scaling now live in the database (P2-5). |
 | Repo hygiene | **Good.** The duplicated ontology is gone (P2-1); dead files, the committed AI-assistant note, the crawl artefact and the committed debug values are all gone, and the README is real (P2-6). Only the stale branches are left, deliberately untouched. |
@@ -26,6 +26,10 @@ This is a **multi-agent RAG customer-support assistant** for Alpinist Studios, b
 **Every P0 except one, and the whole P1 and P2 tiers, are now fixed** — see the changelog. What remains is **P0-3**: no authentication, no authorisation, `CORS: *`, and an unguarded crawler that will fetch any URL it is given. It is now the single thing standing between this and a deployable internal product.
 
 ### Changelog
+
+**2026-09-06 — F8, `hybrid_retrieve` deleted.** It took a single `AsyncSession` while running both retrieval arms under `asyncio.gather`, so the one strategy it was named after raised `InvalidRequestError`. That was fixed with a session factory — and then the function was removed instead, because it had **no production callers** and duplicated four behaviours the compiled graph already implemented (strategy dispatch, graceful misses, the P1-6 fallback, the F4 filter), each of which had already needed matching edits in both copies. `hybrid.py` is now 151 lines of pure retrieval policy rather than 337. **Retrieval is unchanged**: verified live afterwards at `strategy=hybrid, facts=4, chunks=1` — hybrid search is a property of the graph's fan-out edge, not of the function named after it. Eleven test call sites moved onto the nodes and the compiled graph. Suite 645 → **638 passing**.
+
+**2026-09-06 — F8 (superseded), `hybrid_retrieve` made usable.** It took a single `AsyncSession` while running both retrieval arms under `asyncio.gather`, so the one strategy it is named after raised `InvalidRequestError` — and since F5 routes almost everything to hybrid, that was close to always. It now takes a session factory and opens one per arm, as `nodes.py` always has. Recorded honestly: this function has **no production callers** and duplicates orchestration the graph implements independently; deleting it was the alternative considered, and keeping it was a deliberate decision. The duplication has already cost double edits twice (P1-6, F4). Suite 642 → **645 passing**.
 
 **2026-09-06 — P0-4, conversation state off the logs.** `_log_node` printed the full Supervisor state on every node entry and exit — the customer's message, the whole history, and their email address inside the ticket confirmation — unconditionally, in the Docker image. Replaced by a `DEBUG`-level tracer that checks whether it is enabled *before* serialising, and redacts free text to a shape summary even when it is, so routing stays debuggable without reproducing what anyone said. `LOG_PII=true` is the deliberate opt-in. Verified with a turn carrying a card number and an email address: zero occurrences in the container log, and per-turn log volume down from hundreds of lines to 18. Suite 613 → **642 passing**.
 
@@ -85,10 +89,10 @@ cd backend && env -u PYTHONPATH ./.venv/bin/python -m pytest -q
 **Current, after every P0-1, P0-2, P0-4, P1, P2, P1-6, F1–F7 and F9 fix:**
 ```
 cd backend && env -u PYTHONPATH ./.venv/bin/python -m pytest -q
-→ 642 passed, 2 skipped in 57.80s
+→ 638 passed, 2 skipped in 59.63s
 ```
 
-Collected: 644 tests, **no failures and no errors**. The runtime also dropped from ~131s to ~58s: the two opt-in tests that were making real network calls on every run now skip correctly. The 1 failure and 4 errors that had persisted through every earlier report were all the same missing dependency — a Playwright browser, installed with `uv run playwright install chromium`. Nothing in the suite is non-deterministic.
+Collected: 640 tests, **no failures and no errors**. The runtime also dropped from ~131s to ~58s: the two opt-in tests that were making real network calls on every run now skip correctly. The 1 failure and 4 errors that had persisted through every earlier report were all the same missing dependency — a Playwright browser, installed with `uv run playwright install chromium`. Nothing in the suite is non-deterministic.
 
 ### Verified against the live stack
 

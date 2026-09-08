@@ -10,7 +10,7 @@ running the assembled system against a browser.
 ## Unreleased — 2026-09-06
 
 The test suite went from **268 passing with 10 failures and 6 errors** to
-**642 passing with none**, and the backend grew from ~14.8k to ~17k lines
+**638 passing with none**, and the backend grew from ~14.8k to ~17k lines
 while the tests roughly doubled to ~9.1k.
 
 ### Fixed — correctness
@@ -72,6 +72,12 @@ while the tests roughly doubled to ~9.1k.
 - **P2-5 — per-process state that broke horizontal scaling.** Ticket
   idempotency and crawl-discovery review moved into the database, where a
   second instance or a restart can see them.
+- **F8 — `hybrid_retrieve` removed.** It took a single database session while
+  running both arms concurrently, so the strategy it was named after raised.
+  Fixed with a session factory, then deleted outright: it had no production
+  callers and duplicated orchestration the compiled graph already implements.
+  Retrieval behaviour is unchanged — hybrid search lives in the graph's
+  fan-out edge, not in that function.
 - **F1 / F2 — the timeout ladder.** It bounded one node rather than a whole
   turn, so a request could run to ~76 s under a 60 s client budget; and one
   15 s ceiling for every LLM call was cutting off healthy answer generation.
@@ -120,6 +126,3 @@ while the tests roughly doubled to ~9.1k.
   blocker before any deployment (`status.md` P0-3).
 - Ticket status lookup, the admin API and prompt management are unbuilt.
 - No CI, no lint or type configuration, no rate limiting.
-- `hybrid_retrieve` accepts a single database session while its hybrid path
-  runs both arms concurrently; the compiled graph avoids this, a direct
-  caller would not (`test.md` F8).
