@@ -25,8 +25,8 @@ from agents.knowledge.config import KnowledgeAgentConfig
 from agents.knowledge.constants import STRATEGY_HYBRID, STRATEGY_STRUCTURED, STRATEGY_VECTOR
 from agents.knowledge.exceptions import EmptyRetrievalError, EntityNotFoundError
 from agents.knowledge.hybrid import (
+    _structured_only,
     decide_strategy,
-    hybrid_retrieve,
     should_fall_back_to_vector,
 )
 from agents.knowledge.types import (
@@ -100,14 +100,23 @@ class TestTheRule:
     def test_vector_only_never_falls_back(self):
         assert should_fall_back_to_vector(STRATEGY_VECTOR, ()) is False
 
-    def test_the_real_extraction_still_routes_to_structured_only(self, config):
-        """The fix must not work by accident — this query must still take the
-        structured-only branch, which is the branch that was broken."""
-        assert decide_strategy(THE_QUERY, config=config) == STRATEGY_STRUCTURED
+    def test_this_extraction_no_longer_routes_to_structured_only(self, config):
+        """Superseded by F5, and deliberately kept as the record of it.
+
+        This query used to take the structured-only branch — that is what
+        made P1-6 reachable. F5 removed the branch entirely, because routing
+        on the shape of a non-deterministic extraction meant the same
+        question retrieved differently on different runs. So the fallback
+        below is now a backstop rather than the production path.
+        """
+        assert decide_strategy(THE_QUERY, config=config) == STRATEGY_HYBRID
 
 
 class TestHybridRetrieve:
     async def test_an_empty_structured_lookup_retries_semantically(self, config):
+        """Driven through `_structured_only` directly: since F5 nothing
+        *routes* here, but the handler must still behave — `hybrid_retrieve`
+        is public and a caller can reach it."""
         calls = []
 
         async def structured(query, *, session):
@@ -118,7 +127,7 @@ class TestHybridRetrieve:
             calls.append("vector")
             return (_chunk(),)
 
-        result = await hybrid_retrieve(
+        result = await _structured_only(
             THE_QUERY, REWRITTEN, config=config, session=object(), embed_query=lambda t: (),
             structured_lookup_fn=structured, vector_search_fn=vector,
         )
@@ -137,7 +146,7 @@ class TestHybridRetrieve:
         async def vector(rewritten, *, config, session, embed_query):
             return (_chunk(),)
 
-        result = await hybrid_retrieve(
+        result = await _structured_only(
             THE_QUERY, REWRITTEN, config=config, session=object(), embed_query=lambda t: (),
             structured_lookup_fn=structured, vector_search_fn=vector,
         )
@@ -154,7 +163,7 @@ class TestHybridRetrieve:
             called.append("vector")
             return (_chunk(),)
 
-        result = await hybrid_retrieve(
+        result = await _structured_only(
             THE_QUERY, REWRITTEN, config=config, session=object(), embed_query=lambda t: (),
             structured_lookup_fn=structured, vector_search_fn=vector,
         )
@@ -173,7 +182,7 @@ class TestHybridRetrieve:
             raise EmptyRetrievalError(message="nothing cleared the threshold",
                                       query_text="q", top_k=8)
 
-        result = await hybrid_retrieve(
+        result = await _structured_only(
             THE_QUERY, REWRITTEN, config=config, session=object(), embed_query=lambda t: (),
             structured_lookup_fn=structured, vector_search_fn=vector,
         )
@@ -192,7 +201,7 @@ class TestHybridRetrieve:
             return (_chunk(),)
 
         with pytest.raises(RuntimeError, match="connection reset"):
-            await hybrid_retrieve(
+            await _structured_only(
                 THE_QUERY, REWRITTEN, config=config, session=object(), embed_query=lambda t: (),
                 structured_lookup_fn=structured, vector_search_fn=vector,
             )
@@ -203,12 +212,16 @@ class TestTheConditionalEdge:
     not on the production path at all."""
 
     def test_routes_to_vector_search_when_structured_found_nothing(self, config):
+        """The strategy is declared in state (F5's `route` node writes it),
+        so the backstop can still be exercised even though the graph no
+        longer routes anything to structured-only."""
         from agents.knowledge.nodes import make_structured_fallback_edge
         from agents.knowledge.state import KnowledgeAgentState
 
         edge = make_structured_fallback_edge(config=config)
         state = KnowledgeAgentState(
-            raw_query="q", structured_query=THE_QUERY, structured_facts=()
+            raw_query="q", structured_query=THE_QUERY, structured_facts=(),
+            retrieval_strategy=STRATEGY_STRUCTURED,
         )
         assert edge(state) == "vector_search"
 
@@ -334,13 +347,23 @@ class TestTheCompiledGraph:
         assert "hybrid and remote" in context.documentation_section
         assert context.cited_provenance, "the chunk must be citable, not just present"
 
-    async def test_the_graph_skips_vector_search_when_facts_were_found(
+    async def test_the_graph_always_runs_semantic_search_alongside(
         self, monkeypatch, config
     ):
+        """Superseded by F5, and kept as the record of the change.
+
+        This used to assert that a successful structured lookup *skipped*
+        vector search. That skip was the variance: whether a question got
+        documentation depended on the shape of a non-deterministic
+        extraction. Both arms now always run, concurrently, and the
+        fallback edge sends hybrid straight to `rank` so vector search is
+        still reached exactly once.
+        """
         graph, visited = self._build(
             monkeypatch, facts=(_fact(),), chunks=(_chunk(),), config=config
         )
 
         await graph.ainvoke({"raw_query": "q", "conversation_history": ()})
 
-        assert visited == ["structured_lookup"]
+        assert sorted(visited) == ["structured_lookup", "vector_search"]
+        assert visited.count("vector_search") == 1, "vector search ran twice for one query"

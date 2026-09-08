@@ -8,15 +8,21 @@ far has proven that by construction.
 
 Topology:
 
-    rewrite -> extract -> [decide_strategy conditional edge]
-        -> structured_lookup                          (structured)
+    rewrite -> extract -> route -> [decide_strategy conditional edge]
         -> vector_search                               (vector)
         -> structured_lookup + vector_search (parallel) (hybrid)
 
     structured_lookup -> [structured_fallback conditional edge]
-        -> vector_search   (structured-only strategy that found nothing)
+        -> vector_search   (a structured-only lookup that found nothing)
         -> rank            (otherwise)
     vector_search -> rank
+
+The `route` node records the chosen strategy in state so both conditional
+edges read one decision rather than each recomputing it, and so the choice
+is visible in traces (F5). Note that `decide_strategy` no longer returns
+structured-*only*: semantic search runs whenever an entity lookup does, so
+the answer cannot depend on the exact shape of a non-deterministic
+extraction. The fallback edge is retained as a backstop.
 
     rank -> deduplicate -> build_context -> build_prompt -> llm -> END
 
@@ -58,6 +64,7 @@ from .nodes import (
     make_llm_node,
     make_rank_node,
     make_rewrite_node,
+    make_route_node,
     make_structured_fallback_edge,
     make_structured_lookup_node,
     make_vector_search_node,
@@ -66,6 +73,7 @@ from .rewriting import LLMCompletion as RewriteLLMCompletion
 from .state import KnowledgeAgentState
 from .vector_search import EmbeddingFunction
 
+_ROUTE = "route"
 _STRUCTURED_LOOKUP = "structured_lookup"
 _VECTOR_SEARCH = "vector_search"
 
@@ -96,6 +104,7 @@ def build_knowledge_agent_graph(
 
     graph.add_node("rewrite", make_rewrite_node(config=config, llm_complete=rewrite_llm_complete))
     graph.add_node("extract", make_extract_node(config=config, llm_complete=extraction_llm_complete))
+    graph.add_node(_ROUTE, make_route_node(config=config))
     graph.add_node(_STRUCTURED_LOOKUP, make_structured_lookup_node(session_factory=session_factory))
     graph.add_node(
         _VECTOR_SEARCH,
@@ -109,12 +118,18 @@ def build_knowledge_agent_graph(
 
     graph.set_entry_point("rewrite")
     graph.add_edge("rewrite", "extract")
+    graph.add_edge("extract", _ROUTE)
 
-    # Conditional fan-out: returns one or both of the two retrieval
-    # node names depending on decide_strategy's structured/vector/
-    # hybrid decision (see hybrid.py + nodes.py's routing table).
+    # Conditional fan-out: returns one or both of the two retrieval node
+    # names for the strategy `route` just recorded (see hybrid.py +
+    # nodes.py's routing table).
+    #
+    # `route` is a node rather than part of the edge because an edge cannot
+    # write state, and the decision needs to be *visible* — it is the single
+    # thing that explains why two runs of one question retrieved differently
+    # (F5), and it used to appear nowhere at all.
     graph.add_conditional_edges(
-        "extract",
+        _ROUTE,
         make_decide_strategy_edge(config=config),
         [_STRUCTURED_LOOKUP, _VECTOR_SEARCH],
     )

@@ -1,5 +1,11 @@
 # Agent Integration Plan — Supervisor · Knowledge · Ticket · Safety
 
+> **Historical — the plan, not the outcome.** Its status line ("Phase 1
+> complete, Phases 2-6 planning only") is long out of date: all six phases
+> were built, and a number of decisions here were later changed with
+> evidence — the retrieval thresholds, the routing strategy, and the
+> deduplication behaviour among them. See `status.md` and `test.md`.
+
 Status: **Phase 1 complete and merged. Phases 2-6 remain planning only.**
 Scope: `backend/src/ai_customer_assistant/agents/` plus the layers that will
 eventually call it (`services/chat_service.py`, `api/routes.py`, `main.py`).

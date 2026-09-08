@@ -278,10 +278,19 @@
     if (busy && !typing) {
       roots.messages.appendChild(NS.utils.el('div', { class: 'msg-row assistant msg-typing' },
         '<div class="msg-avatar">' + ICON_BOT + '</div>' +
-        '<div class="msg-col"><div class="msg-bubble"><div class="typing-indicator"><span></span><span></span><span></span></div></div></div>'));
+        '<div class="msg-col"><div class="msg-bubble"><div class="typing-indicator"><span></span><span></span><span></span></div>' +
+        '<div class="typing-stage"></div></div></div>'));
       roots.messages.scrollTop = roots.messages.scrollHeight;
     }
     if (!busy && typing) typing.remove();
+  }
+
+  /* Replace the animated ellipsis with what the server is actually doing.
+   * A median turn takes about 35 seconds; without this the customer has no
+   * way to tell a working system from a hung one. */
+  function setStage(label) {
+    var stage = roots.messages.querySelector('.msg-typing .typing-stage');
+    if (stage) stage.textContent = label || '';
   }
 
   function sendMessage() {
@@ -304,23 +313,68 @@
     send(t.id, value);
   }
 
+  function appendReply(threadId, reply, traceId, citations) {
+    var t = ensureThread(threadId);
+    t.messages.push({ role: 'assistant', content: reply || '', traceId: traceId, citations: citations || [] });
+    t.updatedAt = Date.now();
+    save();
+    if (activeId === threadId) { renderThreadList(); renderMessages(); }
+    setBusy(false);
+  }
+
+  function appendFailure(threadId, message, err) {
+    var t = ensureThread(threadId);
+    t.messages.push({
+      role: 'assistant',
+      content: 'Error: ' + ((err && err.message) || 'request failed'),
+      error: true, retriable: true, resendMessage: message
+    });
+    t.updatedAt = Date.now();
+    save();
+    if (activeId === threadId) { renderThreadList(); renderMessages(); }
+    setBusy(false);
+    NS.utils.status('Chat request failed', true);
+  }
+
+  /* The buffered endpoint. Kept as the fallback for browsers without a
+   * readable response body, and for any failure to open the stream. */
+  function sendBuffered(threadId, message) {
+    NS.api.post('/chat', { thread_id: threadId, message: message }, { timeout: CHAT_REQUEST_TIMEOUT_MS })
+      .then(function (res) { appendReply(threadId, res.reply, res.trace_id, res.citations); })
+      .catch(function (err) { appendFailure(threadId, message, err); });
+  }
+
   function send(threadId, message) {
     setBusy(true);
-    NS.api.post('/chat', { thread_id: threadId, message: message }, { timeout: CHAT_REQUEST_TIMEOUT_MS }).then(function (res) {
-      var t = ensureThread(threadId);
-      t.messages.push({ role: 'assistant', content: res.reply || '', traceId: res.trace_id, citations: res.citations || [] });
-      t.updatedAt = Date.now();
-      save();
-      if (activeId === threadId) { renderThreadList(); renderMessages(); }
-      setBusy(false);
+    setStage('Sending…');
+
+    if (!NS.api.stream || typeof fetch !== 'function') { sendBuffered(threadId, message); return; }
+
+    var settled = false;
+    var traceId = null;
+
+    NS.api.stream('/chat/stream', { thread_id: threadId, message: message }, {
+      onEvent: function (event) {
+        if (!event || !event.type) return;
+        if (event.trace_id) traceId = event.trace_id;
+        if (event.type === 'stage') { setStage(event.label); return; }
+        // A heartbeat carries no news; it exists so the client can tell a
+        // slow turn from a dead connection. Nothing to show for it.
+        if (event.type === 'heartbeat') return;
+        if (event.type === 'result' || event.type === 'error') {
+          settled = true;
+          appendReply(threadId, event.reply, traceId, event.citations);
+        }
+      }
+    }).then(function () {
+      // The stream can only close without a terminal event if the server
+      // died mid-turn; the buffered path would have surfaced that as an
+      // error, so surface it here too rather than leaving the spinner up.
+      if (!settled) appendFailure(threadId, message, new Error('the connection closed before an answer arrived'));
     }).catch(function (err) {
-      var t = ensureThread(threadId);
-      t.messages.push({ role: 'assistant', content: 'Error: ' + (err.message || 'request failed'), error: true, retriable: true, resendMessage: message });
-      t.updatedAt = Date.now();
-      save();
-      if (activeId === threadId) { renderThreadList(); renderMessages(); }
-      setBusy(false);
-      NS.utils.status('Chat request failed', true);
+      if (settled) return;
+      if (err && err.unsupported) { sendBuffered(threadId, message); return; }
+      appendFailure(threadId, message, err);
     });
   }
 

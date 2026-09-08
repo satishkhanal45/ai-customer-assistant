@@ -1,5 +1,11 @@
 # Project Scope — AI Customer Assistant
 
+> **Historical — the original MVP scope, August 2026.** Kept as a record of
+> what was planned. Several items listed here as out of scope were built
+> anyway (query rewriting), and the sibling documents it references
+> (`rag_plan.md`, `schema.md`, `architecture_diagrams.md`) are not in this
+> repository. For the architecture as actually built, see `status.md` §3.
+
 Source: `supervisor_plan.md`. This document restates the MVP boundary in one place and gives a
 single high-level picture of the system, deliberately kept to the components named for it —
 detailed views of each box live in `architecture_diagrams.md`, `workflow_of_ingestion.md`,

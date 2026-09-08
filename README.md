@@ -13,6 +13,18 @@ classifies each message and routes it to one of two agents:
 Ingested documents are stored twice: as 768-dimension embeddings in
 `embedding_chunk` (pgvector) for semantic search, and as an entity /
 attribute / value / relation knowledge graph for exact structured lookups.
+A question that names something the graph knows searches **both at once**,
+concurrently, and the answer prompt gets the two as separate sections.
+
+## The chat API
+
+| Endpoint | Shape |
+|---|---|
+| `POST /chat/stream` | Server-sent events: a `trace_id`, then progress stages, heartbeats, and the answer. What the UI uses — a turn takes tens of seconds and this is what makes that legible. |
+| `POST /chat` | One buffered JSON response. Unchanged, and the fallback when streaming is unavailable. |
+
+Both take `{"thread_id": ..., "message": ...}` and produce the same answer;
+history lives server-side behind the checkpointer, keyed by `thread_id`.
 
 ---
 
@@ -46,7 +58,7 @@ cd backend && uv run alembic upgrade head && cd ..
 # 4. Create the service account that ingestion attributes documents to.
 make user
 
-# 5. Open the chat UI (http://127.0.0.1:8000/#/chat).
+# 5. Open the chat UI. `make` reads the port from APP_PORT in ./.env.
 make frontend
 ```
 
@@ -96,18 +108,18 @@ and the app dies with `ModuleNotFoundError: No module named 'pgvector'`.
 
 Nothing can be answered until something is ingested. Every path below only
 *enqueues* a job — the worker does the real work, so watch `make logs` or poll
-`GET /ingest/jobs/{job_id}`.
+`GET /ingest/jobs/{job_id}`. The examples below assume `APP_PORT` is exported from `./.env`.
 
 **Upload a file** (PDF, DOCX or Markdown):
 
 ```bash
-curl -F 'file=@handbook.pdf' http://127.0.0.1:8000/ingest/upload
+curl -F 'file=@handbook.pdf' http://127.0.0.1:$APP_PORT/ingest/upload
 ```
 
 **Crawl a single page:**
 
 ```bash
-curl -X POST http://127.0.0.1:8000/ingest/crawl \
+curl -X POST http://127.0.0.1:$APP_PORT/ingest/crawl \
   -H 'Content-Type: application/json' \
   -d '{"url": "https://example.com/docs", "scope": "PAGE"}'
 ```
@@ -126,11 +138,11 @@ A site crawl is always two steps, so nothing is ingested without review:
 
 ```bash
 # 1. Discover. Returns a discovery_id and the list of pages found.
-curl -X POST http://127.0.0.1:8000/ingest/crawl/discover \
+curl -X POST http://127.0.0.1:$APP_PORT/ingest/crawl/discover \
   -H 'Content-Type: application/json' -d '{"root_url": "https://example.com"}'
 
 # 2. Confirm. Crawls and ingests that list.
-curl -X POST http://127.0.0.1:8000/ingest/crawl/{discovery_id}/confirm \
+curl -X POST http://127.0.0.1:$APP_PORT/ingest/crawl/{discovery_id}/confirm \
   -H 'Content-Type: application/json' -d '{}'
 ```
 
@@ -145,8 +157,18 @@ make test                                  # whole suite
 make test PYTEST_ARGS='-q tests/agents'    # one directory
 ```
 
-Tests that need a live Postgres, a Groq key, or a Playwright browser skip
-themselves when those are absent, so a bare checkout still goes green.
+**642 passing, no failures or errors.** Use `make test` rather than a bare
+`pytest`: an activated conda environment shadows the project's interpreter and
+produces two dozen spurious collection errors. `make test` invokes
+`backend/.venv`'s Python by absolute path.
+
+Tests that need a live Postgres or a Groq key skip themselves when those are
+absent, so a bare checkout still goes green. The crawler tests additionally
+need a Chromium binary:
+
+```bash
+cd backend && uv run playwright install chromium
+```
 
 ---
 
@@ -170,8 +192,22 @@ frontend/                  the chat UI and knowledge-graph explorer
 status.md                  detailed project status, known problems, roadmap
 ```
 
-`status.md` is the honest, current assessment of what works, what does not,
-and what is planned — start there before changing anything substantial.
+---
+
+## Which documents to trust
+
+| File | What it is |
+|---|---|
+| `status.md` | **Current.** What works, what does not, every fixed and open problem with the evidence behind it. Start here before changing anything substantial. |
+| `test.md` | **Current.** A live end-to-end test of the running app through a real browser, and the nine defects it found. Read it for how the system behaves under load rather than in tests. |
+| `CHANGELOG.md` | **Current.** Release-shaped summary of the same work. |
+| `frontend/crawler_frontend_integration.md` | **Current.** Every ingestion endpoint in it was re-verified against `api/ingest.py`. |
+| `docs/architecture.md`, `docs/agents_integration_plan*.md`, `docs/agent implementation and integration.md`, `frontend/frontend_plan.md` | **Historical.** The original design and planning documents, each now carrying a banner saying so. They describe what was *intended*, not what was built — several decisions were later made differently, and a few were reversed with evidence. Kept as a record. |
+| `docs/pricing.md` | Not documentation — it is source content for the knowledge base. |
+
+Configuration is documented in `status.md` §9 — the timeout ladder, retrieval
+thresholds, and logging controls all have working defaults and are listed
+there because most of them are load-bearing.
 
 ---
 
@@ -179,4 +215,14 @@ and what is planned — start there before changing anything substantial.
 
 **There is no authentication.** Every endpoint is open, CORS allows all
 origins, and `POST /ingest/crawl` will fetch any URL it is given. Do not
-expose this to the internet as it stands. See `status.md` for the full list.
+expose this to the internet as it stands. This is the single blocker between
+the project and an internal deployment; `status.md` P0-3 has the detail.
+
+**Answer latency is tens of seconds**, dominated by four sequential LLM
+calls, not by retrieval — retrieval measures 0.14–0.24 s. `/chat/stream`
+makes that legible rather than shorter.
+
+**The free-tier Groq quota is shared between ingestion and chat.** A worker
+draining an ingestion backlog will make the assistant return "I'm handling
+more requests than I can keep up with". Stop the worker when demonstrating
+the chat.
