@@ -10,8 +10,8 @@ running the assembled system against a browser.
 ## Unreleased — 2026-09-06
 
 The test suite went from **268 passing with 10 failures and 6 errors** to
-**638 passing with none**, and the backend grew from ~14.8k to ~17k lines
-while the tests roughly doubled to ~9.1k.
+**759 passing with none**, and the backend grew from ~14.8k to ~18k lines
+while the tests more than doubled.
 
 ### Fixed — correctness
 
@@ -87,6 +87,41 @@ while the tests roughly doubled to ~9.1k.
 
 ### Fixed — security and privacy
 
+- **P0-3 — the API was entirely open.** All 13 endpoints were anonymous,
+  `CORS` allowed every origin, and `POST /ingest/crawl` would fetch any URL a
+  caller named — including `http://169.254.169.254/`, which is a
+  server-side request forgery yielding cloud credentials in one request.
+  Nothing was attributable: `_uploaded_by()` hardcoded the service account.
+
+  Now: JWT (HS256), a 15-minute access token and a 14-day **rotating**
+  refresh token whose id is stored so it can be revoked; `HttpOnly; Secure;
+  SameSite=Strict` cookies for the browser and `Authorization: Bearer` for
+  scripts, through one verifier; Argon2id passwords; two roles, `member` and
+  `admin`. `/chat` is authenticated — this is an internal tool, and every
+  turn spends Groq tokens against a shared daily budget. The public surface
+  is exactly `/health`, `/auth/login` and `/auth/refresh`, and a test
+  enumerates the assembled app to assert that every other route refuses an
+  anonymous caller.
+
+  The SSRF guard sits at the crawler's fetch boundary rather than only at the
+  API, because a site is crawled by following its links: a link on a public
+  page pointing at an intranet host went through the same code path.
+  Redirects are now walked one hop at a time — `follow_redirects=True` was
+  the bypass. Rate limiting is per authenticated user, counted in the
+  database rather than in a process dict, which is the defect P2-5 already
+  fixed twice elsewhere.
+
+  Two security-relevant writes needed explicit commits, both found by tests
+  asserting the consequence rather than the status code: revoking every
+  session on detecting a replayed refresh token, and incrementing the login
+  counter. Both happen on the way to an error response, and `get_session`
+  rolls back when a handler raises — so the response to a *detected token
+  theft* was being silently undone, and the fifth wrong password was as
+  unthrottled as the first.
+
+  Migration `8e5a3c9d21f7`, additive: four columns on `app_user`, plus
+  `refresh_token` and `rate_limit_bucket`. Design and the five places the
+  implementation departed from it: `authentication_implementation.md`.
 - **P0-4 — full conversation state printed to stdout.** Every node entry and
   exit printed the customer's message, the whole history, and their email
   address, unconditionally, in the Docker image. Replaced by a `DEBUG`-level
@@ -119,10 +154,43 @@ while the tests roughly doubled to ~9.1k.
 - Migration `3d6f8b2c17ae` — `ticket.idempotency_key` with a unique
   constraint, and the `crawl_discovery` table.
 
+### Added — admin API
+
+- `GET /admin/knowledge-sources`, `/admin/jobs`, `/admin/stats`,
+  `/admin/tickets` (`api/admin.py`), admin-only. The frontend's Admin page
+  had shown "Endpoint not available yet" on all four tabs since it was
+  written; the data was always in the database. Each returns
+  `{ <list>, total, limit, offset }` rather than a bare array, so a caller
+  can tell "all of it" from "the first page of it".
+- `/admin/stats` also backs the Overview figures, which previously showed a
+  dash for two of four cards and reported a capped `/graph/search` result
+  as if it were an entity total.
+- `ingestion/storage/api.py` stays unregistered, now as a decision rather
+  than a gap: it is an upload path duplicating `POST /ingest/upload`, not
+  the read surface the page needed.
+
+### Added — authentication
+
+- `auth/` — `tokens.py`, `passwords.py`, `roles.py`, `cookies.py`,
+  `dependencies.py`, `models.py`, `router.py`, `rate_limit.py`, `ssrf.py`.
+- `POST /auth/login`, `/auth/refresh`, `/auth/logout`, `GET /auth/me`,
+  `POST /auth/users` (admin only).
+- `scripts/create_user.py` — bootstraps the first admin; there is no
+  self-signup.
+- `frontend/src/session.js` and `src/pages/login.js`; the API client now
+  refreshes and replays once on a 401, through a single shared in-flight
+  refresh. That coalescing is required rather than an optimisation:
+  refresh tokens rotate, so four parallel refreshes would have looked like a
+  stolen token being replayed and logged the user out.
+- Migration `8e5a3c9d21f7`.
+
 ### Known limitations
 
-- **No authentication.** Every endpoint is anonymous, CORS allows all
-  origins, and the crawler will fetch any URL it is given. This is the one
-  blocker before any deployment (`status.md` P0-3).
-- Ticket status lookup, the admin API and prompt management are unbuilt.
-- No CI, no lint or type configuration, no rate limiting.
+- **The SSRF guard cannot pin a connection to the address it validated** —
+  `httpx` offers no supported way, and the workaround breaks certificate
+  verification. It re-checks the peer address and discards the response
+  instead, so a *blind* request to an internal host remains possible for an
+  authenticated caller. Documented in `auth/ssrf.py`.
+- Ticket status lookup, the admin API and prompt management are unbuilt —
+  which is why the `admin` role currently gates only account creation.
+- No CI, no lint or type configuration.

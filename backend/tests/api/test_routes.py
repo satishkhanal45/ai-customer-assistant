@@ -34,9 +34,18 @@ class _CreateTicketClient(StubSupervisorLLMClient):
 
 
 @pytest.fixture
-def app():
+def app(as_role):
+    """The chat router with a signed-in member.
+
+    `/chat` and `/chat/stream` require authentication since P0-3 -- this is
+    an internal tool, and every turn spends Groq tokens against a shared
+    daily budget. These tests are about the turn, not about the credential,
+    so `as_role` supplies one. That the endpoints refuse an anonymous caller
+    is asserted in `tests/api/test_route_protection.py`.
+    """
     app = FastAPI()
     app.include_router(router)
+    as_role(app)
     return app
 
 

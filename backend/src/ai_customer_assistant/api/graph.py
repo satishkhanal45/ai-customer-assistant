@@ -5,7 +5,8 @@ result into a Pydantic response model, return it. No query logic lives in
 this file -- if you find yourself writing a WHERE clause here, it belongs
 in queries.py instead.
 
-All GET, all read-only -- no auth/mutation concerns to design around yet.
+All GET, all read-only. Read-only, but not public: every route here
+requires an authenticated `member` (see the router construction below).
 
 Sessions come from `db.engine`, the single shared engine for the process.
 This module previously built its own engine and sessionmaker at import
@@ -21,6 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from auth.dependencies import require_member
 from db.engine import get_session
 from ingestion.graph.queries import (
     EntityDetail,
@@ -35,7 +37,14 @@ from ingestion.graph.queries import (
     get_neighbors,
 )
 
-router = APIRouter(prefix="/graph", tags=["graph"])
+# Read-only is not the same as harmless. These six endpoints walk the entire
+# internal knowledge graph -- every entity, attribute and relationship
+# extracted from the company's documents -- which makes them a far more
+# efficient way to exfiltrate the corpus than asking the chatbot five hundred
+# questions. Hence `member`, not public.
+router = APIRouter(
+    prefix="/graph", tags=["graph"], dependencies=[Depends(require_member)]
+)
 
 
 # ---------------------------------------------------------------------------
