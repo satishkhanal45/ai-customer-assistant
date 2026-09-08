@@ -21,9 +21,12 @@ from config import load_env
 
 load_env()
 
+from api.admin import router as admin_router  # noqa: E402
 from api.graph import router as graph_router  # noqa: E402
 from api.ingest import router as ingest_router  # noqa: E402
 from api.routes import router  # noqa: E402
+from auth.router import router as auth_router  # noqa: E402
+from auth.tokens import auth_secret  # noqa: E402
 from db.checkpointer import build_checkpointer  # noqa: E402
 from db.engine import dispose_engine, get_session_factory  # noqa: E402
 from logging_config import configure_logging  # noqa: E402
@@ -35,6 +38,12 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
+    # Fail at boot, not at the first login attempt. A process serving
+    # protected routes without a signing secret is not degraded, it is
+    # unauthenticated -- and the hour someone discovers that should not be
+    # whenever the first person happens to try to sign in. Same discipline as
+    # timeouts.assert_ladder_is_consistent().
+    auth_secret()
     checkpointer = await build_checkpointer()
     # Phase 6 wiring: the real Knowledge graph is compiled only when BOTH the
     # shared BGE instance and the async session factory are passed in.
@@ -59,14 +68,33 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="AI Customer Assistant", lifespan=lifespan)
 
-# Cross-origin access for the frontend (opened from file:// or a dev static
-# server). Restrict allow_origins in production as needed.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+# Cross-origin access.
+#
+# The default is *none*, and that is not a restriction on anything the app
+# does: `StaticFiles` below serves the frontend from this very origin, so
+# every request the browser app makes is same-origin and never consults CORS
+# at all. The previous `allow_origins=["*"]` was therefore enabling nothing
+# and exposing everything -- it invited any page on the internet to call this
+# API with the visitor's session.
+#
+# `CORS_ALLOW_ORIGINS` is a comma-separated allowlist for the case that
+# genuinely needs it: a frontend served from somewhere else. `allow_credentials`
+# is on because the session is a cookie, and the CORS specification forbids
+# combining that with a wildcard -- so an explicit list is not merely
+# preferable here, it is the only thing that works.
+_CORS_ORIGINS = tuple(
+    origin.strip()
+    for origin in os.environ.get("CORS_ALLOW_ORIGINS", "").split(",")
+    if origin.strip()
 )
+if _CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(_CORS_ORIGINS),
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "Accept"],
+    )
 
 
 class _NoCacheMiddleware(BaseHTTPMiddleware):
@@ -82,15 +110,24 @@ class _NoCacheMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(_NoCacheMiddleware)
 
-# Chat (registered first — owns POST /chat)
+# Authentication: login, refresh, logout, me, and admin account creation.
+# Registered first because everything below depends on it.
+app.include_router(auth_router)
+# Chat (owns POST /chat) — requires an authenticated member
 app.include_router(router)
 # Read-only knowledge-graph browsing (powers frontend/graph_viewer*.html)
 app.include_router(graph_router)
 # Document ingestion: multipart upload + URL crawl
 app.include_router(ingest_router)
-# NOTE: ingestion.storage.api (/admin/knowledge-sources) is NOT registered yet —
-#       its get_storage_config / get_db_session / get_current_admin_user_id
-#       dependencies still raise NotImplementedError (storage/api.py:62-83).
+# Admin read surface: sources, jobs, stats, tickets. Admin-only.
+app.include_router(admin_router)
+# NOTE: ingestion.storage.api is still NOT registered, and that is now a
+#       decision rather than a gap. It is a *write* path — a second
+#       `POST /admin/knowledge-sources` upload — duplicating
+#       `POST /ingest/upload`, which is what the Ingest page calls and what
+#       the worker pipeline is built around. Its three placeholder
+#       dependencies still raise NotImplementedError. The read endpoints
+#       the Admin page needed live in api/admin.py instead.
 
 
 @app.get("/health")

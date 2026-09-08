@@ -25,12 +25,23 @@ import json
 import uuid
 from typing import AsyncIterator
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 
+from auth.dependencies import enforce_chat_quota
 from schemas.chat import ChatRequest, ChatResponse
 
-router = APIRouter(tags=["chat"])
+# Chat is authenticated. This is an internal support tool, not a public
+# widget: the corpus is the company's own documents, tickets collect an
+# email address for follow-up, and every turn spends Groq tokens against a
+# daily budget that one developer exhausted repeatedly during testing.
+# Authentication bounds who can spend it; `enforce_chat_quota` bounds how
+# much any one of them can.
+#
+# If a customer-facing surface is ever wanted, the right shape is a separate
+# endpoint with its own retrieval scope -- not a relaxation of this one,
+# which would silently expose the internal corpus.
+router = APIRouter(tags=["chat"], dependencies=[Depends(enforce_chat_quota)])
 
 
 @router.post("/chat", response_model=ChatResponse)

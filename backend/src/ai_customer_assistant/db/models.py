@@ -134,19 +134,118 @@ class Relation(Base):
 
 
 class AppUser(Base):
-    """
-    ASSUMPTION: minimal stand-in for the `user` table referenced by
-    knowledge_source.uploaded_by, which the schema doc mentions but does
-    not define. Swap this for your real user/auth model if one already
-    exists.
+    """A person (or service account) who can be attributed work.
+
+    Originally a minimal stand-in for the `user` table that
+    `knowledge_source.uploaded_by` references. P0-3 turned it into the real
+    identity table by adding the four columns below; the original three are
+    unchanged, so existing rows and foreign keys were untouched by that
+    migration.
+
+    `password_hash` is nullable on purpose. The seeded service account
+    (`00000000-...-0000`) has none because it never logs in, and
+    `auth.passwords.verify_or_dummy` is written so that authenticating
+    against a null hash costs exactly what a wrong password costs -- an
+    endpoint that rejects a passwordless account faster than a real one has
+    told the caller which accounts exist.
     """
 
     __tablename__ = "app_user"
 
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
+    # Both defaults on purpose. `server_default` is what a plain SQL INSERT
+    # (a migration, a psql session) gets; `default` is what the ORM uses, and
+    # it keeps this insert portable to backends without gen_random_uuid --
+    # which is what lets the account-creation path be tested against SQLite
+    # rather than mocked.
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=func.gen_random_uuid(),
+    )
     email: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     is_service_account: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(nullable=False, server_default=func.now())
+    # Argon2id, parameters embedded in the string. See auth/passwords.py.
+    password_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Ordered value, never an is_admin boolean -- see auth/roles.py for why.
+    role: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="member"
+    )
+    # Offboarding without deleting the row, so historical attribution on
+    # knowledge_source.uploaded_by keeps resolving to a real person.
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="true"
+    )
+    last_login_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class RefreshToken(Base):
+    """One issued refresh token, so that it can be revoked.
+
+    Access tokens are stateless and short-lived; refresh tokens are stateful
+    precisely so logout and revocation do something. Without a row here,
+    "log out" would only delete the browser's copy, and a stolen token would
+    stay valid for its full fourteen days.
+
+    Refresh is *rotating*: presenting a refresh token revokes it and issues a
+    new pair. So a token being presented twice means either a race or a
+    theft, and this table is what makes the difference observable --
+    `revoked_at` is already set on the second presentation. The router treats
+    that as compromise and revokes every token for the user, which logs the
+    thief and the victim out together and forces a password-backed login.
+
+    Rows are small and expire on their own; `expires_at` is indexed so a
+    sweep can delete the dead ones in one statement.
+    """
+
+    __tablename__ = "refresh_token"
+
+    # The token's `jti` claim. Storing the id rather than the token means a
+    # database leak does not hand over usable credentials.
+    jti: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("app_user.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    issued_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Free-text, truncated, and only ever shown back to the account's owner.
+    # Enough to answer "was that me?" on a session list; deliberately not a
+    # fingerprint.
+    user_agent: Mapped[str | None] = mapped_column(String(256), nullable=True)
+
+
+class RateLimitBucket(Base):
+    """One fixed window of one rate-limit key.
+
+    In the database rather than in a dict, for the reason P2-5 already
+    established for ticket idempotency and crawl discovery: a counter held
+    in process memory is per-instance, so N instances multiply every limit by
+    N and a restart forgets that anyone was ever throttled. A limiter with
+    those properties is not a limit.
+
+    The primary key is (key, window_start), which is what makes the increment
+    a single atomic `INSERT ... ON CONFLICT DO UPDATE ... RETURNING`. Two
+    concurrent requests cannot both read 4 and both write 5.
+    """
+
+    __tablename__ = "rate_limit_bucket"
+
+    # "<scope>:<principal>", e.g. "chat:9f1e...", "login-ip:203.0.113.4".
+    key: Mapped[str] = mapped_column(String(200), primary_key=True)
+    window_start: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), primary_key=True
+    )
+    count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
 
 
 class KnowledgeCategory(Base):
@@ -241,7 +340,15 @@ class KnowledgeSourceVersion(Base):
     mime_type: Mapped[str | None] = mapped_column(Text, nullable=True)
     file_size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     status: Mapped[str] = mapped_column(VersionStatusEnum, nullable=False, server_default="PENDING")
-    metadata_: Mapped[dict | None] = mapped_column("metadata", JSONB, nullable=True)
+    # `with_variant(JSON, "sqlite")` costs nothing on Postgres -- JSONB is
+    # still what production gets -- and lets this table be created on an
+    # in-memory SQLite database. Without it the SQLite compiler cannot
+    # render JSONB at all, so any test that needs a knowledge_source_version
+    # row has to mock the query instead of running it. Same reasoning, and
+    # the same fix, as `crawl_discovery` below.
+    metadata_: Mapped[dict | None] = mapped_column(
+        "metadata", JSONB().with_variant(JSON(), "sqlite"), nullable=True
+    )
     last_ingested_at: Mapped[datetime | None] = mapped_column(nullable=True)
     last_reindexed_at: Mapped[datetime | None] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(nullable=False, server_default=func.now())
@@ -267,7 +374,15 @@ class EmbeddingChunk(Base):
     entity_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("entity.id"), nullable=True, index=True)
     chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
     text: Mapped[str] = mapped_column(Text, nullable=False)
-    embedding: Mapped[list[float]] = mapped_column(Vector(768), nullable=False)
+    # Postgres gets pgvector's real type -- that is what the HNSW index and
+    # the `<=>` distance operator need, and `with_variant` leaves it
+    # untouched there. The SQLite variant exists only so the table can be
+    # *created* off Postgres: `/admin/stats` counts this table, and without
+    # it any test of that endpoint has to mock the query rather than run
+    # it. Nothing off Postgres can do similarity search, and nothing tries.
+    embedding: Mapped[list[float]] = mapped_column(
+        Vector(768).with_variant(Text(), "sqlite"), nullable=False
+    )
     page: Mapped[int | None] = mapped_column(Integer, nullable=True)
     token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     checksum: Mapped[str] = mapped_column(Text, nullable=False, index=True)

@@ -1,3 +1,4 @@
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -193,6 +194,21 @@ class _SiteHandler(BaseHTTPRequestHandler):
 
 @pytest.fixture(scope="module")
 def site_server():
+    """A fixture site on loopback, exempted from the SSRF guard.
+
+    The crawler refuses loopback addresses since P0-3 -- correctly: an
+    unauthenticated caller must not be able to point it at 127.0.0.1 and read
+    whatever else is bound there. That refusal applies to this fixture too,
+    so the exemption is granted explicitly here, for 127.0.0.0/8 only.
+
+    `os.environ` directly rather than `monkeypatch`, because this fixture is
+    module-scoped and monkeypatch is not. The value is restored in the
+    teardown so it cannot leak into the rest of the suite -- which would
+    quietly weaken the guard for every test that runs afterwards.
+    """
+    previous = os.environ.get("CRAWL_ALLOW_ADDRESSES")
+    os.environ["CRAWL_ALLOW_ADDRESSES"] = "127.0.0.0/8"
+
     _SiteHandler.site = _SITE
     server = ThreadingHTTPServer(("127.0.0.1", 0), _SiteHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -200,6 +216,11 @@ def site_server():
     base = f"http://127.0.0.1:{server.server_address[1]}"
     yield base
     server.shutdown()
+
+    if previous is None:
+        os.environ.pop("CRAWL_ALLOW_ADDRESSES", None)
+    else:
+        os.environ["CRAWL_ALLOW_ADDRESSES"] = previous
 
 
 @pytest.mark.asyncio

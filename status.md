@@ -18,14 +18,32 @@ This is a **multi-agent RAG customer-support assistant** for Alpinist Studios, b
 |---|---|
 | Architecture & module design | **Strong.** Clean layering, dependency injection everywhere, pure functions separated from I/O, excellent docstrings. |
 | Feature completeness (MVP scope) | **~75%.** Chat, RAG, ingestion, crawling, graph browsing and ticket creation all work. Ticket status lookup and the admin surface do not. |
-| Test suite | **638 passing / 0 failing / 0 erroring / 2 skipped** (640 collected). **Fully green** — the Playwright browser is now installed, so the last non-deterministic gap is closed. |
-| Production readiness | **One blocker left.** No authentication, no authorisation, `CORS: *` (P0-3). Conversation state no longer reaches the logs (P0-4). Secrets are no longer injected by import side effect (P0-2), and the client/server timeout ladder no longer inverts (P2-4). |
+| Test suite | **759 passing / 0 failing / 0 erroring / 2 skipped** (761 collected). **Fully green** — the Playwright browser is installed, so the last non-deterministic gap is closed. |
+| Production readiness | **No known blockers.** Authentication, authorisation, a CORS allowlist, rate limiting and an SSRF guard on the crawler are all in place (P0-3). Conversation state no longer reaches the logs (P0-4). Secrets are no longer injected by import side effect (P0-2), and the client/server timeout ladder no longer inverts (P2-4). |
 | Scalability | **Much improved.** All four P1 items are fixed: pgvector-native retrieval, LLM calls off the event loop, one shared connection pool, and ingestion moved out of the web process into a worker service. Two pieces of per-process state that quietly broke horizontal scaling now live in the database (P2-5). |
 | Repo hygiene | **Good.** The duplicated ontology is gone (P2-1); dead files, the committed AI-assistant note, the crawl artefact and the committed debug values are all gone, and the README is real (P2-6). Only the stale branches are left, deliberately untouched. |
 
-**Every P0 except one, and the whole P1 and P2 tiers, are now fixed** — see the changelog. What remains is **P0-3**: no authentication, no authorisation, `CORS: *`, and an unguarded crawler that will fetch any URL it is given. It is now the single thing standing between this and a deployable internal product.
+**Every P0, P1 and P2 is now fixed** — see the changelog. P0-3, the last blocker, closed on 2026-09-08: the API is authenticated and authorised, CORS is an env-driven allowlist, requests are rate limited per user, and the crawler refuses to fetch anything that is not a publicly-routable host.
+
+What is left is *unbuilt features* rather than defects — ticket status lookup, the admin API, prompt management, CI and lint configuration, and structured logging with metrics. Those are listed in §5 and §7.
 
 ### Changelog
+
+**2026-09-09 — Admin API (read).** All four tabs of the Admin page had shown *"Endpoint not available yet"* since the page was written, while the data sat in the database: 24 knowledge sources, 82 ingestion jobs, 339 entities, 7 tickets. `api/admin.py` adds `GET /admin/knowledge-sources | jobs | stats | tickets`, admin-only, each returning `{ <list>, total, limit, offset }` rather than a bare array so a caller can tell "all of it" from "the first page of it".
+
+The standing note in `main.py` and `frontend_plan.md` §6.2 pointed at `ingestion/storage/api.py` as the thing to wire. That was the wrong target and stayed wrong for months: it is a *write* path — a second `POST /admin/knowledge-sources` upload duplicating `POST /ingest/upload` — whose placeholder dependencies still raise `NotImplementedError`. Wiring it would have added a duplicate upload route and left every read tab empty.
+
+Three defects surfaced only once the endpoints returned real rows. **(1)** The obvious job ordering, `started_at DESC NULLS FIRST`, filled the entire first page with the oldest failures in the database, because 37 of 82 rows predate the code that stamps `started_at`; it now sorts queued work first, then by whichever of `completed_at`/`started_at` a row actually has. **(2)** `.stats-grid .card` also matched `.card.stat-card`, so all four figures stacked full-width, one per row — invisible until the tab had data to lay out. **(3)** The Jobs table never showed *which source* a job was for, which is the first thing anyone asks of a list of failures.
+
+Two model columns gained `with_variant(..., "sqlite")` — `knowledge_source_version.metadata` (JSONB) and `embedding_chunk.embedding` (pgvector). Postgres is untouched; the variants exist so these tables can be *created* off Postgres, which is what lets the new endpoints be tested against a real query rather than a mock. Suite 759 → **774 passing**.
+
+**2026-09-08 — P0-3, the API is authenticated.** The last blocker. All 13 endpoints were anonymous, `CORS` allowed every origin, and `POST /ingest/crawl` would fetch any URL a caller named — `http://169.254.169.254/latest/meta-data/` included, which is cloud credentials in one unauthenticated request. Now: JWT (HS256) with a 15-minute access token and a 14-day **rotating** refresh token whose id is stored so it can actually be revoked; `HttpOnly; Secure; SameSite=Strict` cookies for the browser and `Authorization: Bearer` for scripts through one verifier; Argon2id passwords; two roles (`member`/`admin`). `/chat` is authenticated — an internal tool whose every turn spends Groq tokens against a shared daily budget. The public surface is exactly three routes, and `tests/api/test_route_protection.py` enumerates the assembled app to assert every other route refuses an anonymous caller.
+
+Three things the implementation taught that the design had not: **(1)** the SSRF guard has to sit at the crawler's *fetch boundary*, not only at the API — a site is crawled by following its links, so a link to an intranet host went through the same code path; and `follow_redirects=True` was a bypass, since a public URL that 302s to the metadata endpoint sailed past a check on the URL the caller supplied. **(2)** Two security-relevant writes were being silently discarded: revoking every session on detecting a replayed refresh token, and the login rate-limit counter, both happen on the way to an error response, and `get_session` rolls back when a handler raises — so theft detection revoked nothing and the fifth wrong password was as unthrottled as the first. Both were found by tests asserting the *consequence* rather than the status code. **(3)** The frontend must coalesce refreshes: tokens rotate, so four parallel 401s would have replayed one refresh token four times, and the server correctly reads that as theft — an ordinary page load would have logged the user out and recorded it as an attack.
+
+Also caught by measurement: on Python 3.12 `100.64.0.0/10` (carrier-grade NAT) reports `is_private=False` *and* `is_global=False`, so an enumeration of the named address flags let it through; the guard now refuses anything not globally routable. And the first version of the exhaustive route test found one route and passed — FastAPI 0.141 does not flatten included routers — which is why it carries a companion assertion that the enumeration is not empty.
+
+Verified live against the running container: anonymous callers get 401 on chat, graph and ingest while `/health` stays open; cookies come back `HttpOnly; Secure; SameSite=strict`; no `Access-Control-*` header is emitted at all; six hostile crawl URLs are refused with 400 *while authenticated as an admin*; a replayed refresh token revokes the whole family; the sixth login in fifteen minutes returns 429 with `Retry-After`, and the counter includes the failed attempts. An upload now records the signing-in member in `knowledge_source.uploaded_by`; historical rows still point at the service account, which cannot be invented retrospectively. Migration `8e5a3c9d21f7`, additive. Suite 638 → **759 passing**.
 
 **2026-09-06 — F8, `hybrid_retrieve` deleted.** It took a single `AsyncSession` while running both retrieval arms under `asyncio.gather`, so the one strategy it was named after raised `InvalidRequestError`. That was fixed with a session factory — and then the function was removed instead, because it had **no production callers** and duplicated four behaviours the compiled graph already implemented (strategy dispatch, graceful misses, the P1-6 fallback, the F4 filter), each of which had already needed matching edits in both copies. `hybrid.py` is now 151 lines of pure retrieval policy rather than 337. **Retrieval is unchanged**: verified live afterwards at `strategy=hybrid, facts=4, chunks=1` — hybrid search is a property of the graph's fan-out edge, not of the function named after it. Eleven test call sites moved onto the nodes and the compiled graph. Suite 645 → **638 passing**.
 
@@ -86,13 +104,17 @@ cd backend && env -u PYTHONPATH ./.venv/bin/python -m pytest -q
 → 10 failed, 268 passed, 6 errors in 170.19s
 ```
 
-**Current, after every P0-1, P0-2, P0-4, P1, P2, P1-6, F1–F7 and F9 fix:**
+**Current, after every P0, P1, P2, P1-6 and F1–F9 fix:**
 ```
 cd backend && env -u PYTHONPATH ./.venv/bin/python -m pytest -q
-→ 638 passed, 2 skipped in 59.63s
+→ 759 passed, 2 skipped in 71.07s
 ```
 
-Collected: 640 tests, **no failures and no errors**. The runtime also dropped from ~131s to ~58s: the two opt-in tests that were making real network calls on every run now skip correctly. The 1 failure and 4 errors that had persisted through every earlier report were all the same missing dependency — a Playwright browser, installed with `uv run playwright install chromium`. Nothing in the suite is non-deterministic.
+Collected: 761 tests, **no failures and no errors**. The last 121 arrived with
+P0-3: tokens, passwords, roles, the auth router, rate limiting, the SSRF
+guard, and `tests/api/test_route_protection.py`, which enumerates the
+assembled application and asserts every route is either on a four-entry
+public allowlist or refuses an anonymous caller. The runtime also dropped from ~131s to ~58s: the two opt-in tests that were making real network calls on every run now skip correctly. The 1 failure and 4 errors that had persisted through every earlier report were all the same missing dependency — a Playwright browser, installed with `uv run playwright install chromium`. Nothing in the suite is non-deterministic.
 
 ### Verified against the live stack
 
@@ -161,10 +183,16 @@ Marking those five `@pytest.mark.integration` (item 5 in §7.1) is still worth d
 ## 3. Architecture as built
 
 ```
- Browser (vanilla JS, hash router)
+ Browser (vanilla JS, hash router, route-guarded by session.js)
+   │  Cookie: access_token (HttpOnly, 15 min) — refreshed and replayed on 401
    │  POST /chat/stream (SSE)   POST /chat   GET /graph/*   POST /ingest/*
    ▼
  FastAPI  (main.py — also serves the frontend as StaticFiles at "/")
+   │
+   ├── auth/  require_role(member|admin) on every router below
+   │     │    verify signature → load the row → check is_active → read role
+   │     │    rate limit per user id, counted in the database
+   │     └── /auth/login | refresh (rotating) | logout | me | users
    │
    ├── ChatService  ── one turn, bounded by TURN_BUDGET_S (52s)
    │     │              buffered (/chat) and streamed (/chat/stream) share
@@ -183,9 +211,13 @@ Marking those five `@pytest.mark.integration` (item 5 in §7.1) is still worth d
    │     ├── ticket_agent  (interrupt() × 2 → TicketStore → SMTP)
    │     └── assemble_response
    │
-   ├── /graph/*   read-only EAV graph browser
+   ├── /graph/*   read-only EAV graph browser  (member)
    └── /ingest/*  upload | crawl | discover | confirm  → 202 Accepted
+                    │     every outbound URL passes auth/ssrf.py, at the
+                    │     crawler's fetch boundary — so discovery, sitemaps,
+                    │     downloads and followed links are all covered
                     └─► register_document_version → MinIO + job row
+                          uploaded_by = the signed-in user
                                                           │
  worker service (scripts/run_worker.py) ◄─────────────────┘ claims the job
    └─► run_ingestion: fetch → Tika → chunk+embed
@@ -195,6 +227,11 @@ Marking those five `@pytest.mark.integration` (item 5 in §7.1) is still worth d
 Every Supervisor node is wrapped by `node_logging.log_node`: off at the
 default `INFO`, and free text redacted to a shape summary even at `DEBUG`
 unless `LOG_PII=true` (P0-4).
+
+**Public surface: three routes.** `GET /health`, `POST /auth/login` and
+`POST /auth/refresh`. Everything else requires a signed-in `member`, and
+`tests/api/test_route_protection.py` enumerates the assembled app to prove
+it — the list is a literal in the test, so widening it is a visible diff.
 
 **Stack:** Python 3.12, FastAPI, LangGraph 1.x, SQLAlchemy 2 (async, psycopg3), Alembic, Postgres 16 + pgvector, MinIO, Apache Tika, Playwright, `sentence-transformers` (BAAI/bge-base-en-v1.5, 768-dim), Groq (`openai/gpt-oss-120b`) as the live LLM.
 
@@ -238,17 +275,42 @@ Notably correct details: the mandated retrieval join contract (only `current_ver
 ### 4.6 Frontend — mostly done
 Zero-build vanilla JS (`window.ACA` namespace, classic scripts, hash router), dark/light theming, served same-origin by the backend.
 
-| Page | State |
-|---|---|
-| Chat | Done — thread list in `localStorage`, retry, citations |
-| Graph | Done — 2D/3D force-graph explorer (the current feature branch) |
-| Ingest | Done — upload, crawl, discover→review→confirm, job polling |
-| Prompt | Partial — prompts are viewable/editable but **device-local only**; no backend write endpoint |
-| Overview | Done |
-| Admin | **Stub** — renders "not available"; the `/admin/*` endpoints it calls don't exist |
+**Login and route guard (P0-3).** The shell is otherwise unchanged from the original design: header, sidebar, cards. What authentication added is a login page, `session.js` holding the signed-in user, the signed-in address and role in the header, and a route guard in `router.js` that gates on two axes -- signed in or not, and `role: 'admin'` on the page.
+
+A studio three-column layout (icon rail / workspace / context inspector) with a warm-ink and then an aurora palette was built on 2026-09-08 and **reverted on 2026-09-09** at the user's request. The authentication work was kept; only the design was rolled back. The reverted design is recoverable from that day's history if it is ever wanted again.
+
+| Page | Role | State |
+|---|---|---|
+| Login | — | Done — the only page reachable signed out; `router.js` guards the rest and remembers where the user was going |
+| Chat | member | Done — thread list in `localStorage`, retry, citations |
+| Graph | member | Done — 2D/3D force-graph explorer (the current feature branch) |
+| Ingest | member | Done — upload, crawl, discover→review→confirm, job polling |
+| Overview | member | Done |
+| Prompt | **admin** | Partial — prompts are viewable/editable but **device-local only**; no backend write endpoint. Admin-gated because editing the agent's prompts changes how the system answers everyone, and it would be odd for that to become an admin action only on the day it starts persisting |
+| Admin | **admin** | **Stub** — renders "not available"; the `/admin/*` endpoints it calls don't exist. When they are built they go behind the `admin` role, which is why that role exists now |
+
+`router.js` gates on two axes: signed in or not, and `role: 'admin'` on the
+page. Admin pages are hidden from the sidebar for a member and refused if
+reached by URL, with a message rather than a silent bounce — being redirected
+with no explanation reads as the app being broken. This is a usability layer,
+not a security boundary: the API refuses unauthorised requests by itself, and
+a determined caller skips the browser entirely. Verified by driving Chromium
+as each role: an admin sees six sidebar entries, a member four, and a member
+typing `#/admin` lands on Chat with *"That page is for administrators."*
+
+`api.js` sends `credentials: 'include'` and, on a 401, refreshes once and
+replays — through a **single shared** in-flight refresh. That coalescing is a
+correctness requirement, not an optimisation: refresh tokens rotate, so four
+parallel 401s would present one token four times, which the server correctly
+reads as theft and answers by revoking every session the user has.
 
 ### 4.7 Tooling
 `docker-compose.yml` (postgres/pgvector, MinIO + bucket init, Tika, backend), a multi-stage `Dockerfile`, an entrypoint that waits for Postgres and runs `alembic upgrade head`, a `Makefile` with `up/down/worker/ingest/verify/psql/trunc/chat/graph`, and a `langgraph.json` for LangGraph Studio.
+
+`scripts/create_user.py` creates the first admin — there is no self-signup,
+so every account after that comes from `POST /auth/users`. It prompts for the
+password rather than taking it as an argument, because an argument lands in
+shell history and in `ps` output for every other user on the machine.
 
 ---
 
@@ -256,17 +318,19 @@ Zero-build vanilla JS (`window.ACA` namespace, classic scripts, hash router), da
 
 | Gap | Evidence |
 |---|---|
-| **Authentication / authorisation** | Every endpoint is anonymous. The 0-byte `auth/jwt.py` placeholder was deleted in P2-6 — an empty file was not a plan; P0-3 adds the real module. |
-| **Admin API** | `ingestion/storage/api.py:62-83` — all three dependencies `raise NotImplementedError`; the router is deliberately not registered (`main.py:78-80`). |
+| ~~**Authentication / authorisation**~~ | **Done (P0-3, 2026-09-08).** `auth/` holds tokens, passwords, roles, dependencies, the router, rate limiting and the SSRF guard. What is *not* built is anything behind the `admin` role beyond account creation — prompt management and source deletion are still unwritten endpoints, and that is why the role exists now rather than later. |
+| ~~**Admin API (read)**~~ | **Done 2026-09-09.** `api/admin.py` serves `GET /admin/knowledge-sources`, `/admin/jobs`, `/admin/stats`, `/admin/tickets`, admin-only. All four Admin tabs now render real data instead of "Endpoint not available yet", and the Overview figures come from `/admin/stats` rather than a capped `/graph/search`. |
+| **Admin API (write)** | Still unbuilt: no source deletion, no re-index trigger, no ticket status change. `ingestion/storage/api.py` remains unregistered — it is an *upload* path duplicating `POST /ingest/upload`, not the read surface the page needed. |
 | **Ticket status lookup** | Routed away at classification time with a hardcoded "not available yet" string (`routing.py:_CHECK_STATUS_UNAVAILABLE`). No read path against the `ticket` table. |
 | **Prompt management API** | Frontend edits never reach the server. |
 | **Typed settings** | `config.py` now loads the environment (P0-2), but modules still read `os.environ` directly rather than a typed settings object. `agents/knowledge/config.py` shows the pattern to follow. |
-| **CHANGELOG** | `CHANGELOG.md` is empty. (`README.md` was written in P2-6.) |
+| ~~**CHANGELOG**~~ | **Done** — `CHANGELOG.md` was written in the F-series and covers P0-3. |
 | **CI** | No `.github/`, no lint config, no formatter config, no coverage gate. |
 | ~~**Worker in Docker**~~ | **Done (P1-5)** — a `worker` service now runs `scripts/run_worker.py`; the API only enqueues. |
 | **Observability** | No structured logging, no metrics, no tracing. `trace_id` is generated and threaded but never actually logged anywhere. |
 | ~~**Streaming responses**~~ | **Done (F7)** — `POST /chat/stream` reports progress from ~50ms; `POST /chat` is unchanged as the fallback. |
-| **Rate limiting / abuse control** | None, on an endpoint that spends money per call. |
+| ~~**Rate limiting / abuse control**~~ | **Done (P0-3)** — per authenticated user, counted in the database rather than a process dict, so it survives a restart and does not multiply by the instance count. 5 logins / 15 min (per address *and* per account), 20 chat turns / min and 500 / day, 10 ingest calls / min. |
+| **Session management UI** | `refresh_token` records a user agent and issue time per session, but nothing surfaces them. "Sign out everywhere" exists as a code path (it fires on detected token reuse) with no button attached. |
 
 ---
 
@@ -371,25 +435,25 @@ Suite: **352 → 364 passing**, 3 failed → 1, 6 errors → 4. **Every remainin
 
 ---
 
-### 🔴 P0-3 — No authentication anywhere
+### ✅ P0-3 — No authentication anywhere — **FIXED 2026-09-08**
 
-**Location:** `main.py:47-52` (the `auth/` package was removed in P2-6; this must create it)
+**Was:** every one of the 13 endpoints anonymous, `allow_origins=["*"]`, and `/ingest/crawl` willing to fetch any URL a caller named — including `http://169.254.169.254/`, which is a server-side request forgery yielding cloud credentials in one request. `_uploaded_by()` hardcoded the service-account UUID, so nothing was attributable to anyone.
 
-```python
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-```
+**Now:** JWT (HS256) with a 15-minute access token and a 14-day *rotating* refresh token whose id is stored so it can be revoked; `HttpOnly; Secure; SameSite=Strict` cookies for the browser and `Authorization: Bearer` for scripts, over one verifier; Argon2id passwords; two roles, `member` and `admin`. Design and rationale: [`authentication_implementation.md`](authentication_implementation.md).
 
-Anyone who can reach the port can: run unlimited LLM-billed chat turns, upload arbitrary documents into the knowledge base, trigger crawls of arbitrary URLs (a **server-side request forgery** vector — `/ingest/crawl` fetches any URL the caller names, including `http://169.254.169.254/` and internal hosts), read the entire knowledge graph, and create tickets that send email.
+The full design decisions live in that document. Four things worth having here:
 
-`_uploaded_by()` hardcodes the service-account UUID for every ingestion, so there is no attribution either.
+**`/chat` is authenticated.** This is an internal tool, and every turn spends Groq tokens against a daily budget that this project's own testing exhausted repeatedly with one developer. Authentication bounds who can spend it; a per-user daily cap bounds how much any one of them can. The public surface is now exactly three routes — `/health`, `/auth/login`, `/auth/refresh` — and `tests/api/test_route_protection.py` enumerates the assembled app and asserts every other route answers 401 without a credential. That test exists to catch the endpoint somebody adds in six months and forgets to protect, which no per-endpoint test can.
 
-**Fix (in order):**
-1. Create `auth/jwt.py` (issue + verify), add a `get_current_user` dependency.
-2. Split routers: public = `/chat`, `/health`; authenticated = `/ingest/*`, `/graph/*`; admin-only = the future `/admin/*`.
-3. Replace `allow_origins=["*"]` with an env-driven allowlist.
-4. Add an SSRF guard on `/ingest/crawl`: block private/loopback/link-local IP ranges after DNS resolution, and enforce a domain allowlist.
-5. Add per-IP rate limiting on `/chat` and `/ingest/*`.
-6. Set `_uploaded_by()` from the authenticated user.
+**`/graph/*` is not public despite being read-only.** Those six endpoints walk the entire knowledge graph, which makes them a far more efficient way to exfiltrate the corpus than asking the chatbot five hundred questions. Read-only means it does not write, not that it is harmless.
+
+**The SSRF guard sits at the crawler's fetch boundary, not only at the API.** A site is crawled by following its links, so a link on a public page pointing at an intranet host is fetched by the same code path. `ingestion/crawler/fetcher.py` is the single network I/O boundary for page and document fetching, so the check goes there and covers discovery, `robots.txt`, `sitemap.xml`, downloads and every followed link. Redirects are walked one hop at a time — `follow_redirects=True` was the bypass, since a public URL that 302s to the metadata endpoint sailed past a check on the URL the caller supplied.
+
+**Two security-relevant writes needed explicit commits.** Revoking every session on detecting a replayed refresh token, and incrementing the login rate-limit counter, both happen on the way to an error response — and `get_session` rolls back when a handler raises. Without the commits, the response to a *detected token theft* was silently undone, and the fifth wrong password was as unthrottled as the first. Both were found by tests that asserted the consequence rather than the status code.
+
+**Migration:** `8e5a3c9d21f7` — four columns on `app_user` (`password_hash`, `role`, `is_active`, `last_login_at`), plus `refresh_token` and `rate_limit_bucket`. Additive; existing rows become active members and the service account is promoted to `admin` because `uploaded_by` points at it.
+
+**Known limitation, written down rather than papered over:** the guard cannot pin a connection to the address it validated — `httpx` has no supported way to do it, and the workaround breaks certificate verification. It instead reads the peer address off the completed connection and rejects the response before any of it is used. An attacker can still cause one *blind* request to an internal address; they cannot see the answer.
 
 ---
 
@@ -767,11 +831,11 @@ Migration `3d6f8b2c17ae` is additive: nothing dropped, no row changed, exact dow
 | `echo` (repo root) | Deleted. Contained a stray AI-assistant summary: *"Task complete. The ticket agent now has…"*. |
 | `backend/store_new.py` | Deleted — a 190-line dead near-duplicate of the real store. |
 | `api/chat.py` | Deleted — an entire unused router, never registered; the explanatory note in `main.py` went with it. |
-| `auth/jwt.py` | Deleted. It was 0 bytes; an empty file is not a plan. **P0-3 will add a real module.** |
+| `auth/jwt.py` | Deleted. It was 0 bytes; an empty file is not a plan. **P0-3 replaced it with a real `auth/` package on 2026-09-08** — `tokens.py`, `passwords.py`, `roles.py`, `dependencies.py`, `router.py`, `cookies.py`, `rate_limit.py`, `ssrf.py`. |
 | `output/docs.md` | Deleted and `output/` gitignored — a tracked crawl artefact from `example.com`. |
 | `frontend/app/.vite/deps_temp_*` | Deleted and `**/.vite/` gitignored. |
 | **Committed debug values** | `CrawlConfig.request_timeout` 520.0 → **15.0** and `max_pages` 5 → **50**, the values from before commit `02b41a5`. A 520-second per-request timeout stalls a crawl for nearly nine minutes on one unresponsive page; `max_pages=5` silently truncated every site crawl to five pages. |
-| `README.md` | Rewritten. **The report was wrong about this one**: it was not the one-line `# AI Customer Assistant`, it contained a single stray absolute path. It is now real setup documentation — requirements, first run, the two-`.env` split, every make target, ingestion, tests, layout, and an explicit "there is no authentication" warning. |
+| `README.md` | Rewritten. **The report was wrong about this one**: it was not the one-line `# AI Customer Assistant`, it contained a single stray absolute path. It is now real setup documentation — requirements, first run, the two-`.env` split, every make target, ingestion, tests and layout. The "there is no authentication" warning it carried was removed on 2026-09-08 and replaced by an Authentication section, because P0-3 made it false. |
 | `.pytest_cache` | Removed from disk (already gitignored). |
 | Branches | **Deliberately not touched.** 13 local + 24 remote branches remain. Deleting branches is irreversible and is the user's call, not a hygiene sweep's. |
 
@@ -784,7 +848,7 @@ Migration `3d6f8b2c17ae` is additive: nothing dropped, no row changed, exact dow
 ### 7.1 Correctness & safety (do first)
 1. ~~Fix the ticket flow (P0-1).~~ **Done 2026-09-05** — 7 regressions cleared, 11 tests added.
 2. ~~Remove import-time `load_dotenv()` (P0-2).~~ **Done 2026-09-06**
-3. Implement JWT auth + CORS allowlist + SSRF guard on the crawler (P0-3).
+3. ~~Implement JWT auth + CORS allowlist + SSRF guard on the crawler (P0-3).~~ **Done 2026-09-08.**
 4. ~~Replace `print()` node logging with redacted structured logging (P0-4).~~ **Done 2026-09-06**
 5. ~~Fall back to vector search when a structured-only lookup returns nothing (P1-6).~~ **Done 2026-09-06**
 6. Mark DB/Playwright tests with `@pytest.mark.integration` and add a `-m "not integration"` default so the unit suite is green on a clean checkout.
@@ -808,7 +872,7 @@ Migration `3d6f8b2c17ae` is additive: nothing dropped, no row changed, exact dow
 
 ### 7.4 Features
 17. **Ticket status lookup** — the `ticket` table exists and the `CHECK_TICKET_STATUS` intent is already classified; only the read path is missing. Cheapest remaining MVP feature.
-18. **Admin API** — implement the three `NotImplementedError` dependencies in `ingestion/storage/api.py`, add `/admin/sources|jobs|stats|tickets`, and register the router. The frontend page is already written and waiting.
+18. ~~**Admin API (read)**~~ **Done 2026-09-09** — `api/admin.py`. The long-standing note pointing at `ingestion/storage/api.py` was aimed at the wrong module: that is a *write* path duplicating `POST /ingest/upload`, and wiring it would have produced a second upload route while leaving all four read tabs empty. What remains is the **write** surface: delete a source, trigger a re-index, change a ticket's status.
 19. **Prompt management endpoint** so the Prompt page's edits persist server-side and are versioned.
 20. ~~**Streaming `/chat`** via SSE.~~ **Done 2026-09-06 (F7)** — `POST /chat/stream`; the buffered endpoint remains as the fallback.
 21. **Ticket lifecycle** — `updated_at`, `resolved_at`, assignee, a `thread_id` FK linking a ticket back to its conversation, and inbound email replies.
@@ -818,7 +882,8 @@ Migration `3d6f8b2c17ae` is additive: nothing dropped, no row changed, exact dow
 23. Prometheus metrics: chat latency by stage, retrieval hit rate, LLM token spend, job queue depth.
 24. `/health` should check Postgres, MinIO and Tika — it currently returns `{"status": "ok"}` unconditionally.
 25. ~~A stale-job reaper.~~ **Done 2026-09-05** with P1-5.
-26. Move secrets to a secret manager; `backend/.env` currently holds a live `GROQ_API_KEY` and SMTP password in plaintext on disk (correctly gitignored, but not protected).
+26. Move secrets to a secret manager; `backend/.env` currently holds a live `GROQ_API_KEY`, an SMTP password and now `AUTH_SECRET` in plaintext on disk (correctly gitignored, but not protected). `AUTH_SECRET` raises the stakes: it signs every session, so leaking it is equivalent to leaking every password at once. Rotating it signs everyone out, which is the intended emergency response.
+28. **Sweep `refresh_token` and `rate_limit_bucket`.** Both accumulate rows that expire on their own but are never deleted. `auth.rate_limit.sweep_expired` exists and has no caller; the equivalent for refresh tokens is a one-line `DELETE ... WHERE expires_at < now()`. Low urgency at this volume, and worth doing before it is not.
 27. ~~Write the README.~~ **Done 2026-09-06** with P2-6 — requirements, first run, the two-`.env` split, make targets, ingestion, tests and layout. An architecture diagram is still missing.
 
 ---
@@ -829,13 +894,15 @@ Migration `3d6f8b2c17ae` is additive: nothing dropped, no row changed, exact dow
 - [x] ~~`git rm echo backend/store_new.py backend/src/ai_customer_assistant/api/chat.py`~~ — **done** (P2-6)
 - [x] ~~Delete the `?` splitting block~~ — **done** (P1-3)
 - [x] ~~Guard `_log_node` behind an environment check~~ — **done** (P0-4), and it redacts rather than merely gating
-- [ ] `allow_origins` from an env var — `main.py:49` (P0-3)
+- [x] `allow_origins` from an env var — `main.py` (P0-3, done 2026-09-08; the default is now *no* cross-origin access at all, which restricts nothing, because the frontend is served same-origin)
 - [x] ~~Revert `CrawlConfig.request_timeout` to 15.0 and `max_pages` to 50~~ — **done** (P2-6)
 - [x] ~~Add `output/`, `frontend/app/.vite/` to `.gitignore`~~ — **done** (P2-6)
 - [x] ~~Use `self._session_factory` in `TicketStore.create_ticket`~~ — **done** (P0-1)
 - [ ] Make `/health` check the database
 - [x] ~~Write a real README~~ — **done** (P2-6)
-- [ ] Log the swallowed exception in `classify_and_route` — `node.py:79` catches every failure and returns the safe fallback **without logging anything**, which is why a Groq 429 during verification looked like an unexplained "something went wrong". One `logger.warning(..., exc_info=True)`.
+- [x] ~~Log the swallowed exception in `classify_and_route`~~ — **done** (F3); `node.py:104` now logs with `exc_info=True`, and a provider rate limit is worded as a wait rather than a breakage.
+- [ ] Sweep expired `rate_limit_bucket` and `refresh_token` rows — `auth.rate_limit.sweep_expired` is written and has no caller.
+- [ ] A "sign out everywhere" button — the code path exists (it fires on detected token reuse), with nothing attached to it.
 
 ---
 
@@ -856,6 +923,15 @@ make chat                    # open the chat UI (port from APP_PORT in ./.env)
 make verify                  # list knowledge sources
 ```
 
+**Create an account** (there is no self-signup; the first admin has to come
+from here, because `POST /auth/users` requires one to already exist):
+```bash
+cd backend
+set -a && . ./.env && set +a
+POSTGRES_HOST=localhost POSTGRES_PORT=5433 \
+  env -u PYTHONPATH ./.venv/bin/python scripts/create_user.py you@example.com --role admin
+```
+
 **Apply migrations from the host** (the compose Postgres is published on 5433):
 ```bash
 cd backend
@@ -864,7 +940,7 @@ POSTGRES_HOST=localhost POSTGRES_PORT=5433 \
   env -u PYTHONPATH PYTHONPATH=src/ai_customer_assistant ./.venv/bin/python -m alembic upgrade head
 ```
 
-**Codebase size:** backend `src` 17 005 lines · tests 9 116 lines · frontend 3 892 lines. The test suite roughly doubled over this work — 268 → 642 passing.
+**Codebase size:** backend `src` ~18 000 lines · tests ~11 000 lines · frontend ~4 200 lines. The test suite nearly tripled over this work — 268 → **759 passing**.
 
 **Largest modules:** `frontend/src/pages/graph.js` (930) · `ontology/vocabulary.py` (596) · `frontend/src/pages/ingest.js` (509) · `agents/knowledge/structured_lookup.py` (455) · `api/ingest.py` (~470).
 
@@ -899,6 +975,24 @@ process refuses to start if it does not hold):
 | `KNOWLEDGE_AGENT_LLM_PROVIDER` / `LLM_MODEL_NAME` / `REWRITE_MODEL_NAME` | anthropic / claude-sonnet-5 | Falls back to the stub when the credential is absent |
 | `EMBEDDING_QUERY_INSTRUCTION` | *model-derived* | Overrides the BGE query prefix; set to empty to disable it |
 
+**Authentication** (P0-3, `auth/`):
+
+| Variable | Default | Notes |
+|---|---|---|
+| `AUTH_SECRET` | *none* | **The one setting with no default.** The process refuses to start without it, and rejects anything under 32 characters. A defaulted signing key means anyone who has read the source can mint tokens for any account. Rotating it signs everyone out — which is the intended emergency response |
+| `AUTH_COOKIE_SECURE` | `true` | Leave on. `http://localhost` still works; browsers treat it as a trustworthy origin. Set `false` only to reach the app over plain HTTP at a LAN address, and understand that it sends session tokens in clear |
+| `AUTH_COOKIE_SAMESITE` | `strict` | Available *because* the frontend is same-origin, and what makes CSRF a non-problem |
+| `CORS_ALLOW_ORIGINS` | empty | Empty means no cross-origin access at all, which restricts nothing — the frontend is same-origin. A wildcard is **not** accepted: the session is a cookie, and the CORS spec forbids combining credentials with `*` |
+| `TRUST_PROXY_HEADERS` | `false` | Read `X-Forwarded-For` for rate-limit keys. Only behind a proxy that sets it — anyone can send the header, so trusting it without one lets a caller choose their own rate-limit key |
+| `RATE_LIMIT_DISABLED` | `false` | Tests and single-user local development only |
+
+**Crawler safety** (`auth/ssrf.py`):
+
+| Variable | Default | Notes |
+|---|---|---|
+| `CRAWL_DOMAIN_ALLOWLIST` | empty | Restrict crawling to these domains, subdomains included. Empty means any publicly-routable host |
+| `CRAWL_ALLOW_ADDRESSES` | empty | CIDRs exempt from the private/loopback/link-local refusal, for crawling an intranet or for the crawler's own fixture site on loopback. A **list of networks, not a switch**, so exempting `10.1.0.0/16` does not also exempt `169.254.169.254` — which would hand an authenticated caller the instance's credentials |
+
 **Logging and privacy:**
 
 | Variable | Default | Notes |
@@ -908,7 +1002,7 @@ process refuses to start if it does not hold):
 
 **Database pool** (`db/engine.py`): `DB_POOL_SIZE` (10), `DB_MAX_OVERFLOW` (5), `DB_POOL_TIMEOUT` (30), `DB_POOL_RECYCLE` (1800).
 
-**Credentials and services:** `GROQ_API_KEY` / `GEMINI_API_KEY` / `ANTHROPIC_API_KEY`, `POSTGRES_*`, `MINIO_*`, `TIKA_BASE_URL`, `INGEST_DEFAULT_USER_ID`, `FRONTEND_DIR`.
+**Credentials and services:** `GROQ_API_KEY` / `GEMINI_API_KEY` / `ANTHROPIC_API_KEY`, `POSTGRES_*`, `MINIO_*`, `TIKA_BASE_URL`, `FRONTEND_DIR`. `INGEST_DEFAULT_USER_ID` still exists but no longer applies to HTTP requests: since P0-3 an upload is attributed to the caller, and the fallback is reached only by the worker and the offline scripts, which genuinely have no person behind them.
 
 **Re-run the retrieval calibration** after changing the corpus, the embedding model or the thresholds:
 ```bash
@@ -924,10 +1018,12 @@ POSTGRES_HOST=localhost POSTGRES_PORT=5433 \
 
 The engineering *discipline* in this codebase is unusually good: consistent dependency injection, pure functions isolated from I/O, immutable data types, dispatch tables in place of conditional chains, and docstrings that explain *why* rather than *what*. Whoever wrote the Knowledge Agent and the ingestion pipeline knew what they were doing.
 
-What is missing is the last mile. The system was built module-by-module against a plan document, and the seams show where the modules meet: the ticket flow half-migrated to async and broke, the two ontologies forked and drifted, four database engines accumulated, the timeout budgets contradicted each other across the client/server boundary, state that had to be shared was left in per-process dictionaries, and the retrieval graph had a branch with no way out. All of those are now fixed. What is still absent is the set of concerns no single module owns: **auth, logging and CI**.
+What was missing was the last mile. The system was built module-by-module against a plan document, and the seams showed where the modules met: the ticket flow half-migrated to async and broke, the two ontologies forked and drifted, four database engines accumulated, the timeout budgets contradicted each other across the client/server boundary, state that had to be shared was left in per-process dictionaries, and the retrieval graph had a branch with no way out. All of those are fixed, and so is the largest of the cross-cutting concerns no single module owned: **authentication**. What is still absent is **structured logging and CI**.
 
 A pattern worth naming, because it recurs and it is the hardest kind of defect to notice: **most of the bugs found here failed silently rather than loudly.** A threshold rejected four-fifths of answerable questions. An idempotency guarantee held only inside one process. A timeout abandoned requests the server went on to complete. A classifier swallowed every exception and returned a friendly apology. A retrieval branch skipped the only search that would have worked. In each case every component behaved exactly as written, so nothing errored and no log line appeared — the damage was only visible in the relationship *between* components, or by measuring the output against what it should have been.
 
-P1-6 is the sharpest illustration, and the reason it is worth changing how this codebase is tested. Every module involved was individually correct and individually well tested; the defect was one missing edge in the graph that connects them. Unit tests could not have found it, and did not. The fixes that catch this class of bug are the ones that assert across boundaries: the golden set that measures retrieval end to end, the ladder assertion in `timeouts.py`, the ontology drift tests, and the compiled-graph tests added with P1-6.
+P1-6 is the sharpest illustration, and the reason it is worth changing how this codebase is tested. Every module involved was individually correct and individually well tested; the defect was one missing edge in the graph that connects them. Unit tests could not have found it, and did not. The fixes that catch this class of bug are the ones that assert across boundaries: the golden set that measures retrieval end to end, the ladder assertion in `timeouts.py`, the ontology drift tests, the compiled-graph tests added with P1-6, and now the route-protection test that enumerates the assembled application rather than trusting each router to have remembered.
 
-**With the two P0 security items addressed (roughly one focused week), this becomes a genuinely deployable internal product.**
+P0-3 produced two more of exactly this shape, worth recording because neither would have shown up as an error. Revoking every session on detecting a replayed refresh token, and counting a failed login attempt, both happen on the way to an *error response* — and the request-scoped session rolls back when a handler raises. Both writes were silently discarded: theft detection revoked nothing, and the fifth wrong password was as unthrottled as the first. Every line of both functions was correct; the defect lived in their relationship with the framework's error handling. They were caught only by tests that asserted the **consequence** — count the live tokens, read the counter — rather than the status code the endpoint returned.
+
+**All ten P0/P1/P2 items and all nine live-test defects are now closed. This is a deployable internal product.** What remains is unbuilt features (ticket status lookup, the admin API, prompt management) and operational polish (structured logging with the `trace_id` already threaded through every node, metrics, CI) — work that adds capability rather than work that removes risk.

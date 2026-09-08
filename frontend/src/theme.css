@@ -865,7 +865,12 @@ a { color: inherit; text-decoration: none; }
 .badge-muted { color: var(--text-dim); background: var(--border); }
 .err-detail { color: var(--red); cursor: help; }
 .stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 16px; }
-.stats-grid .card { grid-column: 1 / -1; }
+/* Only the wide cards span the grid. `statCard` renders `class="card
+   stat-card"`, so a bare `.stats-grid .card` matched the figures too and
+   stacked all four at full width, one per row. Invisible until the admin
+   endpoints existed, because the tab never had data to lay out. */
+.stats-grid > .card:not(.stat-card) { grid-column: 1 / -1; }
+.stats-grid .stat-card { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
 .stats-grid .card h3 { margin: 0 0 10px; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-faint); }
 .stat-card { text-align: center; padding: 24px; }
 .stat-num { font-size: 28px; font-weight: 700; letter-spacing: -.02em; font-family: var(--mono); }
@@ -971,3 +976,202 @@ pre.code { font-family: var(--mono); font-size: 12px; background: var(--bg); bor
   .side-panel { max-height: 260px; }
   .graph-canvas-wrap { height: 420px; }
 }
+
+/* ==========================================================================
+   Authentication (P0-3)
+   ========================================================================== */
+
+/* Signed out there is no workspace to navigate and no account to represent,
+   so the sidebar and the avatar are removed rather than rendered empty
+   beside a login form. */
+.app.signed-out .sidebar { display: none; }
+.app.signed-out .main { grid-column: 1 / -1; }
+.app.signed-out .avatar { display: none; }
+
+/* ---- Header identity ---- */
+
+.session-box {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-right: 10px;
+  margin-right: 2px;
+  border-right: 1px solid var(--border);
+}
+
+.session-email {
+  font-size: 12px;
+  color: var(--text-dim);
+  max-width: 210px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-role {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  border: 1px solid var(--accent-dim);
+}
+
+/* ---- Sign-in ---- */
+
+.login-shell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: calc(100vh - 116px);
+  padding: 24px;
+}
+
+.login-card {
+  display: grid;
+  grid-template-columns: 300px 1fr;
+  width: 100%;
+  max-width: 800px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+}
+
+.login-brand {
+  position: relative;
+  padding: 38px 30px;
+  background: linear-gradient(160deg,
+    color-mix(in srgb, var(--blue) 14%, var(--panel-alt)),
+    color-mix(in srgb, var(--purple) 11%, var(--panel-alt)));
+  border-right: 1px solid var(--border);
+  overflow: hidden;
+}
+/* The lattice is decoration; it must never sit above the words. */
+.login-brand > .graph-field {
+  mask-image: linear-gradient(200deg, black, transparent 78%);
+  -webkit-mask-image: linear-gradient(200deg, black, transparent 78%);
+}
+.login-brand-inner { position: relative; z-index: 1; }
+
+.login-mark { width: 38px; height: 38px; color: var(--blue); margin-bottom: 20px; }
+.login-mark svg { width: 100%; height: 100%; }
+
+.login-brand-title {
+  margin: 0 0 10px;
+  font-family: var(--font-display);
+  font-size: 25px;
+  font-weight: 700;
+  line-height: 1.16;
+  letter-spacing: -.02em;
+  color: var(--text);
+}
+.login-brand-sub { margin: 0 0 26px; font-size: 13px; line-height: 1.5; color: var(--text-dim); }
+
+.login-points { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 13px; }
+.login-points li {
+  display: flex; align-items: flex-start; gap: 10px;
+  font-size: 12.5px; line-height: 1.45; color: var(--text-dim);
+}
+.login-points svg { width: 15px; height: 15px; flex: 0 0 15px; margin-top: 2px; color: var(--blue); }
+
+.login-form { display: flex; flex-direction: column; padding: 40px 38px; }
+
+.login-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 23px; font-weight: 700; letter-spacing: -.015em;
+  color: var(--text);
+}
+.login-sub { margin: 6px 0 26px; font-size: 13px; color: var(--text-dim); }
+
+.login-label {
+  font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase;
+  color: var(--text-dim); margin-bottom: 7px;
+}
+.login-label + .login-input,
+.login-label + .login-password { margin-bottom: 18px; }
+
+/* Colours come from the same tokens the rest of the app's fields use.
+   An earlier version referenced `--input-bg`, a token that does not
+   exist, so every theme got the dark fallback and these rendered as black
+   boxes in light mode. */
+.login-input {
+  width: 100%;
+  box-sizing: border-box;
+  height: 42px;
+  padding: 0 13px;
+  font-size: 14px;
+  font-family: inherit;
+  color: var(--text);
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  outline: none;
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+.login-input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px var(--accent-soft); }
+.login-input::placeholder { color: var(--text-faint); }
+
+.login-password { position: relative; }
+.login-password .login-input { padding-right: 44px; }
+
+.login-reveal {
+  position: absolute; top: 0; right: 0;
+  width: 42px; height: 42px;
+  display: flex; align-items: center; justify-content: center;
+  background: none; border: none; cursor: pointer;
+  color: var(--text-faint);
+  border-radius: var(--radius-sm);
+  transition: color .15s ease;
+}
+.login-reveal:hover { color: var(--text-dim); }
+.login-reveal.on { color: var(--blue); }
+.login-reveal svg { width: 16px; height: 16px; }
+
+/* One message for every credential failure: the server answers a wrong
+   password and an unknown address identically, and this is where that
+   shows up. Do not make it more specific. */
+.login-error {
+  margin-bottom: 16px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--red) 30%, transparent);
+}
+
+.login-btn { height: 42px; font-size: 14px; }
+.login-btn.is-busy { cursor: progress; }
+
+.login-foot { margin: 18px 0 0; font-size: 11.5px; text-align: center; color: var(--text-faint); }
+
+/* Below this width the brand panel is decoration competing with the only
+   thing on screen that matters, so it is dropped rather than stacked. */
+@media (max-width: 880px) {
+  .login-card { grid-template-columns: 1fr; max-width: 420px; }
+  .login-brand { display: none; }
+  .login-form { padding: 34px 28px; }
+  .session-email { max-width: 130px; }
+}
+
+/* Admin list summary — the count, and the status breakdown, above each
+   table. Both come from the endpoint rather than from counting the rows on
+   screen, which would be wrong the moment a page limit applies. */
+.admin-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 0 2px 12px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.admin-summary .sum-chip { display: inline-flex; align-items: center; gap: 5px; }
+
