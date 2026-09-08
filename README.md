@@ -157,7 +157,7 @@ make test                                  # whole suite
 make test PYTEST_ARGS='-q tests/agents'    # one directory
 ```
 
-**642 passing, no failures or errors.** Use `make test` rather than a bare
+**638 passing, no failures or errors.** Use `make test` rather than a bare
 `pytest`: an activated conda environment shadows the project's interpreter and
 produces two dozen spurious collection errors. `make test` invokes
 `backend/.venv`'s Python by absolute path.
