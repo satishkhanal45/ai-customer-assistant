@@ -1,9 +1,9 @@
 # AI Customer Assistant — Project Status Report
 
 **Repository:** `/mnt/hdd/satish/ai-customer-assistant`
-**Branch analysed:** `features/graph_visualization` (HEAD `ba45956`, with 7 uncommitted files)
+**Branch:** `features/test` (last commit `ff24bd4`; the P0-4 / F1–F9 work is uncommitted at the time of writing)
 **Report date:** 2026-09-05
-**Last updated:** 2026-09-06 — **P0-1**, **P0-2**, the **whole P1 tier** (including the newly-found P1-6) and the **whole P2 tier** fixed; see the changelog
+**Last updated:** 2026-09-06 — **P0-1**, **P0-2**, the **whole P1 tier** (including the newly-found P1-6), the **whole P2 tier**, and **F1–F7 + F9** from the live UI test; see the changelog
 **Method:** full read of `backend/src` (14.8k LOC), `backend/tests` (4.6k LOC), `frontend/src` (2.8k LOC), migrations, Docker/Make tooling and docs; plus a live run of the test suite.
 
 ---
@@ -18,14 +18,37 @@ This is a **multi-agent RAG customer-support assistant** for Alpinist Studios, b
 |---|---|
 | Architecture & module design | **Strong.** Clean layering, dependency injection everywhere, pure functions separated from I/O, excellent docstrings. |
 | Feature completeness (MVP scope) | **~75%.** Chat, RAG, ingestion, crawling, graph browsing and ticket creation all work. Ticket status lookup and the admin surface do not. |
-| Test suite | **443 passing / 1 failing / 4 erroring / 2 skipped** (450 collected). Everything still non-green needs only a **Playwright browser** — the suite is otherwise deterministic on a clean checkout. |
-| Production readiness | **Low, but the list is shrinking.** Remaining blockers: no authentication, no authorisation, `CORS: *`, debug `print()` of full conversation state, no observability. Secrets are no longer injected by import side effect (P0-2), and the client/server timeout ladder no longer inverts (P2-4). |
+| Test suite | **642 passing / 0 failing / 0 erroring / 2 skipped** (644 collected). **Fully green** — the Playwright browser is now installed, so the last non-deterministic gap is closed. |
+| Production readiness | **One blocker left.** No authentication, no authorisation, `CORS: *` (P0-3). Conversation state no longer reaches the logs (P0-4). Secrets are no longer injected by import side effect (P0-2), and the client/server timeout ladder no longer inverts (P2-4). |
 | Scalability | **Much improved.** All four P1 items are fixed: pgvector-native retrieval, LLM calls off the event loop, one shared connection pool, and ingestion moved out of the web process into a worker service. Two pieces of per-process state that quietly broke horizontal scaling now live in the database (P2-5). |
 | Repo hygiene | **Good.** The duplicated ontology is gone (P2-1); dead files, the committed AI-assistant note, the crawl artefact and the committed debug values are all gone, and the README is real (P2-6). Only the stale branches are left, deliberately untouched. |
 
-**Every P0 except the two security items, and the whole P1 and P2 tiers, are now fixed** — see the changelog. What remains is **P0-3** (no authentication) and **P0-4** (debug `print()` of conversation state). Both are security, both are untouched, and together they are the only thing left in the way of deploying this anywhere real.
+**Every P0 except one, and the whole P1 and P2 tiers, are now fixed** — see the changelog. What remains is **P0-3**: no authentication, no authorisation, `CORS: *`, and an unguarded crawler that will fetch any URL it is given. It is now the single thing standing between this and a deployable internal product.
 
 ### Changelog
+
+**2026-09-06 — P0-4, conversation state off the logs.** `_log_node` printed the full Supervisor state on every node entry and exit — the customer's message, the whole history, and their email address inside the ticket confirmation — unconditionally, in the Docker image. Replaced by a `DEBUG`-level tracer that checks whether it is enabled *before* serialising, and redacts free text to a shape summary even when it is, so routing stays debuggable without reproducing what anyone said. `LOG_PII=true` is the deliberate opt-in. Verified with a turn carrying a card number and an email address: zero occurrences in the container log, and per-turn log volume down from hundreds of lines to 18. Suite 613 → **642 passing**.
+
+**2026-09-06 — F9, a structured fact was deleting the answer.** `deduplicate` dropped any chunk containing both a fact's value and its entity label, as "redundant prose". For *"Why did Soani Tech change its name?"* that discarded the entire 2463-character press release — because the graph held `Alpinist Studios formerly_known_as "Soani Tech"` and a rebrand announcement necessarily names both. The documentation section was left literally empty, so the model's refusal was *correct*. Two earlier hypotheses (an over-strict answer prompt; an empty-string fact value) were each killed by measurement before the real cause turned up. The pass is removed, not tightened. Cleaned up alongside: the dead `groundedness_threshold`, the discarded `is_grounded` (the node hardcoded `"GROUNDED"`, so refusals logged as successes — and **a test was pinning that in place**), and a real order-preservation bug in `deduplicate` that my own new test caught. The module had had no tests at all. Suite 604 → **613 passing**.
+
+**2026-09-06 — F6, corpus-aware scope.** The Supervisor decided what was in scope from a hand-written paragraph with no connection to the knowledge base, and confidently refused *"Why did Soani Tech change its name?"* while a document called `soani-tech-is-now-alpinist-studios` sat in the corpus. **The fix originally proposed for this was refuted by measurement**: routing low-confidence out-of-scope classifications through retrieval would have done nothing, because that question scored 0.95 and "how's the weather" scored 0.98 — the classifier is sure, and wrong. The domain definition now carries the titles of the live documents, refreshed on a TTL so ingestion widens scope without a restart, degrading to the static paragraph whenever the database is unreachable. Measured: the refused question flips to `DOMAIN_REQUEST` while "how's the weather" stays `OUT_OF_SCOPE`. Suite 589 → **604 passing**.
+
+**2026-09-06 — F5, deterministic routing.** `decide_strategy` keyed on the *shape* of a non-deterministic extraction, so the same question retrieved differently on different runs — `Policy`/`supports`/0.85 routed to structured-only (no semantic search at all) while `Company`/no-slot/0.62 routed to hybrid. Routing now asks one question, *is there an entity to look up?*, and consults neither shape nor confidence; the second lever turned out to matter too (0.54 vs 0.56 flipped vector/hybrid). `STRATEGY_STRUCTURED` is no longer selectable, though it is kept as the backstop carrying the P1-6 fallback. A new `route` node finally populates `KnowledgeAgentState.retrieval_strategy` — declared and documented since the beginning, never written, because conditional edges cannot write state. Fixed alongside: **application `INFO` logging never appeared at all** (uvicorn leaves the root at WARNING), so the new line — and any other — was being discarded in every deployed process; `logging_config.configure_logging()` now runs at startup. Suite 521 → **589 passing**.
+
+**2026-09-06 — F7, streamed responses.** A median turn takes 35s and the customer saw an animated ellipsis for all of it, with no way to tell a working system from a hung one. A new `POST /chat/stream` returns server-sent events — a `trace_id` up front, then stage transitions, heartbeats through the silence, and the same answer the buffered endpoint gives. `POST /chat` is unchanged and is the fallback. Measured in the browser, the stage line now appears at **0.05s** and updates as the turn progresses. Both paths share `_prepare_turn` / `_finalize_turn`, so the ticket/interrupt flow cannot diverge between them; hanging up cancels the graph, and the F1 turn budget still applies. Suite 506 → **521 passing**.
+
+**2026-09-06 — F4, structured-fact relevance.** `structured_lookup`'s *general* shape returns everything known about an entity, and that dump went into the prompt under "Structured Facts" ahead of the documentation — with `answer.md` rule 4 telling the model to *prefer* it. Measured live on "What are the core values of the company?": 15 facts, all about Agile ceremonies, while the documentation right below contained the answer. **The run that retrieved more was the run that failed** (facts=15 → refusal; facts=0 → correct answer, twice). A new `agents/knowledge/fact_relevance.py` keeps an unslotted dump only where it overlaps the question, leaves slotted lookups untouched, and degrades to keeping everything when it has nothing to filter on. On the live corpus: 15 → 0 facts for the two failing questions, and 15 → **14** for a question the dump genuinely answers. When a structured-only dump is emptied, the P1-6 fallback now runs a semantic search instead. Suite 489 → **506 passing**.
+
+**2026-09-06 — F1, the turn budget.** The ladder bounded the Knowledge node and nothing else, but a turn is `classify + knowledge node + checkpointing` — each honouring its own budget while the total reached ~76s under a 60s client. `ChatService.handle_message_turn` now enforces a 52s `TURN_BUDGET_S` and genuinely **cancels** the graph, so the server stops working instead of finishing an answer nobody will receive. The node budget is derived from what the turn has left (45s → 37s) rather than declared independently, classification's retry loop is bounded by wall clock rather than attempt count (~31s → 12s), and `assert_ladder_is_consistent()` now checks the **sum** of the server-side rungs — the pairwise check is what passed this configuration. Worst-case server turn: **52s, down from ~76s**. Verified by booting a real server with a setting the old check accepted and watching it refuse. Suite 476 → **489 passing**.
+
+**2026-09-06 — F2 / F3, from the live UI test (see `test.md`).** Driving the real chat UI in a browser found three defects the test suite could not — all three are now fixed.
+
+- **F3 — failures are no longer silent.** The Supervisor's classification node and its Knowledge adapter both caught every exception and logged *nothing*; the entire diagnostic for a failed turn was `"error": "error"`. Both now log the exception with a traceback, and a provider rate limit is detected through the `__cause__` chain and told apart from a defect — labelled `rate_limited` and worded as a wait rather than a breakage. Verified live by forcing each failure through the running server.
+- **F2 — per-stage LLM timeouts.** One 15s ceiling for every call sat right on top of the answer stage's measured range (1.3–13.6s), so healthy generations were cut off as failures. Now `short` (10s/22s) for classify/rewrite/extract and `answer` (30s/38s) for generation, with `assert_ladder_is_consistent()` rewritten to enforce that no single stage can consume the node's whole budget. Found alongside: **the Anthropic provider stored a `timeout` it never passed to the SDK** — the same defect as the Supervisor's Groq client, in a second place.
+
+Suite 443 → **476 passing, fully green** (the Playwright browser is now installed, so the 1 failure and 4 errors that had persisted all along are gone).
+
+**Also measured, and the reason F1 matters:** retrieval costs **0.14–0.24s** and is not the bottleneck — the four sequential LLM calls are. Median turn latency in the browser was **35s**, with 4 of 12 turns over 45s. Full detail in `test.md`.
 
 **2026-09-06 — P1-6 structured-only fallback.** A structured-only lookup that finds nothing now retries semantically instead of returning an empty result. The defect was in the *graph topology*, not in any module: every unit test passed while the compiled graph silently never called vector search. Verified against the live database — the query that exposed it now retrieves the answering chunk and carries it into the prompt with citations. Suite 427 → **443 passing**.
 
@@ -59,17 +82,25 @@ cd backend && env -u PYTHONPATH ./.venv/bin/python -m pytest -q
 → 10 failed, 268 passed, 6 errors in 170.19s
 ```
 
-**Current, after every P0-1, P0-2, P1 and P2 fix:**
+**Current, after every P0-1, P0-2, P0-4, P1, P2, P1-6, F1–F7 and F9 fix:**
 ```
 cd backend && env -u PYTHONPATH ./.venv/bin/python -m pytest -q
-→ 1 failed, 443 passed, 2 skipped, 4 errors in 54.08s
+→ 642 passed, 2 skipped in 57.80s
 ```
 
-Collected: 450 tests. The runtime also dropped from ~131s to ~55s: the two opt-in tests that were making real network calls on every run now skip correctly. **Every remaining failure and error needs only a Playwright browser** (`uv run playwright install --with-deps chromium`); nothing else in the suite is non-deterministic.
+Collected: 644 tests, **no failures and no errors**. The runtime also dropped from ~131s to ~58s: the two opt-in tests that were making real network calls on every run now skip correctly. The 1 failure and 4 errors that had persisted through every earlier report were all the same missing dependency — a Playwright browser, installed with `uv run playwright install chromium`. Nothing in the suite is non-deterministic.
 
 ### Verified against the live stack
 
-The P1-6 and P2 work was checked against the running Docker stack, not only the test suite:
+The P1-6, P2 and F1-F7 work was checked against the running Docker stack, not only the test suite. The container was rebuilt after the F-series so it serves the current code; the frontend is bind-mounted, so its changes were already live.
+
+**Full chain, end to end** (the question that originally failed at three separate layers):
+
+> *"What was Alpinist Studios called before, and where is it based?"*
+> → classified `DOMAIN_REQUEST` (F6) → `retrieval strategy=hybrid` (F5) → retrieval returns `soani-tech-is-now-alpinist-studios` → streamed as `accepted` + 3 stages + result (F7)
+> → **"Alpinist Studios was previously called Soani Tech, and the company is based in Kathmandu, Nepal.[2]"**
+
+Earlier detail:
 
 | Check | Result |
 |---|---|
@@ -127,21 +158,28 @@ Marking those five `@pytest.mark.integration` (item 5 in §7.1) is still worth d
 
 ```
  Browser (vanilla JS, hash router)
-   │  POST /chat            GET /graph/*          POST /ingest/*
+   │  POST /chat/stream (SSE)   POST /chat   GET /graph/*   POST /ingest/*
    ▼
  FastAPI  (main.py — also serves the frontend as StaticFiles at "/")
    │
-   ├── ChatService ──► Supervisor LangGraph  (Postgres checkpointer)
-   │                     ├── classify_and_route   (Groq / Gemini / stub)
-   │                     ├── knowledge_agent  ──► Knowledge LangGraph
-   │                     │     rewrite → extract → decide_strategy
-   │                     │        ├── structured_lookup  (EAV tables)
-   │                     │        └── vector_search      (embedding_chunk)
-   │                     │     → rank → dedupe → context → prompt → llm
-   │                     ├── ticket_agent  (interrupt() × 2 → TicketStore → SMTP)
-   │                     └── assemble_response
+   ├── ChatService  ── one turn, bounded by TURN_BUDGET_S (52s)
+   │     │              buffered (/chat) and streamed (/chat/stream) share
+   │     │              _prepare_turn / _finalize_turn, so they cannot drift
+   │     ▼
+   │   Supervisor LangGraph  (Postgres checkpointer)
+   │     ├── classify_and_route   (Groq / Gemini / stub)
+   │     │     scope comes from CorpusScope — the live document titles,
+   │     │     refreshed on a TTL, not a hand-written paragraph
+   │     ├── knowledge_agent  ──► Knowledge LangGraph
+   │     │     rewrite → extract → route ──┬─► structured_lookup  (EAV)
+   │     │                                 └─► vector_search      (pgvector)
+   │     │        both arms run concurrently whenever an entity resolves;
+   │     │        facts are relevance-filtered, chunks are never deleted
+   │     │     → rank → dedupe → context → prompt → llm
+   │     ├── ticket_agent  (interrupt() × 2 → TicketStore → SMTP)
+   │     └── assemble_response
    │
-   ├── /graph/*   read-only EAV graph browser (own engine)
+   ├── /graph/*   read-only EAV graph browser
    └── /ingest/*  upload | crawl | discover | confirm  → 202 Accepted
                     └─► register_document_version → MinIO + job row
                                                           │
@@ -150,6 +188,10 @@ Marking those five `@pytest.mark.integration` (item 5 in §7.1) is still worth d
         → EAV extraction (Groq) → persist → cutover
 ```
 
+Every Supervisor node is wrapped by `node_logging.log_node`: off at the
+default `INFO`, and free text redacted to a shape summary even at `DEBUG`
+unless `LOG_PII=true` (P0-4).
+
 **Stack:** Python 3.12, FastAPI, LangGraph 1.x, SQLAlchemy 2 (async, psycopg3), Alembic, Postgres 16 + pgvector, MinIO, Apache Tika, Playwright, `sentence-transformers` (BAAI/bge-base-en-v1.5, 768-dim), Groq (`openai/gpt-oss-120b`) as the live LLM.
 
 ---
@@ -157,7 +199,7 @@ Marking those five `@pytest.mark.integration` (item 5 in §7.1) is still worth d
 ## 4. What is done
 
 ### 4.1 Database schema — complete
-`backend/src/ai_customer_assistant/db/models.py`, 8 Alembic migrations in a clean linear chain, single head (`0001 → 11160c9078cc → 0003 → 1e4beb1b8d68 → 2a1c9f0e45d7 → 4c2d8a1f9e0b → 7b3e5c1a9d42 → 9f1a2b7c4e08`).
+`backend/src/ai_customer_assistant/db/models.py`, 9 Alembic migrations in a clean linear chain, single head (`0001 → 11160c9078cc → 0003 → 1e4beb1b8d68 → 2a1c9f0e45d7 → 4c2d8a1f9e0b → 7b3e5c1a9d42 → 9f1a2b7c4e08 → 3d6f8b2c17ae`).
 
 - **EAV core:** `entity`, `attribute`, `value`, `relation` with the right unique constraints for idempotent writes.
 - **Document versioning:** `knowledge_source` ⇄ `knowledge_source_version` (the circular FK is correctly handled with `use_alter=True`), `embedding_chunk` (`Vector(768)`, HNSW-indexed on `vector_cosine_ops`), `knowledge_source_entity_map`, `knowledge_injection_job`.
@@ -219,7 +261,7 @@ Zero-build vanilla JS (`window.ACA` namespace, classic scripts, hash router), da
 | **CI** | No `.github/`, no lint config, no formatter config, no coverage gate. |
 | ~~**Worker in Docker**~~ | **Done (P1-5)** — a `worker` service now runs `scripts/run_worker.py`; the API only enqueues. |
 | **Observability** | No structured logging, no metrics, no tracing. `trace_id` is generated and threaded but never actually logged anywhere. |
-| **Streaming responses** | `/chat` is request/response only; a long RAG turn shows a spinner. Now a UX gap rather than a correctness one — the budgets no longer contradict each other (P2-4). |
+| ~~**Streaming responses**~~ | **Done (F7)** — `POST /chat/stream` reports progress from ~50ms; `POST /chat` is unchanged as the fallback. |
 | **Rate limiting / abuse control** | None, on an endpoint that spends money per call. |
 
 ---
@@ -347,15 +389,42 @@ Anyone who can reach the port can: run unlimited LLM-billed chat turns, upload a
 
 ---
 
-### 🔴 P0-4 — Full conversation state is printed to stdout
+### ✅ P0-4 — Full conversation state was printed to stdout — **FIXED 2026-09-06**
 
-**Location:** `agents/supervisor/graph.py:56-79` (`_log_node`)
+**Was:** `agents/supervisor/graph.py:56-79` (`_log_node`)
 
-Every Supervisor node entry and exit does `print(json.dumps(state, indent=2))`. That includes the customer's raw message, the full conversation history, and — on the ticket path — **their email address**. It is unconditional: no log level, no environment guard, and it runs in the Docker image.
+Every Supervisor node entry and exit did `print(json.dumps(state, indent=2))`. On a ticket turn that put the customer's raw message, the entire conversation history, and — inside the confirmation text — **their email address** on stdout. Unconditional: no log level, no environment guard, and it ran in the Docker image, so anyone with access to the container logs had the transcript.
 
-Beyond the privacy problem, `print()` is synchronous, unbuffered under `PYTHONUNBUFFERED=1`, and adds real latency per node.
+**Three problems, of which privacy was only the first.** It could not be turned off — there was no level to raise and no flag to unset. `print()` bypasses logging entirely, ignoring handlers, formatting and `LOG_LEVEL`, and under `PYTHONUNBUFFERED=1` it is a synchronous write per node. And it serialised the whole state to indented JSON *before* deciding anything, so the cost was paid whether or not anyone was reading.
 
-**Fix:** Replace with `logger.debug(...)`, gate on `logging.DEBUG`, and redact `user_message` / `conversation_history` / `email` behind an explicit `LOG_PII=true` flag that defaults to off.
+**Fixed** in a new `agents/supervisor/node_logging.py`:
+
+| | |
+|---|---|
+| Emits at `DEBUG` through the logging module | off under the default `INFO`, obeys `LOG_LEVEL` like everything else |
+| Checks `isEnabledFor(DEBUG)` **before** serialising | a disabled trace costs an integer comparison, not a JSON dump |
+| Redacts free text even when tracing is on | routing stays debuggable without reproducing what anyone said |
+| `LOG_PII=true` opts back in | deliberate, visible, and the only way |
+
+**Why redact rather than just gate.** A pure on/off flag fails the moment someone needs to debug a live routing problem: the only way to see which branch a turn took would be to also print the customer's message. So the default keeps every routing field and replaces free text with a shape summary:
+
+```
+{
+  "user_message": "<redacted str, 46 chars>",
+  "conversation_history": "<redacted list, 1 items>",
+  "request_category": "DOMAIN_REQUEST",
+  "domain_confidence": 0.95,
+  "intent": "CREATE_TICKET",
+  "next_agent": "TICKET_AGENT",
+  "final_response": "<redacted str, 67 chars>"
+}
+```
+
+**The email drove the design.** It never arrives in a field called `email` — it is embedded in the ticket confirmation prose, so `response` and `final_response` are redacted too. Trusting a field name to be honest about what it holds is what would have missed it.
+
+**Verified live.** A turn carrying `my card 4111-1111-1111-1111 was double charged, email me at alice@example.com` produced **zero** occurrences of the card number, the address or the message text in the container logs — and log volume per turn fell from hundreds of lines to 18.
+
+**Files changed:** `agents/supervisor/node_logging.py` (**new**), `agents/supervisor/graph.py`, `tests/agents/supervisor_agent_test/test_node_logging.py` (**new**, 29 tests).
 
 ---
 
@@ -658,7 +727,11 @@ It raises at import on an inverted ladder — a misconfiguration here produces n
 - **The Supervisor's Groq client stored a `timeout` it never passed to the API call.** Classification had no socket deadline whatsoever; a stalled connection held the chat turn open indefinitely.
 - **The Groq retry budget is now wall-clock, not a per-sleep clamp.** Clamping each sleep at 300s still allowed several clamped sleeps in a row. The loop now stops as soon as the next attempt could not finish within what is left.
 
-`tests/test_timeout_ladder.py` (**new**, 11 tests) covers the ordering, the boot-time refusal, the retry budget, the classify deadline, and — by reading `chat.js` — that the frontend literal still agrees.
+`tests/test_timeout_ladder.py` (**new**, now 19 tests) covers the ordering, the boot-time refusal, the retry budget, the classify deadline, and — by reading `chat.js` — that the frontend literal still agrees.
+
+**Refined 2026-09-06 (F2).** Live testing showed one timeout for every LLM call was too blunt: the answer stage measures 1.3–13.6s against classify's 1.1s, so a shared 15s ceiling cut off healthy generations. The two innermost rungs are now per stage — see `test.md` F2.
+
+**Completed 2026-09-06 (F1).** The original fix bounded the Knowledge *node*, not the whole turn, so `classify + node + checkpointing` could still overrun the client. The turn is now the budgeted unit, the node budget is derived from it, and the consistency check tests the sum rather than each pair — see `test.md` F1.
 
 ---
 
@@ -708,7 +781,7 @@ Migration `3d6f8b2c17ae` is additive: nothing dropped, no row changed, exact dow
 1. ~~Fix the ticket flow (P0-1).~~ **Done 2026-09-05** — 7 regressions cleared, 11 tests added.
 2. ~~Remove import-time `load_dotenv()` (P0-2).~~ **Done 2026-09-06**
 3. Implement JWT auth + CORS allowlist + SSRF guard on the crawler (P0-3).
-4. Replace `print()` node logging with redacted structured logging (P0-4).
+4. ~~Replace `print()` node logging with redacted structured logging (P0-4).~~ **Done 2026-09-06**
 5. ~~Fall back to vector search when a structured-only lookup returns nothing (P1-6).~~ **Done 2026-09-06**
 6. Mark DB/Playwright tests with `@pytest.mark.integration` and add a `-m "not integration"` default so the unit suite is green on a clean checkout.
 
@@ -723,8 +796,9 @@ Migration `3d6f8b2c17ae` is additive: nothing dropped, no row changed, exact dow
 ### 7.3 Quality
 12. ~~Unify the ontologies with a drift test (P2-1).~~ **Done 2026-09-06**
 13. ~~Build a golden Q&A evaluation set; calibrate `similarity_threshold` against it (P2-2).~~ **Done 2026-09-06** — 26+10 questions, `scripts/calibrate_retrieval.py`; threshold 0.70 → 0.50, relative margin added. Grow the set as the corpus grows.
+13b. ~~Stop unfiltered structured-fact dumps diluting the answer prompt (F4).~~ **Done 2026-09-06** — `agents/knowledge/fact_relevance.py`.
 14. Add a re-ranking stage (cross-encoder) — currently ranking is a weighted score with no second pass.
-14b. Populate `KnowledgeAgentState.retrieval_strategy`. It is declared and documented but never set, because LangGraph conditional edges cannot write state; both routing edges recompute the decision instead. A small `decide_strategy` node would fix it and make the chosen strategy visible in traces — pair it with §7.5's observability work.
+14b. ~~Populate `KnowledgeAgentState.retrieval_strategy`.~~ **Done 2026-09-06 (F5)** — a `route` node writes it; both edges read that one value.
 15. ~~Wrap ingestion in a proper transaction boundary (P2-3).~~ **Done 2026-09-06**
 16. Add `ruff` + `mypy` and a GitHub Actions workflow: lint → type-check → unit tests → coverage gate.
 
@@ -732,11 +806,11 @@ Migration `3d6f8b2c17ae` is additive: nothing dropped, no row changed, exact dow
 17. **Ticket status lookup** — the `ticket` table exists and the `CHECK_TICKET_STATUS` intent is already classified; only the read path is missing. Cheapest remaining MVP feature.
 18. **Admin API** — implement the three `NotImplementedError` dependencies in `ingestion/storage/api.py`, add `/admin/sources|jobs|stats|tickets`, and register the router. The frontend page is already written and waiting.
 19. **Prompt management endpoint** so the Prompt page's edits persist server-side and are versioned.
-20. **Streaming `/chat`** via SSE — transforms perceived latency. (The timeout *mismatch* is fixed by P2-4; streaming is now a UX win rather than a correctness one.)
+20. ~~**Streaming `/chat`** via SSE.~~ **Done 2026-09-06 (F7)** — `POST /chat/stream`; the buffered endpoint remains as the fallback.
 21. **Ticket lifecycle** — `updated_at`, `resolved_at`, assignee, a `thread_id` FK linking a ticket back to its conversation, and inbound email replies.
 
 ### 7.5 Operations
-22. Structured JSON logging that actually emits the `trace_id` already threaded through every node.
+22. Structured JSON logging that actually emits the `trace_id` already threaded through every node. (Log *levels* were fixed with F5 — `logging_config.configure_logging()`; the remaining work is structure and the trace id.)
 23. Prometheus metrics: chat latency by stage, retrieval hit rate, LLM token spend, job queue depth.
 24. `/health` should check Postgres, MinIO and Tika — it currently returns `{"status": "ok"}` unconditionally.
 25. ~~A stale-job reaper.~~ **Done 2026-09-05** with P1-5.
@@ -750,7 +824,7 @@ Migration `3d6f8b2c17ae` is additive: nothing dropped, no row changed, exact dow
 - [x] ~~Add the missing `f` to the email subject~~ — **done** (P0-1)
 - [x] ~~`git rm echo backend/store_new.py backend/src/ai_customer_assistant/api/chat.py`~~ — **done** (P2-6)
 - [x] ~~Delete the `?` splitting block~~ — **done** (P1-3)
-- [ ] Guard `_log_node` behind `if os.environ.get("DEBUG_GRAPH")` — `graph.py:56` (P0-4)
+- [x] ~~Guard `_log_node` behind an environment check~~ — **done** (P0-4), and it redacts rather than merely gating
 - [ ] `allow_origins` from an env var — `main.py:49` (P0-3)
 - [x] ~~Revert `CrawlConfig.request_timeout` to 15.0 and `max_pages` to 50~~ — **done** (P2-6)
 - [x] ~~Add `output/`, `frontend/app/.vite/` to `.gitignore`~~ — **done** (P2-6)
@@ -786,9 +860,51 @@ POSTGRES_HOST=localhost POSTGRES_PORT=5433 \
   env -u PYTHONPATH PYTHONPATH=src/ai_customer_assistant ./.venv/bin/python -m alembic upgrade head
 ```
 
-**Codebase size:** backend `src` 14 809 lines · tests 4 628 lines · frontend 2 773 lines.
+**Codebase size:** backend `src` 17 005 lines · tests 9 116 lines · frontend 3 892 lines. The test suite roughly doubled over this work — 268 → 642 passing.
 
 **Largest modules:** `frontend/src/pages/graph.js` (930) · `ontology/vocabulary.py` (596) · `frontend/src/pages/ingest.js` (509) · `agents/knowledge/structured_lookup.py` (455) · `api/ingest.py` (~470).
+
+### Configuration
+
+Everything below has a working default; none of it needs setting to run the
+stack. Listed because most of it was added during this work and appears in no
+other document.
+
+**Timeout ladder** (`timeouts.py` — the arithmetic is checked at import and the
+process refuses to start if it does not hold):
+
+| Variable | Default | What it bounds |
+|---|---|---|
+| `CLIENT_REQUEST_TIMEOUT_S` | 60 | The browser's own limit; declared here as the reference point, and mirrored in `chat.js` |
+| `TURN_BUDGET_S` | 52 | One whole `POST /chat`, enforced in `ChatService` |
+| `CLASSIFY_BUDGET_S` | 12 | Classification including retries |
+| `CHECKPOINT_HEADROOM_S` | 3 | Reading and writing the checkpoint |
+| `KNOWLEDGE_NODE_TIMEOUT_S` | *derived* | Whatever the turn budget has left; an explicit value is accepted and validated |
+| `LLM_SHORT_TIMEOUT_S` / `LLM_SHORT_RETRY_BUDGET_S` | 10 / 22 | One classify/rewrite/extract call, and that stage with retries |
+| `LLM_ANSWER_TIMEOUT_S` / `LLM_ANSWER_RETRY_BUDGET_S` | 30 / 34 | The same for answer generation, which is legitimately an order of magnitude slower |
+
+**Retrieval** (`KNOWLEDGE_AGENT_` prefix, `agents/knowledge/config.py`):
+
+| Variable | Default | Notes |
+|---|---|---|
+| `KNOWLEDGE_AGENT_SIMILARITY_THRESHOLD` | 0.50 | Absolute floor. **Measured, not guessed** — see P2-2 before changing it |
+| `KNOWLEDGE_AGENT_RELATIVE_SCORE_MARGIN` | 0.12 | How far below the best hit a chunk may score and survive |
+| `KNOWLEDGE_AGENT_TOP_K` | 8 | Must not exceed `MAX_CONTEXT_CHUNKS` |
+| `KNOWLEDGE_AGENT_MAX_CONTEXT_CHUNKS` / `MAX_STRUCTURED_FACTS` | 12 / 20 | Prompt budgets |
+| `KNOWLEDGE_AGENT_EXTRACTION_CONFIDENCE_THRESHOLD` | 0.55 | No longer used for routing (F5); still gates extraction |
+| `KNOWLEDGE_AGENT_LLM_PROVIDER` / `LLM_MODEL_NAME` / `REWRITE_MODEL_NAME` | anthropic / claude-sonnet-5 | Falls back to the stub when the credential is absent |
+| `EMBEDDING_QUERY_INSTRUCTION` | *model-derived* | Overrides the BGE query prefix; set to empty to disable it |
+
+**Logging and privacy:**
+
+| Variable | Default | Notes |
+|---|---|---|
+| `LOG_LEVEL` | `INFO` | Uvicorn leaves the root at WARNING, so this is what makes application logs appear at all |
+| `LOG_PII` | unset (off) | Opt back in to un-redacted node traces. **Never set in a deployed process** — see P0-4 |
+
+**Database pool** (`db/engine.py`): `DB_POOL_SIZE` (10), `DB_MAX_OVERFLOW` (5), `DB_POOL_TIMEOUT` (30), `DB_POOL_RECYCLE` (1800).
+
+**Credentials and services:** `GROQ_API_KEY` / `GEMINI_API_KEY` / `ANTHROPIC_API_KEY`, `POSTGRES_*`, `MINIO_*`, `TIKA_BASE_URL`, `INGEST_DEFAULT_USER_ID`, `FRONTEND_DIR`.
 
 **Re-run the retrieval calibration** after changing the corpus, the embedding model or the thresholds:
 ```bash

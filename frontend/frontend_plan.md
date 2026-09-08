@@ -1,5 +1,10 @@
 # Frontend Implementation Plan — AI Customer Assistant
 
+> **Historical — the original frontend plan.** Its status line predates the
+> streaming chat surface; `chat.js` now consumes `POST /chat/stream` and
+> renders progress stages, falling back to `POST /chat`. See the root
+> `README.md` and `status.md`.
+
 Status: **Phases 0–3 implemented. Phase 4 UI implemented (backend-blocked — endpoints not wired). Phase 5 partial (responsive CSS + basic polish).**
 Scope: `frontend/` — build the missing customer portal (chat), ingestion UI, admin dashboard, and unify/upgrade the existing knowledge-graph explorers around the ready backend.
 

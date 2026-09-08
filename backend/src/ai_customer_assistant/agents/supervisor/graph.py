@@ -14,8 +14,6 @@ later (see §4.3).
 """
 from __future__ import annotations
 
-import inspect
-import json
 from typing import Callable, Optional
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -29,6 +27,7 @@ from .agents_wiring import (
 )
 from .llm_client import StubSupervisorLLMClient, SupervisorLLMClient
 from .node import assemble_response_node, make_classify_and_route_node
+from .node_logging import log_node as _log_node
 from .schema import NextAgent, SupervisorState
 from ..ticket_agent.store import TicketStore
 
@@ -43,42 +42,6 @@ _ROUTE_TARGETS = {
     NextAgent.TICKET_AGENT: TICKET_AGENT_NODE,
     NextAgent.NONE: END,
 }
-
-
-def _jsonable(value: object) -> object:
-    """Best-effort JSON conversion so any state value (dataclasses, enums,
-    provenance objects) can be dumped for terminal debugging."""
-    try:
-        return json.loads(json.dumps(value, default=str))
-    except (TypeError, ValueError):
-        return str(value)
-
-
-def _log_node(node_name: str, node_fn):
-    """Wrap a node function to print the SupervisorState on entry and the
-    partial update it returns — a dev/debug aid that works for both sync and
-    async node functions. ``interrupt()`` pauses propagate untouched."""
-    if inspect.iscoroutinefunction(node_fn):
-
-        async def _async_logged(state: SupervisorState) -> dict:
-            print(f"\n--- supervisor node: {node_name} (in) ---")
-            print(json.dumps(_jsonable(state), indent=2))
-            result = await node_fn(state)
-            print(f"--- supervisor node: {node_name} (out) ---")
-            print(json.dumps(_jsonable(result), indent=2))
-            return result
-
-        return _async_logged
-
-    def _sync_logged(state: SupervisorState) -> dict:
-        print(f"\n--- supervisor node: {node_name} (in) ---")
-        print(json.dumps(_jsonable(state), indent=2))
-        result = node_fn(state)
-        print(f"--- supervisor node: {node_name} (out) ---")
-        print(json.dumps(_jsonable(result), indent=2))
-        return result
-
-    return _sync_logged
 
 
 def _placeholder_agent_node(agent_name: str):
@@ -117,6 +80,7 @@ def build_supervisor_graph(
     knowledge_timeout_s: float = KNOWLEDGE_NODE_TIMEOUT_S,
     ticket_ops: Optional[Callable] = None,
     checkpointer: Optional[BaseCheckpointSaver] = None,
+    domain_definition: Optional[Callable[[], str]] = None,
 ):
     """Construct and compile the Supervisor's LangGraph graph.
 
@@ -149,7 +113,11 @@ def build_supervisor_graph(
 
     graph = StateGraph(SupervisorState)
     graph.add_node(
-        CLASSIFY_NODE, _log_node(CLASSIFY_NODE, make_classify_and_route_node(client))
+        CLASSIFY_NODE,
+        _log_node(
+            CLASSIFY_NODE,
+            make_classify_and_route_node(client, domain_definition=domain_definition),
+        ),
     )
     graph.add_node(
         KNOWLEDGE_AGENT_NODE,

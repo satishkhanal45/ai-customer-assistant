@@ -77,7 +77,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .config import KnowledgeAgentConfig
 from .constants import STRATEGY_HYBRID, STRATEGY_STRUCTURED, STRATEGY_VECTOR
 from .exceptions import AmbiguousEntityError, AttributeNotFoundError, EmptyRetrievalError, EntityNotFoundError
-from .extraction import is_confident
+from .fact_relevance import relevant_facts
 from .structured_lookup import structured_lookup
 from .types import RankedResult, RetrievedChunk, RewrittenQuery, StructuredFact, StructuredQuery
 from .vector_search import EmbeddingFunction, vector_search
@@ -101,32 +101,66 @@ GRACEFUL_VECTOR_MISSES: tuple[type[BaseException], ...] = (EmptyRetrievalError,)
 def decide_strategy(query: StructuredQuery, *, config: KnowledgeAgentConfig) -> str:
     """Pure decision function backing graph.py's conditional edge.
 
-    - structured: an entity was resolved, a specific attribute or
-      relation was requested, and extraction confidence clears the
-      configured threshold — an exact-fact lookup.
-    - hybrid: an entity was resolved and (a specific slot was
-      requested OR confidence clears the threshold) but the structured
-      case above didn't fully apply — a broad question about a named
-      entity ("tell me everything about X"), or a specific-seeming
-      request extraction wasn't fully confident about, benefits from
-      structured facts as an anchor plus supporting documentation.
-    - vector: no entity was resolved, or what was resolved carries too
-      little confidence to anchor a lookup on — open-ended,
-      explanatory, or procedural questions.
+    - hybrid: an entity was resolved. Structured facts anchor the answer,
+      documentation supports it, and the two arms run concurrently.
+    - vector: no entity was resolved — open-ended, explanatory, or
+      procedural questions with nothing to look up.
 
-    Routing quality follows directly from extraction.py's confidence
-    calibration (see prompts/extraction.md) — this function only
-    combines already-extracted signals, it doesn't re-interpret the
-    original query text."""
+    ## Why there is no longer a structured-*only* strategy (F5)
+
+    There was a third outcome: an entity, a specific slot, and confidence
+    above the threshold meant an exact-fact lookup with **no semantic search
+    at all**. That made the answer depend on the exact shape of a
+    non-deterministic extraction. Observed live, same question, same
+    `temperature=0`:
+
+        run A:  entity_type='Policy',  relation_type='supports', 0.85
+                -> slot + confident   -> structured-only, no chunks
+        run B:  entity_type='Company', no slot,                  0.62
+                -> confident, no slot -> hybrid, with chunks
+
+    Two different retrieval plans, two different contexts, two different
+    answers to one question. No amount of tuning the confidence threshold
+    fixes that, because the runs did not differ in confidence — they
+    differed in *shape*, and any router keyed on shape inherits the
+    extractor's variance.
+
+    So the extraction is treated as a hint about what to *add*, never as a
+    switch that turns retrieval off. Whenever an entity is worth looking up,
+    semantic search runs alongside it. It costs nothing worth counting:
+    measured at 0.14-0.24s, and `_hybrid_fan_out` runs both arms
+    concurrently, so the wall-clock cost is usually zero.
+
+    The confidence score is not consulted either, for the same reason in a
+    second guise: two runs landing either side of the threshold (0.54 and
+    0.56) would otherwise choose different plans, which is the same defect
+    with a different trigger. Routing now asks one question — *is there an
+    entity to look up?* — and nothing about how sure the extractor felt.
+
+    That is safe because the structured arm is guarded downstream rather
+    than upstream: an unresolvable entity degrades to no facts
+    (`GRACEFUL_STRUCTURED_MISSES`), and an unslotted dump is filtered
+    against the question by `fact_relevance` (F4). Confidence was a poor
+    proxy for both, and it cost determinism to consult.
+
+    `STRATEGY_STRUCTURED` is deliberately still implemented — see
+    `should_fall_back_to_vector` and `_structured_only`. It is now a
+    backstop rather than a routing outcome: `hybrid_retrieve` is a public
+    function that a caller could drive with any strategy, and deleting the
+    P1-6 fallback would mean re-introducing that bug the moment anything
+    routes there again. `test_f5_routing_consistency.py` asserts this
+    function never selects it.
+
+    Routing quality otherwise follows from extraction.py's confidence
+    calibration (see prompts/extraction.md) — this function only combines
+    already-extracted signals, it doesn't re-interpret the original query
+    text."""
     has_entity = query.entity_type is not None
-    has_specific_slot = query.attribute is not None or query.relation_type is not None
-    confident = is_confident(query, config=config)
 
     return next(
         strategy
         for strategy, is_applicable in (
-            (STRATEGY_STRUCTURED, has_entity and has_specific_slot and confident),
-            (STRATEGY_HYBRID, has_entity and (has_specific_slot or confident)),
+            (STRATEGY_HYBRID, has_entity),
             (STRATEGY_VECTOR, True),
         )
         if is_applicable
@@ -200,6 +234,7 @@ async def _structured_only(
         # caught rather than propagated so both entry points behave alike:
         # the graph's structured_lookup node already degrades these to ().
         facts = ()
+    facts = relevant_facts(facts, query=query, query_text=rewritten.rewritten_text)
 
     if not should_fall_back_to_vector(STRATEGY_STRUCTURED, facts):
         return RankedResult(structured_facts=facts, retrieved_chunks=())
@@ -245,7 +280,11 @@ async def _hybrid_fan_out(
         return_exceptions=True,
     )
     return RankedResult(
-        structured_facts=_resolve_arm(structured_outcome, graceful_types=GRACEFUL_STRUCTURED_MISSES),
+        structured_facts=relevant_facts(
+            _resolve_arm(structured_outcome, graceful_types=GRACEFUL_STRUCTURED_MISSES),
+            query=query,
+            query_text=rewritten.rewritten_text,
+        ),
         retrieved_chunks=_resolve_arm(vector_outcome, graceful_types=GRACEFUL_VECTOR_MISSES),
     )
 

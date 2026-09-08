@@ -62,7 +62,88 @@
     return attempt();
   }
 
+  /* Server-sent events over POST.
+   *
+   * EventSource cannot do this — it is GET-only and cannot carry a body — so
+   * the stream is read straight off fetch's ReadableStream. `onEvent` is
+   * called with each parsed JSON payload as it arrives.
+   *
+   * `idleTimeout` bounds *silence*, not total duration, which is the whole
+   * point of streaming: a turn may legitimately run for a minute, but half a
+   * minute with nothing on the wire means the connection is dead. The server
+   * sends a heartbeat every few seconds, so any real gap is a fault.
+   */
+  function stream(path, body, options) {
+    var opts = options || {};
+    var idleTimeout = opts.idleTimeout || 30000;
+    var onEvent = opts.onEvent || function () {};
+    var controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    var idleTimer = null;
+
+    function resetIdle(reject) {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(function () {
+        if (controller) controller.abort();
+        var e = new Error('Request timed out.');
+        e.timeout = true;
+        reject(e);
+      }, idleTimeout);
+    }
+
+    return new Promise(function (resolve, reject) {
+      var init = {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+        body: JSON.stringify(body)
+      };
+      if (controller) init.signal = controller.signal;
+
+      fetch(base() + path, init).then(function (response) {
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        if (!response.body || !response.body.getReader) {
+          // No streaming support in this browser — the caller falls back.
+          var e = new Error('streaming unsupported');
+          e.unsupported = true;
+          throw e;
+        }
+        var reader = response.body.getReader();
+        var decoder = new TextDecoder();
+        var buffer = '';
+        resetIdle(reject);
+
+        function pump() {
+          return reader.read().then(function (chunk) {
+            if (chunk.done) {
+              if (idleTimer) clearTimeout(idleTimer);
+              resolve();
+              return;
+            }
+            resetIdle(reject);
+            buffer += decoder.decode(chunk.value, { stream: true });
+            // SSE frames are separated by a blank line; anything after the
+            // last one is a partial frame and stays in the buffer.
+            var frames = buffer.split('\n\n');
+            buffer = frames.pop();
+            frames.forEach(function (frame) {
+              frame.split('\n').forEach(function (line) {
+                if (line.indexOf('data:') !== 0) return;
+                try { onEvent(JSON.parse(line.slice(5).trim())); } catch (e) { /* ignore a malformed frame */ }
+              });
+            });
+            return pump();
+          });
+        }
+        return pump();
+      }).catch(function (err) {
+        if (idleTimer) clearTimeout(idleTimer);
+        if (err && err.name === 'AbortError') return;   // already rejected above
+        reject(err);
+      });
+    });
+  }
+
   NS.api = {
+    stream: stream,
     get: function (path, params) {
       var q = '';
       if (params) {

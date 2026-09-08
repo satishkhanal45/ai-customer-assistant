@@ -22,7 +22,6 @@ from .constants import (
     DEFAULT_EMBEDDING_DIMENSION,
     DEFAULT_EMBEDDING_MODEL_NAME,
     DEFAULT_EXTRACTION_CONFIDENCE_THRESHOLD,
-    DEFAULT_GROUNDEDNESS_THRESHOLD,
     DEFAULT_MAX_CONTEXT_CHUNKS,
     DEFAULT_MAX_STRUCTURED_FACTS,
     DEFAULT_RELATIVE_SCORE_MARGIN,
@@ -63,8 +62,13 @@ class KnowledgeAgentConfig(BaseSettings):
     max_context_chunks: int = DEFAULT_MAX_CONTEXT_CHUNKS
     max_structured_facts: int = DEFAULT_MAX_STRUCTURED_FACTS
 
-    # -- Generation / groundedness ------------------------------------------
-    groundedness_threshold: float = DEFAULT_GROUNDEDNESS_THRESHOLD
+    # -- Generation ----------------------------------------------------------
+    # No `groundedness_threshold` here on purpose. One was declared and
+    # validated for a long time and read by absolutely nothing, which made it
+    # look like a tunable safety control: the obvious thing to reach for when
+    # the assistant over-refuses, and it would have done nothing at all.
+    # Grounding is decided by the answer prompt and reported by the model as
+    # `GroundedResponse.is_grounded`; there is no score to threshold.
     llm_provider: str = "anthropic"
     llm_model_name: str = "claude-sonnet-5"
     rewrite_model_name: str = "claude-sonnet-5"
@@ -90,7 +94,6 @@ class KnowledgeAgentConfig(BaseSettings):
         "similarity_threshold",
         "relative_score_margin",
         "extraction_confidence_threshold",
-        "groundedness_threshold",
     )
     @classmethod
     def _must_be_a_probability(cls, value: float) -> float:

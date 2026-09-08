@@ -89,8 +89,8 @@ DEFAULT_TOP_K: int = 8
 #
 # So this is now a sanity floor — it rejects "what is the recipe for
 # sourdough bread" (0.388), not near-misses — and the real discrimination
-# happens in DEFAULT_RELATIVE_SCORE_MARGIN below and in the groundedness
-# check. Re-run the calibration script after any corpus or model change;
+# happens in DEFAULT_RELATIVE_SCORE_MARGIN below and in the answer prompt's
+# own grounding rules. Re-run the calibration script after any corpus or model change;
 # these numbers are specific to both.
 DEFAULT_SIMILARITY_THRESHOLD: float = 0.50
 
@@ -118,7 +118,6 @@ DEFAULT_RELATIVE_SCORE_MARGIN: float = 0.12
 DEFAULT_EXTRACTION_CONFIDENCE_THRESHOLD: float = 0.55
 DEFAULT_MAX_CONTEXT_CHUNKS: int = 12
 DEFAULT_MAX_STRUCTURED_FACTS: int = 20
-DEFAULT_GROUNDEDNESS_THRESHOLD: float = 0.60
 
 # --------------------------------------------------------------------------
 # Embedding model — must match chunk_embed's IngestionSettings so

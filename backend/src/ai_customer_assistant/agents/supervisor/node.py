@@ -7,13 +7,21 @@ classification.py and routing.py.
 """
 from __future__ import annotations
 
-from typing import Callable
+import logging
+from typing import Callable, Optional
 
 from .classification import parse_llm_response
 from .llm_client import SupervisorLLMClient
-from .prompt import build_supervisor_system_prompt
-from .routing import _SAFE_FALLBACK_RESPONSE, assemble_final_response, decide_route
+from .prompt import DOMAIN_DEFINITION, build_supervisor_system_prompt
+from .routing import (
+    _SAFE_FALLBACK_RESPONSE,
+    assemble_final_response,
+    decide_route,
+    failure_response,
+)
 from .schema import ConversationTurn, NextAgent, SupervisorState
+
+logger = logging.getLogger(__name__)
 
 _MAX_HISTORY_TURNS = 4
 _MAX_HISTORY_CHARS = 4000
@@ -38,10 +46,15 @@ def _bounded_history(history: list[ConversationTurn]) -> list[ConversationTurn]:
     return kept
 
 
-def _transient_error_update(state: SupervisorState) -> dict:
+def _transient_error_update(
+    state: SupervisorState, exc: Optional[BaseException] = None
+) -> dict:
     """Classify LLM unavailable: never decline an in-domain question as
     OUT_OF_SCOPE because the model failed. Surface a transient error so the
-    customer can retry, mirroring the Knowledge node's error path."""
+    customer can retry, mirroring the Knowledge node's error path.
+
+    ``exc`` selects the wording: a provider rate limit is a wait, not a
+    breakage, and saying so gives the customer something to act on."""
     classification = parse_llm_response("{}")
     return {
         "request_category": classification.request_category,
@@ -53,31 +66,48 @@ def _transient_error_update(state: SupervisorState) -> dict:
         "clarification_attempts": state.get("clarification_attempts", 0),
         "next_agent": NextAgent.NONE,
         "ticket_type": None,
-        "final_response": _SAFE_FALLBACK_RESPONSE,
+        "final_response": failure_response(exc),
     }
 
 
 def make_classify_and_route_node(
     llm_client: SupervisorLLMClient,
+    domain_definition: Optional[Callable[[], str]] = None,
 ) -> Callable[[SupervisorState], dict]:
     """Build the classify-and-route node, closing over the LLM client.
 
     The returned function is what LangGraph invokes on entry: it reads
     user_message / conversation_history, classifies, decides where to route,
     and returns a partial update — never a mutated copy of the input state.
+
+    ``domain_definition`` supplies what counts as in-scope, called fresh on
+    each turn so it can track the knowledge base (F6). It defaults to the
+    static paragraph, which is what made the classifier confidently refuse
+    questions the corpus answered — see ``domain_scope``.
     """
+    resolve_domain = domain_definition or (lambda: DOMAIN_DEFINITION)
 
     def classify_and_route(state: SupervisorState) -> dict:
         try:
             raw_response = llm_client.classify(
-                system_prompt=build_supervisor_system_prompt(),
+                system_prompt=build_supervisor_system_prompt(resolve_domain()),
                 user_message=state["user_message"],
                 conversation_history=_bounded_history(
                     state.get("conversation_history", [])
                 ),
             )
-        except Exception:
-            return _transient_error_update(state)
+        except Exception as exc:  # noqa: BLE001 - a failed classify must
+            # never take the whole turn down, but it must not vanish either.
+            # This branch used to swallow the exception silently, so a Groq
+            # 429 and a genuine bug produced the same customer-facing apology
+            # and left nothing at all in the log to tell them apart.
+            logger.warning(
+                "supervisor classification failed (%s); returning a transient "
+                "error to the customer",
+                type(exc).__name__,
+                exc_info=True,
+            )
+            return _transient_error_update(state, exc)
 
         classification = parse_llm_response(raw_response)
         decision = decide_route(

@@ -1,22 +1,41 @@
 # AI Customer Assistant — Backend
 
-## Crawler v2 setup (Playwright)
+Setup, commands and architecture live in the [root README](../README.md).
+This file covers the two things specific to working inside `backend/`.
 
-The crawler v2 (sitemap-first discovery + Playwright page rendering) requires a
-Chromium binary in addition to the Python package. Install the dependency and
-the browser once:
-
-```bash
-uv add playwright
-uv run playwright install --with-deps chromium
-```
-
-`--with-deps` installs the OS libraries Chromium needs (requires root/sudo on
-Linux). This is a new environment requirement beyond the v1 (httpx-only)
-crawler — run it in every environment that executes a crawl (local dev, CI).
-
-## Tests
+## Running the tests
 
 ```bash
-uv run pytest
+make test                       # from the repository root — preferred
 ```
+
+Or directly:
+
+```bash
+cd backend
+env -u PYTHONPATH ./.venv/bin/python -m pytest -q
+```
+
+**Not `uv run pytest`, and not a bare `pytest`.** An activated conda
+environment — or a stale `VIRTUAL_ENV` from another checkout — puts a
+different interpreter first on `PATH`, and the suite fails with about two
+dozen collection errors that look like missing dependencies and are not.
+Invoking `backend/.venv`'s Python by absolute path is what avoids it, and is
+what `make test` does.
+
+`env -u PYTHONPATH` matters for the same reason: an inherited `PYTHONPATH`
+can shadow the package under test.
+
+## Crawling (Playwright)
+
+Site crawls render pages with Playwright, which needs a Chromium binary the
+Python package does not install:
+
+```bash
+cd backend
+uv run playwright install chromium
+```
+
+Add `--with-deps` to also install the OS libraries Chromium needs; that
+requires root on Linux. Without the browser, four crawler tests error and one
+fails — everything else passes.
