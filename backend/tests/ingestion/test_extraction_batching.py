@@ -242,3 +242,126 @@ class TestCooldownBound:
         from timeouts import INGEST_EXTRACTION_STAGE_BUDGET_S
 
         assert extraction_agent._MAX_COOLDOWN_WAIT < INGEST_EXTRACTION_STAGE_BUDGET_S / 4
+
+
+# ---------------------------------------------------------------------------
+# A rejected batch costs a window, not a document.
+#
+# Two documents in the development corpus (`sdlc.pdf`, `tech_stck.pdf`) sat at
+# zero chunks because one call in the batch came back 400 `json_validate_failed`
+# with an *empty* `failed_generation` -- a response outgrowing what the model
+# will emit for three windows at once, not unextractable content. The batch
+# raised, and the whole document failed over it.
+# ---------------------------------------------------------------------------
+
+class _Rejected(Exception):
+    """Groq's 400 for a response that did not match the requested schema."""
+
+    def __init__(self, message: str | None = None) -> None:
+        super().__init__(
+            message
+            or "Error code: 400 - {'error': {'message': \"Failed to validate "
+               "JSON. Please adjust your prompt.\", 'code': 'json_validate_failed', "
+               "'failed_generation': ''}}"
+        )
+
+
+def _reject_batches_larger_than(limit: int):
+    """A model that cannot answer a wide request but handles a narrow one --
+    the shape of the real failure."""
+
+    def responder(kwargs):
+        if _windows_in(kwargs) > limit:
+            raise _Rejected()
+        return _answer_every_window(kwargs)
+
+    return responder
+
+
+class TestRejectedBatchSplits:
+    def test_a_rejected_batch_is_split_rather_than_lost(self):
+        agent, client = _agent(_reject_batches_larger_than(1))
+
+        result = extract_document(agent, source_name="doc", chunks=_doc("a", "b", "c"))
+
+        # Every chunk still extracted, from the single-window retries.
+        assert len(result) == 3
+        assert all(e.entity is not None for e in result)
+        # 1 rejected batch of three, then 2 and 1 (also rejected), then singles.
+        assert [_windows_in(c) for c in client.calls] == [3, 1, 2, 1, 1]
+
+    def test_only_the_window_that_cannot_be_extracted_is_lost(self):
+        """The other case: one genuinely bad window. The split isolates it."""
+
+        def responder(kwargs):
+            if "POISON" in kwargs["messages"][1]["content"]:
+                raise _Rejected()
+            return _answer_every_window(kwargs)
+
+        agent, _ = _agent(responder)
+
+        result = extract_document(
+            agent, source_name="doc", chunks=_doc("a", "POISON", "c")
+        )
+
+        by_index = {e.chunk_index: e for e in result}
+        assert by_index[0].entity is not None
+        assert by_index[2].entity is not None
+        assert by_index[1].entity is None      # lost, but only this one
+
+    def test_a_document_whose_every_window_is_rejected_still_fails(self):
+        """Degrading to "extracted nothing" would mark the job SUCCEEDED with
+        an empty graph -- indistinguishable from a document that genuinely had
+        no facts in it, which is worse than failing."""
+        from ingestion.extraction.agent import ExtractionFailed
+
+        agent, _ = _agent(lambda kwargs: (_ for _ in ()).throw(_Rejected()))
+
+        with pytest.raises(ExtractionFailed):
+            extract_document(agent, source_name="doc", chunks=_doc("a", "b", "c"))
+
+    def test_a_rate_limit_is_not_split(self, monkeypatch):
+        """Splitting a throttled batch makes two throttled calls against a
+        budget that is already gone. Only deterministic rejections split."""
+        monkeypatch.setattr(extraction_agent.time, "sleep", lambda _: None)
+        calls: list[int] = []
+
+        def responder(kwargs):
+            calls.append(_windows_in(kwargs))
+            raise Exception("Error code: 429 - rate limit reached")
+
+        agent, _ = _agent(responder)
+
+        with pytest.raises(Exception, match="429"):
+            extract_document(agent, source_name="doc", chunks=_doc("a", "b", "c"))
+
+        # `_invoke_with_retry` retries the same width; nothing narrower is tried.
+        assert set(calls) == {3}
+
+
+class TestRetryPredicate:
+    def test_a_schema_rejection_is_not_retried(self):
+        """It was: the message contains the word "JSON", which satisfied the
+        old `"json" in lower` clause. With temperature=0 and an identical
+        prompt every attempt fails identically -- five times the tokens for a
+        guaranteed failure, against the daily budget that was the constraint."""
+        assert extraction_agent._is_retryable(_Rejected()) is False
+
+    def test_a_rate_limit_is_still_retried(self):
+        assert extraction_agent._is_retryable(
+            Exception("Error code: 429 - rate limit reached for model")
+        ) is True
+
+    def test_a_schema_rejection_costs_one_call_per_width(self):
+        """The token saving, measured: each width is tried once, not five
+        times."""
+        agent, client = _agent(lambda kwargs: (_ for _ in ()).throw(_Rejected()))
+
+        with pytest.raises(Exception):
+            extract_document(agent, source_name="doc", chunks=_doc("a", "b", "c"))
+
+        # 3 -> (1, 2) -> the 2 splits into (1, 1): five calls, each a
+        # different request. Under the old predicate the first would alone
+        # have been five identical ones.
+        assert len(client.calls) == 5
+        assert [_windows_in(c) for c in client.calls] == [3, 1, 2, 1, 1]

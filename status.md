@@ -17,7 +17,7 @@ This is a **multi-agent RAG customer-support assistant** for Alpinist Studios, b
 | Dimension | State |
 |---|---|
 | Architecture & module design | **Strong.** Clean layering, dependency injection everywhere, pure functions separated from I/O, excellent docstrings. |
-| Feature completeness (MVP scope) | **~75%.** Chat, RAG, ingestion, crawling, graph browsing and ticket creation all work. Ticket status lookup and the admin surface do not. |
+| Feature completeness (MVP scope) | **~80%.** Chat, RAG, ingestion, crawling, graph browsing, ticket creation, ticket status lookup and the admin *read* surface all work. The admin *write* surface and prompt management do not. |
 | Test suite | **759 passing / 0 failing / 0 erroring / 2 skipped** (761 collected). **Fully green** — the Playwright browser is installed, so the last non-deterministic gap is closed. |
 | Production readiness | **No known blockers.** One open correctness issue, P1-7, which only bites once documents start being *updated* rather than added. Authentication, authorisation, a CORS allowlist, rate limiting and an SSRF guard on the crawler are all in place (P0-3). Conversation state no longer reaches the logs (P0-4). Secrets are no longer injected by import side effect (P0-2), and the client/server timeout ladder no longer inverts (P2-4). |
 | Scalability | **Much improved.** All four P1 items are fixed: pgvector-native retrieval, LLM calls off the event loop, one shared connection pool, and ingestion moved out of the web process into a worker service. Two pieces of per-process state that quietly broke horizontal scaling now live in the database (P2-5). |
@@ -25,7 +25,7 @@ This is a **multi-agent RAG customer-support assistant** for Alpinist Studios, b
 
 **Every P0 and P2 is fixed, and P1-1 through P1-6** — see the changelog. **P1-7 is open**: superseded document versions are retained but unreachable by semantic search, while superseded structured facts accumulate with no way to tell which is current. It needs a product decision (keep history, or supersede it) before it needs code, and it becomes visible the first time a document is re-ingested with changed content — see §6. P0-3, the last blocker, closed on 2026-09-08: the API is authenticated and authorised, CORS is an env-driven allowlist, requests are rate limited per user, and the crawler refuses to fetch anything that is not a publicly-routable host.
 
-What is left is *unbuilt features* rather than defects — ticket status lookup, the admin API, prompt management, CI and lint configuration, and structured logging with metrics. Those are listed in §5 and §7.
+What is left is *unbuilt features* rather than defects — the admin write API, prompt management, CI and lint configuration, and structured logging with metrics. Those are listed in §5 and §7.
 
 ### Changelog
 
@@ -72,6 +72,52 @@ The page's `source` column ("saved" vs "from environment") exists because a save
 Two defects found by measurement rather than reasoning. **(1) A read-after-write race:** `get_session` commits during dependency teardown, *after* the response reaches the client, so the page's immediate reload could miss its own write — observed as a save that appeared not to take. The mutating handlers now commit before returning. **(2) `server_default="false"` is a string literal**, which Postgres reads as the boolean but SQLite stores as the text `'false'` — and `'false'` is truthy, so a freshly inserted row came back claiming to be the default provider. Fixed with a Python-side `default=False` alongside it. Harmless on Postgres, wrong everywhere else; a test caught it.
 
 Migration `9a4f7c2b83d1`, with a partial unique index enforcing at most one default in the database rather than in whoever remembers to clear the old one. Suite 774 → **798 passing**.
+
+**2026-09-09 — Ingestion: the last two unindexed documents.** With the P0
+persistence work and the quota problems behind it, 22 of 24 sources were
+indexed. The two that were not — `sdlc.pdf` and `tech_stck.pdf`, both at zero
+chunks — failed on one thing: `400 Failed to validate JSON`, a class
+`ingestion.md` had noted and then set aside without giving it a work item.
+
+Reading the code found two defects behind it. `_is_retryable` matched the
+substring `"json"`, and Groq's rejection message contains the word — so every
+rejection was retried five times at `temperature=0` with an identical prompt,
+five identical failures, five times the tokens against the daily budget that
+was the binding constraint. And because batching put three windows in one
+call, a rejected call lost all three and failed the document; the empty
+`failed_generation` says the response outgrew what the model emits for three
+windows at once, which is a request-size problem, not a content one.
+
+A rejected batch is now split in half and retried recursively — repeating a
+deterministic request is never the answer to it, but a smaller request can
+be. Only deterministic rejections split (splitting a throttled batch makes
+two throttled calls), a document whose every window is rejected still fails
+rather than succeeding with an empty graph, and a lost window is logged with
+its chunk index. Recorded as item 8b in `ingestion.md`.
+
+Verified on the real rejection: `sdlc.pdf` logged `batch of 3 window(s) ...
+was rejected; splitting into 1 and 2`, then lost the one window that still
+failed at width 1 and kept the other two — `Extracted sdlc.pdf with 1 of 9
+window(s) lost`, where the same rejection previously ended the document. That
+the isolated window failed alone says both causes were real: one window here
+genuinely cannot be extracted, and the other two were collateral damage from
+sharing its call.
+
+**All 24 sources are now indexed for the first time** — 77 chunks (from 67),
+491 entities (410), 768 values (708), 374 relations. Suite 846 →
+**853 passing**.
+
+**2026-09-09 — Ticket status lookup.** The last hardcoded promise in the core product. `CHECK_TICKET_STATUS` was classified correctly, reached `routing.py`, and was answered with a fixed string — *"Ticket status lookups aren't available yet"* — regardless of what the customer asked, while the `ticket` table held 7 real rows. A customer who had just been handed a ticket id in a confirmation could not ask what had become of it.
+
+Two pieces. `TicketStore.get_ticket(ticket_id)` is the read half of a store that until now only wrote. A new `ticket_status` graph node sits beside the ticket agent rather than inside it: the ticket agent's entire job is *creating* a ticket, and it does so by interrupting twice to collect a reason and an email — routing a status question there would have opened a second ticket instead of answering about the first. `routing.py` now names the new destination, and `NextAgent` gained `TICKET_STATUS_AGENT`.
+
+The node answers in one turn when the message already carries an id (`"any update on 974de0b9-…?"`), and `interrupt()`s once for the id when it does not — the same pause/resume mechanism the ticket-creation flow uses, so the serving layer needed no change.
+
+**Tickets are identified by id, not by email.** An email lookup would be friendlier — nobody keeps a uuid to hand — and it would let anyone who can name an address read that person's tickets, in a chat surface where the address is typed rather than proven. The id is what the confirmation gave them and it is unguessable. Doing this by email needs the ticket bound to the authenticated `AppUser`, which is worth building and is not a lookup change.
+
+Three things the implementation is deliberate about. A **malformed id is a miss, not an error** — the id arrives from a person typing into a chat box, and "no ticket with that id" is the honest answer to `abc123` as much as to a well-formed uuid that does not exist; raising would turn a typo into a failed turn. A **miss is reported as a miss**, never as a status, because inventing "that ticket is open" for an id that matches nothing is worse than saying it was not found. And the extracted id is **normalized to lowercase**, caught by a test pasting an id in the uppercase form a mail client renders: the fake store's lookup missed, and the real one would have echoed an id back in a different case than the confirmation showed.
+
+Verified against the live database, not only the fakes: the node read ticket `974de0b9-…` back through the real `TicketStore` and rendered *"is currently **open**"* with the customer's own reason and address, and answered a bogus uuid with the not-found text. Suite 836 → **846 passing**.
 
 **2026-09-09 — Admin API (read).** All four tabs of the Admin page had shown *"Endpoint not available yet"* since the page was written, while the data sat in the database: 24 knowledge sources, 82 ingestion jobs, 339 entities, 7 tickets. `api/admin.py` adds `GET /admin/knowledge-sources | jobs | stats | tickets`, admin-only, each returning `{ <list>, total, limit, offset }` rather than a bare array so a caller can tell "all of it" from "the first page of it".
 
@@ -365,7 +411,7 @@ shell history and in `ps` output for every other user on the machine.
 | ~~**Authentication / authorisation**~~ | **Done (P0-3, 2026-09-08).** `auth/` holds tokens, passwords, roles, dependencies, the router, rate limiting and the SSRF guard. What is *not* built is anything behind the `admin` role beyond account creation — prompt management and source deletion are still unwritten endpoints, and that is why the role exists now rather than later. |
 | ~~**Admin API (read)**~~ | **Done 2026-09-09.** `api/admin.py` serves `GET /admin/knowledge-sources`, `/admin/jobs`, `/admin/stats`, `/admin/tickets`, admin-only. All four Admin tabs now render real data instead of "Endpoint not available yet", and the Overview figures come from `/admin/stats` rather than a capped `/graph/search`. |
 | **Admin API (write)** | Still unbuilt: no source deletion, no re-index trigger, no ticket status change. `ingestion/storage/api.py` remains unregistered — it is an *upload* path duplicating `POST /ingest/upload`, not the read surface the page needed. |
-| **Ticket status lookup** | Routed away at classification time with a hardcoded "not available yet" string (`routing.py:_CHECK_STATUS_UNAVAILABLE`). No read path against the `ticket` table. |
+| ~~**Ticket status lookup**~~ | **Done 2026-09-09.** `TicketStore.get_ticket` reads the `ticket` table; a `ticket_status` node answers the `CHECK_TICKET_STATUS` intent that was previously routed away with a hardcoded "not available yet" string. What is *not* built: looking a ticket up by anything other than its id (see the note in §3), and changing a ticket's status, which belongs to the admin write surface. |
 | **Prompt management API** | Frontend edits never reach the server. |
 | ~~**LLM provider keys**~~ | **Done 2026-09-09.** `GET/PUT/DELETE /admin/llm-providers`, admin-only, keys encrypted at rest. What is *not* built: validating a key against the provider before saving it, and per-agent provider overrides — the default applies to every agent. |
 | **Typed settings** | `config.py` now loads the environment (P0-2), but modules still read `os.environ` directly rather than a typed settings object. `agents/knowledge/config.py` shows the pattern to follow. |
@@ -946,7 +992,7 @@ Migration `3d6f8b2c17ae` is additive: nothing dropped, no row changed, exact dow
 16. Add `ruff` + `mypy` and a GitHub Actions workflow: lint → type-check → unit tests → coverage gate.
 
 ### 7.4 Features
-17. **Ticket status lookup** — the `ticket` table exists and the `CHECK_TICKET_STATUS` intent is already classified; only the read path is missing. Cheapest remaining MVP feature.
+17. ~~**Ticket status lookup**~~ **Done 2026-09-09** — `TicketStore.get_ticket` plus a `ticket_status` graph node. What it deliberately does not do is find a ticket from an email address; see §3.
 18. ~~**Admin API (read)**~~ **Done 2026-09-09** — `api/admin.py`. The long-standing note pointing at `ingestion/storage/api.py` was aimed at the wrong module: that is a *write* path duplicating `POST /ingest/upload`, and wiring it would have produced a second upload route while leaving all four read tabs empty. What remains is the **write** surface: delete a source, trigger a re-index, change a ticket's status.
 19. **Prompt management endpoint** so the Prompt page's edits persist server-side and are versioned.
 20. ~~**Streaming `/chat`** via SSE.~~ **Done 2026-09-06 (F7)** — `POST /chat/stream`; the buffered endpoint remains as the fallback.
@@ -1112,4 +1158,4 @@ P1-6 is the sharpest illustration, and the reason it is worth changing how this 
 
 P0-3 produced two more of exactly this shape, worth recording because neither would have shown up as an error. Revoking every session on detecting a replayed refresh token, and counting a failed login attempt, both happen on the way to an *error response* — and the request-scoped session rolls back when a handler raises. Both writes were silently discarded: theft detection revoked nothing, and the fifth wrong password was as unthrottled as the first. Every line of both functions was correct; the defect lived in their relationship with the framework's error handling. They were caught only by tests that asserted the **consequence** — count the live tokens, read the counter — rather than the status code the endpoint returned.
 
-**All ten P0/P1/P2 items and all nine live-test defects are now closed. This is a deployable internal product.** What remains is unbuilt features (ticket status lookup, the admin API, prompt management) and operational polish (structured logging with the `trace_id` already threaded through every node, metrics, CI) — work that adds capability rather than work that removes risk.
+**All ten P0/P1/P2 items and all nine live-test defects are now closed. This is a deployable internal product.** What remains is unbuilt features (the admin write API, prompt management) and operational polish (structured logging with the `trace_id` already threaded through every node, metrics, CI) — work that adds capability rather than work that removes risk.
