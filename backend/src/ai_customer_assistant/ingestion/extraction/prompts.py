@@ -68,3 +68,48 @@ Chunk text:
 {chunk_text}
 ---
 """
+
+# ---------------------------------------------------------------------------
+# Batched extraction.
+#
+# The system prompt above is 896 tokens, and a single window of text is about
+# 450 -- so two thirds of every call was the same vocabulary sent again. One
+# call covering several windows pays that once instead of once per window.
+#
+# The rules are deliberately unchanged from the single-window prompt: this
+# addendum only describes the envelope. Restating the extraction rules in
+# different words is how two prompts drift into extracting different things.
+# ---------------------------------------------------------------------------
+
+BATCH_SYSTEM_SUFFIX = """\
+
+BATCHED INPUT:
+You will receive SEVERAL numbered windows of text in one message. Treat each
+window completely independently, applying all of the rules above to each one
+on its own. Do not merge findings across windows, and do not skip a window
+because it resembles another.
+
+Respond with ONLY a single JSON object of this exact shape:
+
+{
+  "windows": [
+    {"window_id": 0, "entities": [...], "attributes": [...], "relations": [...]}
+  ]
+}
+
+Emit EXACTLY ONE object per window you were given, with that window's
+`window_id`, in the same order. A window with nothing to extract still gets
+an object, with empty lists. The word JSON appears here as required.
+"""
+
+BATCH_WINDOW_TEMPLATE = """\
+--- WINDOW {window_id} ---
+{chunk_text}
+"""
+
+BATCH_TASK_TEMPLATE = """\
+Document: {source_name}
+Windows in this message: {window_count}
+
+{windows}
+"""

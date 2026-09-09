@@ -125,7 +125,7 @@ is protected by default or the suite fails.
 | Role | Can |
 |---|---|
 | `member` | Chat, browse the knowledge graph, upload documents, run crawls, watch jobs. Sidebar: Overview, Chat, Graph, Ingest. |
-| `admin` | All of that, plus the system's own controls: creating accounts, agent prompts, and (when they are built) retrieval configuration and source deletion. Sidebar adds Prompt and Admin. |
+| `admin` | All of that, plus the system's own controls: creating accounts, agent prompts, **LLM provider API keys**, the Admin dashboard (sources, jobs, stats, tickets), and — when they are built — retrieval configuration and source deletion. Sidebar adds Prompt, Admin and API Keys. |
 
 The UI hides admin pages from a member and redirects with a message if one is
 reached by URL. That is a convenience, not the protection — the API refuses
@@ -180,6 +180,7 @@ page — can read them.
 | `CRAWL_DOMAIN_ALLOWLIST` | empty | Restrict crawling to these domains. Empty means any publicly-routable host. |
 | `CRAWL_ALLOW_ADDRESSES` | empty | CIDRs exempt from the private/loopback refusal, for crawling an intranet. A list, not a switch, so opening `10.1.0.0/16` does not also open `169.254.169.254`. |
 | `RATE_LIMIT_DISABLED` | `false` | Tests and single-user local development only. |
+| `GROQ_API_KEY` and friends | unset | Still read, and still the fallback. A key saved on the **Admin › API Keys** page shadows the matching variable; clearing it falls back here. Stored keys are encrypted under a key derived from `AUTH_SECRET`, so rotating that secret means re-entering them. |
 
 Rate limits: 5 logins per 15 minutes (per address *and* per account), 20 chat
 turns a minute and 500 a day per user, 10 ingestion calls a minute. The chat

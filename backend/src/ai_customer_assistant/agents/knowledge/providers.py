@@ -39,6 +39,8 @@ from timeouts import (
     sleep_within_budget,
 )
 
+import llm_credentials
+
 from .config import KnowledgeAgentConfig
 
 # Transient-call budget for the Groq backend: connection blips and 429 rate
@@ -130,7 +132,7 @@ class AnthropicKnowledgeProvider:
     ) -> None:
         import anthropic
 
-        resolved_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        resolved_key = api_key or llm_credentials.api_key_for("anthropic")
         if not resolved_key:
             raise ValueError("ANTHROPIC_API_KEY not set.")
 
@@ -206,7 +208,7 @@ class GroqKnowledgeProvider:
         answer_timeout: float = LLM_ANSWER_TIMEOUT_S,
         answer_retry_budget: float = LLM_ANSWER_RETRY_BUDGET_S,
     ) -> None:
-        resolved_key = api_key or os.environ.get("GROQ_API_KEY")
+        resolved_key = api_key or llm_credentials.api_key_for("groq")
         if not resolved_key:
             raise ValueError("GROQ_API_KEY not set.")
 
@@ -317,7 +319,7 @@ class GeminiKnowledgeProvider:
         timeout: float = LLM_SHORT_TIMEOUT_S,
         answer_timeout: float = LLM_ANSWER_TIMEOUT_S,
     ) -> None:
-        resolved_key = api_key or os.environ.get("GEMINI_API_KEY")
+        resolved_key = api_key or llm_credentials.api_key_for("gemini")
         if not resolved_key:
             raise ValueError("GEMINI_API_KEY not set.")
 
@@ -451,15 +453,23 @@ def _resolved_provider_from_config(config: Optional[KnowledgeAgentConfig]) -> st
     configured = getattr(config, "llm_provider", "stub")
     if configured in _PROVIDER_FACTORIES and _has_credentials(configured):
         return configured
-    for candidate in ("groq", "gemini"):
-        if _has_credentials(candidate):
+    # The administrator's chosen default is tried before the hard-coded
+    # order, so setting it on the Admin page actually decides something.
+    for candidate in (llm_credentials.default_provider(), "groq", "gemini"):
+        if candidate in _PROVIDER_FACTORIES and _has_credentials(candidate):
             return candidate
     return "stub"
 
 
 def _has_credentials(provider: str) -> bool:
-    env_var = _ENV_VAR_BY_PROVIDER.get(provider)
-    return bool(env_var and os.environ.get(env_var))
+    """Whether this provider has a key at all -- saved or in the environment.
+
+    `llm_credentials.api_key_for` checks the admin-saved key first and the
+    provider's environment variable second, so a deployment that never uses
+    the Admin page behaves exactly as it did when this read `os.environ`
+    directly.
+    """
+    return bool(llm_credentials.api_key_for(provider))
 
 
 def llm_completions(provider: KnowledgeProvider) -> LLMCompletions:

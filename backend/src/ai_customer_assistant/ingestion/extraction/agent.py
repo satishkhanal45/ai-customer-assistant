@@ -11,6 +11,8 @@ relations -- in a single response, so it is both cheaper and more complete.
 from __future__ import annotations
 
 import json
+import logging
+import os
 import time
 from dataclasses import dataclass
 
@@ -22,10 +24,14 @@ from ingestion.extraction.ontology import (
     safe_canonicalize_relation_type,
 )
 from ingestion.extraction.prompts import (
+    BATCH_SYSTEM_SUFFIX,
+    BATCH_TASK_TEMPLATE,
+    BATCH_WINDOW_TEMPLATE,
     CHUNK_TASK_TEMPLATE,
     SYSTEM_PROMPT,
 )
 from ingestion.extraction.schema import (
+    BatchedExtractionOutput,
     ExtractionOutput,
     ValueType,
     VALUE_TYPES,
@@ -35,6 +41,8 @@ from ingestion.pipeline_types import (
     ExtractedFact,
     ExtractedRelation,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,7 +82,20 @@ _WINDOW_OVERLAP = 150
 
 _MAX_RETRIES = 5
 _RETRY_BASE_DELAY = 3.0
-_MAX_COOLDOWN_WAIT = 420.0  # 7 minutes
+
+# How long a single 429 cooldown may hold the call.
+#
+# This was 420 seconds. The stage that contains it is bounded at 600
+# (`INGEST_EXTRACTION_STAGE_BUDGET_S`), so one cooldown could consume 70% of
+# the budget for the entire document and a second would exceed it outright --
+# which is what turned rate limiting into documents that never finished.
+#
+# 60 seconds is chosen against the thing being waited for: Groq's per-minute
+# token bucket refills every minute, so waiting longer than that for a TPM
+# limit buys nothing. A longer cooldown hint means the daily quota is gone,
+# and no amount of waiting inside one job will fix that -- failing fast and
+# leaving the job requeueable is the better answer.
+_MAX_COOLDOWN_WAIT = 60.0
 
 
 def _window_text(text: str, size: int, overlap: int) -> tuple[str, ...]:
@@ -127,14 +148,16 @@ def _cooldown_seconds(exc: Exception) -> float | None:
     return None
 
 
-def _invoke_with_retry(agent: ExtractionAgent, messages: list[dict]) -> object:
+def _invoke_with_retry(
+    agent: ExtractionAgent, messages: list[dict], *, max_tokens: int | None = None
+) -> object:
     delay = _RETRY_BASE_DELAY
     for attempt in range(_MAX_RETRIES):
         try:
             return agent.client.chat.completions.create(
                 model=agent.model,
                 temperature=0,
-                max_tokens=agent.max_tokens,
+                max_tokens=max_tokens or agent.max_tokens,
                 response_format={"type": "json_object"},
                 messages=messages,
             )
@@ -195,28 +218,10 @@ def _output_to_extraction(chunk_index: int, output: ExtractionOutput) -> ChunkEx
     return ChunkExtraction(chunk_index=chunk_index, entity=entity, facts=facts, relations=relations)
 
 
-def extract_chunk(
-    agent: ExtractionAgent,
-    *,
-    source_name: str,
-    chunk_index: int,
-    chunk_text: str,
-) -> ChunkExtraction:
-    """
-    Run extraction for a single chunk: one JSON-mode model call, then a pure
-    parse + canonicalize step.
-    """
-    messages = _build_messages(
-        source_name=source_name, chunk_index=chunk_index, chunk_text=chunk_text
-    )
-    response = _invoke_with_retry(agent, messages)
-    content = response.choices[0].message.content or "{}"
-    try:
-        payload = json.loads(content)
-    except json.JSONDecodeError:
-        payload = {}
-    output = ExtractionOutput.model_validate(payload)
-    return _output_to_extraction(chunk_index, output)
+# NOTE: a second, identical `extract_chunk` used to be defined here and was
+# immediately shadowed by the windowing version below -- dead from the moment
+# windowing was added. Removed rather than kept: two functions with one name
+# means the one you read is not necessarily the one that runs.
 
 
 def _merge_windows(extractions: tuple[ChunkExtraction, ...]) -> ChunkExtraction:
@@ -277,6 +282,117 @@ def _extract_window(
     return _output_to_extraction(chunk_index, output)
 
 
+# How many windows share one model call.
+#
+# The system prompt is 896 tokens and a window is about 450, so a single
+# window call spends two thirds of its input on text the model has already
+# been sent. Batching amortises that: at three windows the overhead per
+# window drops by ~67%, which on a per-minute token budget is the difference
+# between a document finishing and a document timing out.
+#
+# Three rather than more, because the reason windows exist at all is that
+# this model under-extracts on long input. Batching keeps each window
+# separately delimited and separately answered, which is not the same as
+# handing it one long passage -- but it is not free of that risk either, so
+# the batch stays small and the size is tunable.
+#
+# `INGESTION_EXTRACTION_BATCH_WINDOWS=1` restores exactly the previous
+# behaviour, one call per window, and is the escape hatch if a future model
+# handles batching worse than this one.
+_BATCH_WINDOWS = max(1, int(os.environ.get("INGESTION_EXTRACTION_BATCH_WINDOWS", "3")))
+
+# Output has to grow with the batch or the response is truncated mid-JSON --
+# which the model reports as a validation failure and looks like a content
+# problem rather than a budget one.
+_BATCH_MAX_TOKENS_PER_WINDOW = 1500
+
+
+def _build_batch_messages(*, source_name: str, windows: tuple[str, ...]) -> list[dict]:
+    rendered = "\n".join(
+        BATCH_WINDOW_TEMPLATE.format(window_id=i, chunk_text=text)
+        for i, text in enumerate(windows)
+    )
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT + BATCH_SYSTEM_SUFFIX},
+        {
+            "role": "user",
+            "content": BATCH_TASK_TEMPLATE.format(
+                source_name=source_name,
+                window_count=len(windows),
+                windows=rendered,
+            ),
+        },
+    ]
+
+
+def _extract_batch(
+    agent: ExtractionAgent,
+    *,
+    source_name: str,
+    batch: tuple[tuple[int, str], ...],
+) -> tuple[ChunkExtraction, ...]:
+    """One model call covering several windows. Returns one ChunkExtraction
+    per window, in the order given.
+
+    A window the model omits yields an empty extraction rather than an error:
+    losing one window's facts is a smaller harm than failing the document,
+    and it is logged so the loss is visible rather than silent.
+    """
+    texts = tuple(text for _, text in batch)
+    response = _invoke_with_retry(
+        agent,
+        _build_batch_messages(source_name=source_name, windows=texts),
+        max_tokens=_BATCH_MAX_TOKENS_PER_WINDOW * len(batch),
+    )
+    content = response.choices[0].message.content or "{}"
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        payload = {}
+
+    parsed = BatchedExtractionOutput.model_validate(payload)
+    by_id = {window.window_id: window for window in parsed.windows}
+
+    # Positional fallback: some responses come back correctly ordered but
+    # without ids. Using position is better than discarding real extractions
+    # over a missing integer.
+    if not by_id or set(by_id) == {-1}:
+        by_id = dict(enumerate(parsed.windows))
+
+    missing = [i for i in range(len(batch)) if i not in by_id]
+    if missing:
+        logger.warning(
+            "Extraction batch for %s returned %d/%d windows; %s produced nothing.",
+            source_name,
+            len(batch) - len(missing),
+            len(batch),
+            f"window(s) {missing}",
+        )
+
+    return tuple(
+        _output_to_extraction(
+            chunk_index,
+            by_id.get(position) or ExtractionOutput(),
+        )
+        for position, (chunk_index, _) in enumerate(batch)
+    )
+
+
+def _document_windows(chunks: tuple) -> tuple[tuple[int, str], ...]:
+    """Flatten every chunk of a document into (chunk_index, window_text).
+
+    Flattening across chunks is what lets a batch be full: batching within a
+    chunk would leave a two-window chunk sending a batch of two and a
+    one-window chunk sending a batch of one, which is most of the saving
+    thrown away on short documents.
+    """
+    return tuple(
+        (embedded.chunk.chunk_index, window)
+        for embedded in chunks
+        for window in _window_text(embedded.chunk.text, _WINDOW_CHARS, _WINDOW_OVERLAP)
+    )
+
+
 def extract_document(
     agent: ExtractionAgent,
     *,
@@ -284,18 +400,41 @@ def extract_document(
     chunks: tuple,  # tuple[chunk_embed.types.EmbeddedChunk, ...]
 ) -> tuple[ChunkExtraction, ...]:
     """
-    Run extraction across every chunk of a document. Reads the real
-    EmbeddedChunk shape (`embedded.chunk.chunk_index` / `.text`) directly --
-    no adapter object needed. A comprehension, not a for-loop with an
-    accumulator list, since each chunk's extraction is independent (step 5
-    is scoped per-chunk).
+    Run extraction across every chunk of a document.
+
+    Windows from every chunk are flattened, grouped into batches, and each
+    batch is one model call; the per-window results are then merged back into
+    one ChunkExtraction per chunk. Extraction is still scoped per chunk --
+    only the transport is shared.
     """
+    windows = _document_windows(chunks)
+    if not windows:
+        return ()
+
+    batches = [
+        windows[i : i + _BATCH_WINDOWS] for i in range(0, len(windows), _BATCH_WINDOWS)
+    ]
+    logger.info(
+        "Extracting %s: %d chunk(s), %d window(s), %d model call(s).",
+        source_name,
+        len(chunks),
+        len(windows),
+        len(batches),
+    )
+
+    per_window: list[ChunkExtraction] = []
+    for batch in batches:
+        per_window.extend(_extract_batch(agent, source_name=source_name, batch=batch))
+
+    # Back to one extraction per chunk, preserving the order the chunks came
+    # in -- `_merge_windows` already knows how to fold several windows of one
+    # chunk together.
+    by_chunk: dict[int, list[ChunkExtraction]] = {}
+    for extraction in per_window:
+        by_chunk.setdefault(extraction.chunk_index, []).append(extraction)
+
     return tuple(
-        extract_chunk(
-            agent,
-            source_name=source_name,
-            chunk_index=embedded.chunk.chunk_index,
-            chunk_text=embedded.chunk.text,
-        )
+        _merge_windows(tuple(by_chunk[embedded.chunk.chunk_index]))
         for embedded in chunks
+        if embedded.chunk.chunk_index in by_chunk
     )

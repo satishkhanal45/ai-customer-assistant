@@ -19,15 +19,59 @@ This is a **multi-agent RAG customer-support assistant** for Alpinist Studios, b
 | Architecture & module design | **Strong.** Clean layering, dependency injection everywhere, pure functions separated from I/O, excellent docstrings. |
 | Feature completeness (MVP scope) | **~75%.** Chat, RAG, ingestion, crawling, graph browsing and ticket creation all work. Ticket status lookup and the admin surface do not. |
 | Test suite | **759 passing / 0 failing / 0 erroring / 2 skipped** (761 collected). **Fully green** — the Playwright browser is installed, so the last non-deterministic gap is closed. |
-| Production readiness | **No known blockers.** Authentication, authorisation, a CORS allowlist, rate limiting and an SSRF guard on the crawler are all in place (P0-3). Conversation state no longer reaches the logs (P0-4). Secrets are no longer injected by import side effect (P0-2), and the client/server timeout ladder no longer inverts (P2-4). |
+| Production readiness | **No known blockers.** One open correctness issue, P1-7, which only bites once documents start being *updated* rather than added. Authentication, authorisation, a CORS allowlist, rate limiting and an SSRF guard on the crawler are all in place (P0-3). Conversation state no longer reaches the logs (P0-4). Secrets are no longer injected by import side effect (P0-2), and the client/server timeout ladder no longer inverts (P2-4). |
 | Scalability | **Much improved.** All four P1 items are fixed: pgvector-native retrieval, LLM calls off the event loop, one shared connection pool, and ingestion moved out of the web process into a worker service. Two pieces of per-process state that quietly broke horizontal scaling now live in the database (P2-5). |
 | Repo hygiene | **Good.** The duplicated ontology is gone (P2-1); dead files, the committed AI-assistant note, the crawl artefact and the committed debug values are all gone, and the README is real (P2-6). Only the stale branches are left, deliberately untouched. |
 
-**Every P0, P1 and P2 is now fixed** — see the changelog. P0-3, the last blocker, closed on 2026-09-08: the API is authenticated and authorised, CORS is an env-driven allowlist, requests are rate limited per user, and the crawler refuses to fetch anything that is not a publicly-routable host.
+**Every P0 and P2 is fixed, and P1-1 through P1-6** — see the changelog. **P1-7 is open**: superseded document versions are retained but unreachable by semantic search, while superseded structured facts accumulate with no way to tell which is current. It needs a product decision (keep history, or supersede it) before it needs code, and it becomes visible the first time a document is re-ingested with changed content — see §6. P0-3, the last blocker, closed on 2026-09-08: the API is authenticated and authorised, CORS is an env-driven allowlist, requests are rate limited per user, and the crawler refuses to fetch anything that is not a publicly-routable host.
 
 What is left is *unbuilt features* rather than defects — ticket status lookup, the admin API, prompt management, CI and lint configuration, and structured logging with metrics. Those are listed in §5 and §7.
 
 ### Changelog
+
+**2026-09-09 — Ingestion: pipeline resources built once per process, and the worker image rebuilt.** `_resolve_deps` constructed everything per call and the worker calls it per job, so the 400 MB embedding model and its tokenizer were loaded from disk **once per document** — `Loading weights: 199/199` appeared in the log for every job, while `pipeline.py`'s docstring claimed the opposite. A new `PipelineResources` holds the session-independent half and is built once by `get_pipeline_resources()`; `_resolve_deps` now only binds the session. `scripts/run_worker.py` builds it at startup, so a broken model or missing MinIO config fails at boot rather than becoming a mystery failure on the first document. **Verified live: three jobs claimed, one model load.** The `httpx.Client` moved there too — it was previously created per job and never closed, leaking a descriptor per document — and is closed in the worker's `finally`.
+
+Also: `_default_extraction_agent` read `GROQ_API_KEY` from the environment directly, so a key saved on the Admin › API Keys page reached chat but not ingestion, silently. It resolves through `llm_credentials` now, with the same environment fallback.
+
+**The worker image was rebuilt and the container restarted on it.** It had been running code from the day before — including the `persist_chunks` bug that failed 31 jobs — so any `docker compose up worker` would have reintroduced it. Worth knowing for next time: the `worker` service has no `build:` section of its own (it reuses `ai-customer-assistant:local`), so `docker compose build worker` reports *"No services to build"* and silently does nothing; **`docker compose build backend` is what rebuilds the image the worker runs.** Suite 827 → **836 passing**.
+
+**2026-09-09 — Ingestion: extraction calls batched (`ingestion.md` §5 item 8).** Extraction was making one model call per *window*, and chunks over 1800 characters are split into several windows — so a 5-chunk document made 10 calls. Measured first: the system prompt carries the whole canonical vocabulary at **896 tokens** against ~450 tokens of actual content, so **two thirds of every call was the same text sent again**.
+
+Windows from every chunk are now flattened, batched three to a call, and mapped back by `window_id` before merging per chunk. Verified live: `news` went from 10 calls to 4, and two other documents from 6 to 2 each. Batching across chunk boundaries rather than within them is deliberate — batching within a chunk leaves short documents sending batches of one.
+
+`INGESTION_EXTRACTION_BATCH_WINDOWS=1` restores the old behaviour exactly. A window the model omits costs that window, not the document. Also fixed: `_MAX_COOLDOWN_WAIT` was 420s inside a 600s stage budget, so one rate-limit cooldown could eat 70% of the time available for a whole document — now 60s, which is what a per-minute token bucket actually needs. And a duplicate `extract_chunk` that had been shadowed since windowing was added was removed.
+
+**Not resolved:** the three large documents still are not ingested. They now fail on the Groq **daily** token budget (200,000 TPD, spent by the day's repeated re-runs) rather than on per-minute throttling — a quota ceiling rather than a code problem. Their jobs are left `QUEUED` and will ingest on the next worker run once the daily budget rolls over. Suite 813 → **827 passing**.
+
+**2026-09-09 — Ingestion: the extraction stage is bounded, and the backlog re-run.** With the `persist_chunks` fix in place and a fresh Groq key, the 15 documents that had never ingested were requeued (one job each — the 60 failed rows were repeat attempts at the same 15 files). **Nine ingested successfully: indexed documents 9 → 18, entities 339 → 410, relations 242 → 334, with zero duplicate chunk groups.** Every `persist_failed` and every 429 disappeared.
+
+Three failed on `400 Failed to validate JSON` — the model emitting malformed tool-call JSON, which is not transient and would not be helped by retrying.
+
+The re-run also exposed a new defect: one document held the worker in `RUNNING` for **28 minutes** with no output, stalling the whole queue, because the worker is serial and the Groq client had no timeout. The stale-job reaper does not cover this — it runs once at worker startup, so a worker that is alive and stuck blocks forever. Fixed: `INGEST_EXTRACTION_CALL_TIMEOUT_S` (30s, on the client, with `max_retries=3`) and `INGEST_EXTRACTION_STAGE_BUDGET_S` (600s, around the stage) now sit in `timeouts.py` in their own section — ingestion is background work and may be slower than a chat turn, but not unbounded. A new `eav_extraction_timeout` failure kind separates "never came back" from "the model refused this". Verified live: the same document produced a clean timeout and the queue drained instead of stopping.
+
+Also fixed while testing it: `ingestion/queue/__init__.py` eagerly re-exported `run_worker`, creating a circular import that fired only when `ingestion.pipeline` was imported first. Nothing used the shortcut — `scripts/run_worker.py` imports the module directly — so it bought nothing and cost a load-order trap. Suite 807 → **813 passing**.
+
+**Still open:** three large documents (`news`, `2`, `artificial-intelligence`) remain un-ingested. They now fail visibly rather than hanging, but extraction makes one serial LLM call per chunk and a free-tier per-minute token budget cannot finish them inside any sane wall clock — see `ingestion.md` §5 item 8 (batch or parallelise the extraction calls).
+
+**2026-09-09 — Ingestion: chunk persistence made idempotent (P0 tier of `ingestion.md`).** 60 of the 82 ingestion jobs in the development database had failed; **31 of them to one bug**. `persist_chunks` appended rather than replaced, so re-ingesting a version wrote every chunk again, and `_link_entity_to_chunk`'s lookup by `(version_id, chunk_index)` then raised *"Multiple rows were found when exactly one was required"*. The state was self-perpetuating: once a version held duplicates, every later attempt failed identically and the document could never be ingested again without database surgery.
+
+Four changes: `persist_chunks` deletes this version's chunks before inserting; a `uq_chunk_version_index` unique constraint makes the duplicate state unrepresentable; migration `b7d1e93a5c40` deduplicates the existing rows *before* adding the constraint (the other order fails against exactly the data it exists to prevent); and `_link_entity_to_chunk` no longer uses `scalar_one()` — the remaining case is a *missing* chunk, which means the model named an index the document does not have, and that is one bad extraction rather than a reason to fail the whole document.
+
+**Deleting first loses nothing.** Chunks belong to a *version*, and a version is an immutable snapshot — `_stage_fetch_bytes` verifies the bytes still match the recorded checksum before any of this runs. Superseded versions have different `version_id`s and are untouched. (Whether they stay *searchable* is the separate open question, P1-7.)
+
+On the live database the migration removed **58 redundant chunks across 31 duplicated indexes** — 125 rows down to 67 — leaving 22 versions with contiguous chunk indexes and every indexed source still searchable. Verified beyond tests: three consecutive re-ingests of one version leave four chunks, and a following two-chunk re-ingest leaves two, with no orphaned tail.
+
+Two portability defects surfaced while writing the tests, both invisible on Postgres: `embedding`'s SQLite variant was `Text`, which cannot bind a list, and `chunk_id` had no Python-side uuid default. Both are why this code had no test before — the table could not be written to off Postgres, which is the gap the bug lived in. Suite 798 → **807 passing**.
+
+**2026-09-09 — Provider API keys in the Admin UI.** A new admin-only **API Keys** page lists every supported provider (Groq, OpenAI, Gemini, Anthropic), shows which are configured, and lets an administrator paste or clear a key and choose the default. Groq is the seeded default.
+
+This deliberately trades away some safety: a key that previously existed only in `backend/.env` can now live in the database. Three things make the trade defensible. Keys are **AES-GCM encrypted** under a key derived from `AUTH_SECRET` by HKDF, so a database dump alone is not a usable credential. The API is **write-only** — no endpoint ever returns a key, only its last four characters, which is enough to recognise one and not enough to use it. And the **environment still works**: resolution is saved-key first, environment second, so a deployment that never opens the page behaves exactly as it did before. The consequence worth stating: **rotating `AUTH_SECRET` makes stored provider keys undecryptable** and they must be re-entered. An unreadable row is logged and skipped at startup rather than raised, because one bad credential must not stop the app from starting with the others.
+
+The page's `source` column ("saved" vs "from environment") exists because a saved key shadows the environment variable — without showing which is in effect, *"I changed the key and nothing happened"* is unanswerable.
+
+Two defects found by measurement rather than reasoning. **(1) A read-after-write race:** `get_session` commits during dependency teardown, *after* the response reaches the client, so the page's immediate reload could miss its own write — observed as a save that appeared not to take. The mutating handlers now commit before returning. **(2) `server_default="false"` is a string literal**, which Postgres reads as the boolean but SQLite stores as the text `'false'` — and `'false'` is truthy, so a freshly inserted row came back claiming to be the default provider. Fixed with a Python-side `default=False` alongside it. Harmless on Postgres, wrong everywhere else; a test caught it.
+
+Migration `9a4f7c2b83d1`, with a partial unique index enforcing at most one default in the database rather than in whoever remembers to clear the old one. Suite 774 → **798 passing**.
 
 **2026-09-09 — Admin API (read).** All four tabs of the Admin page had shown *"Endpoint not available yet"* since the page was written, while the data sat in the database: 24 knowledge sources, 82 ingestion jobs, 339 entities, 7 tickets. `api/admin.py` adds `GET /admin/knowledge-sources | jobs | stats | tickets`, admin-only, each returning `{ <list>, total, limit, offset }` rather than a bare array so a caller can tell "all of it" from "the first page of it".
 
@@ -323,6 +367,7 @@ shell history and in `ps` output for every other user on the machine.
 | **Admin API (write)** | Still unbuilt: no source deletion, no re-index trigger, no ticket status change. `ingestion/storage/api.py` remains unregistered — it is an *upload* path duplicating `POST /ingest/upload`, not the read surface the page needed. |
 | **Ticket status lookup** | Routed away at classification time with a hardcoded "not available yet" string (`routing.py:_CHECK_STATUS_UNAVAILABLE`). No read path against the `ticket` table. |
 | **Prompt management API** | Frontend edits never reach the server. |
+| ~~**LLM provider keys**~~ | **Done 2026-09-09.** `GET/PUT/DELETE /admin/llm-providers`, admin-only, keys encrypted at rest. What is *not* built: validating a key against the provider before saving it, and per-agent provider overrides — the default applies to every agent. |
 | **Typed settings** | `config.py` now loads the environment (P0-2), but modules still read `os.environ` directly rather than a typed settings object. `agents/knowledge/config.py` shows the pattern to follow. |
 | ~~**CHANGELOG**~~ | **Done** — `CHANGELOG.md` was written in the F-series and covers P0-3. |
 | **CI** | No `.github/`, no lint config, no formatter config, no coverage gate. |
@@ -335,6 +380,35 @@ shell history and in `ps` output for every other user on the machine.
 ---
 
 ## 6. Current problems, ranked
+
+### 🟠 P1-7 — Superseded content: chunks hide history, facts cannot date it — **OPEN**
+
+**Found 2026-09-09**, while reviewing the ingestion pipeline. Not caused by any recent change; it has been true since retrieval was written. Surfaced by the question *"if the rate to build a website changed, can the assistant still tell me what it used to be?"*
+
+The two retrieval paths answer that in opposite — and both wrong — ways.
+
+**Semantic search keeps history and then hides it.** `cutover` marks the previous version `STALE` and deletes nothing, so every superseded chunk is still in `embedding_chunk`. But `agents/knowledge/vector_search.py:347` filters:
+
+```sql
+WHERE knowledge_source_version.version_id = knowledge_source.current_version_id
+```
+
+so a superseded chunk can never be retrieved. *"What was the previous rate?"* is unanswerable, and the data needed to answer it is sitting in the table.
+
+**Structured lookup keeps history and cannot distinguish it.** `value` rows are written `ON CONFLICT DO NOTHING` on `(entity_id, attribute_id, value)`. When a price changes from $500 to $800, **both rows survive**, under the same entity and attribute, with **no timestamp and no version reference**. `structured_lookup` returns both and nothing marks which is current.
+
+**The second is the more serious.** A missing answer is visibly missing. Two contradictory prices returned as equally true is a *wrong* answer delivered with confidence — and the F-series showed that structured facts lead the answer prompt, so the model is being handed the contradiction first.
+
+**Not yet visible in this deployment.** All 125 chunks currently belong to current versions; nothing has been re-ingested with changed content. It becomes real the first time a document is updated — which is exactly when nobody will be looking for it.
+
+**This needs a product decision before it needs code.** Two coherent positions:
+
+1. **History matters.** Chunks carry their version into retrieval, temporal questions are allowed to reach `STALE` versions, `value` gains a version reference so "current" is derivable, and answers cite which version a fact came from. A feature, not a fix.
+2. **Only current truth matters.** Re-ingest supersedes old `value` rows rather than accumulating them, and superseded chunks are pruned on a retention schedule.
+
+Either is defensible; the present state — half of one, half of the other — is not. Full analysis, and the ingestion-side work it implies, in [`ingestion.md`](ingestion.md) §5 item 5.
+
+---
 
 ### ✅ P0-1 — The ticket flow was broken end to end — **FIXED 2026-09-05**
 
@@ -851,7 +925,8 @@ Migration `3d6f8b2c17ae` is additive: nothing dropped, no row changed, exact dow
 3. ~~Implement JWT auth + CORS allowlist + SSRF guard on the crawler (P0-3).~~ **Done 2026-09-08.**
 4. ~~Replace `print()` node logging with redacted structured logging (P0-4).~~ **Done 2026-09-06**
 5. ~~Fall back to vector search when a structured-only lookup returns nothing (P1-6).~~ **Done 2026-09-06**
-6. Mark DB/Playwright tests with `@pytest.mark.integration` and add a `-m "not integration"` default so the unit suite is green on a clean checkout.
+6. **Decide the superseded-content policy (P1-7)** and implement whichever half is missing — either let temporal questions reach `STALE` versions, or stop `value` accumulating undated duplicates. Today the two retrieval paths disagree with each other.
+7. Mark DB/Playwright tests with `@pytest.mark.integration` and add a `-m "not integration"` default so the unit suite is green on a clean checkout.
 
 ### 7.2 Performance & scale
 6. ~~pgvector `<=>` + HNSW index (P1-1).~~ **Done 2026-09-05** — see the P1-1 entry.
@@ -985,6 +1060,17 @@ process refuses to start if it does not hold):
 | `CORS_ALLOW_ORIGINS` | empty | Empty means no cross-origin access at all, which restricts nothing — the frontend is same-origin. A wildcard is **not** accepted: the session is a cookie, and the CORS spec forbids combining credentials with `*` |
 | `TRUST_PROXY_HEADERS` | `false` | Read `X-Forwarded-For` for rate-limit keys. Only behind a proxy that sets it — anyone can send the header, so trusting it without one lets a caller choose their own rate-limit key |
 | `RATE_LIMIT_DISABLED` | `false` | Tests and single-user local development only |
+
+**LLM provider keys** (`llm_credentials.py`, and the Admin › API Keys page):
+
+| Variable | Default | Notes |
+|---|---|---|
+| `GROQ_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY` / `ANTHROPIC_API_KEY` | unset | Still read, and still the fallback. A key saved through the Admin page **shadows** the matching variable; clearing it falls back here rather than switching the provider off |
+
+The stored keys are encrypted under a key derived from `AUTH_SECRET`, so
+**rotating that secret means re-entering every provider key**. There is no
+separate encryption secret on purpose: a second one is a second thing nobody
+remembers to rotate.
 
 **Crawler safety** (`auth/ssrf.py`):
 
