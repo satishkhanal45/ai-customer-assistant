@@ -95,6 +95,40 @@ class TestPersistence:
         assert len(factory.statements) == 1
 
 
+class TestStatusLookup:
+    """The read half of the store, added so a customer can ask what happened
+    to a ticket they were given an id for."""
+
+    async def test_round_trips_a_ticket_created_in_this_process(self) -> None:
+        store = TicketStore()
+        created = await store.create_ticket(
+            PendingTicket(query="I was double charged", reason="billing issue"),
+            "a@example.com",
+        )
+
+        found = await store.get_ticket(created.ticket_id)
+
+        assert found is not None
+        assert found.ticket_id == created.ticket_id
+        assert found.email == "a@example.com"
+        assert found.reason == "billing issue"
+        assert found.status == "OPEN"
+
+    async def test_unknown_id_is_a_miss(self) -> None:
+        store = TicketStore()
+        await store.create_ticket(PendingTicket(query="q"), "a@example.com")
+
+        assert await store.get_ticket("00000000-0000-4000-8000-000000000000") is None
+
+    async def test_malformed_id_is_a_miss_not_an_error(self) -> None:
+        """The id comes from a person typing into a chat box. "abc123"
+        deserves "no such ticket", not a failed turn."""
+        store = TicketStore()
+
+        for bad in ("abc123", "", "not-a-uuid", None):
+            assert await store.get_ticket(bad) is None
+
+
 class TestEmailRendering:
     def test_subject_contains_the_real_ticket_id(self) -> None:
         """Regression: the subject was a plain string with an unsubstituted

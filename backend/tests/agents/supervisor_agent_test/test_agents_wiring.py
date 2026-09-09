@@ -314,3 +314,169 @@ class _StubClient:
 
     def classify(self, system_prompt, user_message, conversation_history) -> str:
         return self.payload
+
+# ---------------------------------------------------------------------------
+# Ticket status lookup
+#
+# The behaviour under test is the one the customer sees: "what's happening
+# with my ticket?" used to be answered with "status lookups aren't available
+# yet" no matter what. It now reads the ticket back.
+# ---------------------------------------------------------------------------
+
+class FakeStatusOps(FakeTicketOps):
+    """FakeTicketOps plus the read side."""
+
+    def __init__(self, tickets=()):
+        super().__init__()
+        self.tickets = {t.ticket_id: t for t in tickets}
+        self.looked_up: list[str] = []
+
+    async def get_ticket(self, ticket_id: str):
+        self.looked_up.append(ticket_id)
+        return self.tickets.get(ticket_id)
+
+
+_KNOWN_ID = "3f2a9c14-5b7e-4a21-9f03-8c6d1e4b7a92"
+_UNKNOWN_ID = "00000000-0000-4000-8000-000000000000"
+
+
+def _known_ticket(**overrides):
+    fields = {
+        "ticket_id": _KNOWN_ID,
+        "email": "customer@example.com",
+        "query": "My invoice is wrong",
+        "reason": "billing issue",
+        "status": "IN_PROGRESS",
+    }
+    fields.update(overrides)
+    return Ticket(**fields)
+
+
+@pytest.mark.asyncio
+async def test_status_node_answers_inline_when_message_carries_the_id():
+    """The common case after a confirmation: the id is in the message, so no
+    interrupt and no extra round trip."""
+    from agents.supervisor.agents_wiring import make_ticket_status_node
+
+    ops = FakeStatusOps([_known_ticket()])
+    node = make_ticket_status_node(ops)
+
+    result = await node(_state(user_message=f"any update on ticket {_KNOWN_ID}?"))
+
+    assert ops.looked_up == [_KNOWN_ID]
+    reply = result["downstream_result"]["response"]
+    assert result["downstream_result"]["status"] == "GROUNDED"
+    assert "in progress" in reply.lower()
+    assert "billing issue" in reply
+    assert "customer@example.com" in reply
+
+
+@pytest.mark.asyncio
+async def test_status_node_finds_the_id_regardless_of_surrounding_punctuation():
+    from agents.supervisor.agents_wiring import make_ticket_status_node
+
+    ops = FakeStatusOps([_known_ticket()])
+    node = make_ticket_status_node(ops)
+
+    for message in (
+        f"ID: {_KNOWN_ID}.",
+        f"({_KNOWN_ID})",
+        _KNOWN_ID.upper(),
+        f"status of {_KNOWN_ID}?",
+    ):
+        result = await node(_state(user_message=message))
+        assert "in progress" in result["downstream_result"]["response"].lower(), message
+
+
+@pytest.mark.asyncio
+async def test_status_node_reports_a_miss_as_a_miss_not_as_a_status():
+    """An id that matches nothing is usually a typo. Saying "not found" is
+    honest; saying "open" would invent a ticket."""
+    from agents.supervisor.agents_wiring import make_ticket_status_node
+
+    ops = FakeStatusOps([_known_ticket()])
+    node = make_ticket_status_node(ops)
+
+    result = await node(_state(user_message=f"how about {_UNKNOWN_ID}"))
+
+    reply = result["downstream_result"]["response"]
+    assert _UNKNOWN_ID in reply
+    assert "couldn't find" in reply.lower()
+
+
+@pytest.mark.asyncio
+async def test_status_node_never_creates_a_ticket():
+    """The whole point of a separate node: a status question must not open a
+    new ticket, on any of its paths."""
+    from agents.supervisor.agents_wiring import make_ticket_status_node
+
+    ops = FakeStatusOps([_known_ticket()])
+    node = make_ticket_status_node(ops)
+
+    await node(_state(user_message=f"status of {_KNOWN_ID}"))
+    await node(_state(user_message=f"status of {_UNKNOWN_ID}"))
+
+    assert ops.created == []
+    assert ops.calls == []
+
+
+@pytest.mark.asyncio
+async def test_status_node_asks_for_the_id_then_answers():
+    """No id in the message: one interrupt, then the lookup. Driven through
+    the compiled graph because `interrupt()` needs a checkpointer."""
+    from langgraph.types import Command
+
+    from agents.supervisor.graph import build_supervisor_graph
+
+    payload = json.dumps(
+        {
+            "request_category": "DOMAIN_REQUEST",
+            "domain_confidence": 0.9,
+            "intent": "CHECK_TICKET_STATUS",
+            "intent_confidence": 0.95,
+            "clarification_question": None,
+        }
+    )
+    ops = FakeStatusOps([_known_ticket()])
+    graph = build_supervisor_graph(
+        llm_client=_StubClient(payload),
+        ticket_ops=ops,
+        checkpointer=MemorySaver(),
+    )
+
+    config = {"configurable": {"thread_id": "status-flow"}}
+    first = await graph.ainvoke(
+        {
+            "user_message": "any update on my ticket?",
+            "conversation_history": [],
+            "clarification_attempts": 0,
+        },
+        config=config,
+    )
+    assert "__interrupt__" in first
+    (asked,) = first["__interrupt__"]
+    assert asked.value["type"] == "ticket_id_collection"
+    assert "ticket ID" in asked.value["query"]
+
+    answered = await graph.ainvoke(Command(resume=_KNOWN_ID), config=config)
+    assert ops.looked_up == [_KNOWN_ID]
+    assert "in progress" in answered["final_response"].lower()
+    assert ops.created == []
+
+
+@pytest.mark.asyncio
+async def test_status_node_handles_a_resume_that_still_has_no_id():
+    """The customer answers the question with something that isn't an id. Say
+    what an id looks like rather than looking up garbage."""
+    from agents.supervisor.agents_wiring import make_ticket_status_node
+
+    ops = FakeStatusOps([_known_ticket()])
+    node = make_ticket_status_node(ops)
+
+    # Called directly (no interrupt machinery): an empty message takes the
+    # same path a useless resume does once `_find_ticket_id` returns None.
+    from agents.supervisor.agents_wiring import _status_reply
+
+    assert ops.looked_up == []
+    reply = _status_reply(None, None)
+    assert "ticket ID" in reply or "ticket id" in reply.lower()

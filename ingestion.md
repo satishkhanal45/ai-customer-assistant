@@ -17,7 +17,7 @@ failure rate**, and it is not random — it is two specific, fixable causes:
 | Failure | Count | Cause | State |
 |---|---:|---|---|
 | `persist_failed: Multiple rows were found when exactly one was required` | **31** | A real bug. `persist_chunks` was not idempotent, and nothing in the schema stopped it | ✅ **Fixed 2026-09-09** |
-| `eav_extraction_failed` | **29** | Groq 429 rate limits and 400 JSON-validation errors, with **no retry anywhere in the pipeline** | 🟠 Open — §5 item 6 |
+| `eav_extraction_failed` | **29** | Groq 429 rate limits and 400 JSON-validation errors, with **no retry anywhere in the pipeline** | ✅ **Closed 2026-09-09** — §5 items 6, 8, 8b |
 
 Both are diagnosed in §4. Neither is a design flaw in the architecture,
 which is sound; both are gaps in the seams between good components.
@@ -28,6 +28,18 @@ migration `b7d1e93a5c40` cleaned the existing rows — **58 redundant chunks
 across 31 duplicated indexes**, 125 rows down to 67. Verified against the
 live database: three consecutive re-ingests of one version leave four
 chunks, not twelve.
+
+**The second is now closed too.** The 429s needed quota and fewer calls
+(§5 item 8 batched them, cutting calls per document by ~60%); the 400s needed
+§5 item 8b, which stopped retrying a deterministic rejection five times and
+made a rejected batch split rather than fail its document. **As of 2026-09-09
+all 24 sources are indexed** — 77 chunks, 491 entities, 768 values, 374
+relations — which had never previously been true.
+
+What remains is not a failure *cause* but a failure *policy*: nothing retries
+a transient failure later, and nothing distinguishes a job that will fix
+itself from one that needs a human. That is §5 items 6 (retry half) and 7,
+now the top of the order of work in §7.
 
 ---
 
@@ -479,6 +491,85 @@ a quota ceiling, not a code problem: the jobs are left `QUEUED` and will
 ingest on the next worker run once the day's budget rolls over. 14 tests in
 `tests/ingestion/test_extraction_batching.py`.
 
+**8b. A rejected batch must cost a window, not a document.** ✅ **Done
+2026-09-09.**
+
+Item 6 noted the `400 Failed to validate JSON` residue and set it aside as
+"a separate prompt/schema problem". It was never given a work item, and it
+turned out to be the *only* thing still blocking ingestion: with the P0 and
+quota problems behind us, 22 of 24 sources were indexed and the two that were
+not — `sdlc.pdf` and `tech_stck.pdf`, both at zero chunks — failed on nothing
+else.
+
+Two separate defects, found by reading the code rather than the doc.
+
+*The retry predicate was retrying a deterministic failure.* `_is_retryable`
+returned true on `"json" in lower`, and Groq's rejection message is *"Failed
+to validate **JSON**"* — so every one of these was retried five times, at
+`temperature=0`, with a byte-identical prompt, producing a byte-identical
+rejection. Five times the tokens for a guaranteed failure, spent against the
+200,000-token daily budget that was the binding constraint on finishing a
+document at all. The clause was written for *flaky* JSON output; it was
+catching a *deterministic* schema rejection. Retryability is now decided by
+`_is_deterministic_rejection`, and rate limits remain retryable.
+
+*Batching had tripled the blast radius of one bad call.* Item 8 records that
+"a window the model omits yields an empty extraction, not a failed document"
+— true, but that covers a window missing from an otherwise good response. A
+call that is *rejected* raised straight out of `_extract_batch`, so one bad
+call lost all three of its windows and failed the whole document. The
+signature said what was really wrong: `failed_generation` came back **empty**,
+which is a response outgrowing what the model will emit for three windows at
+once, not content that cannot be extracted.
+
+So a rejected batch is now split in half and retried, recursively. Repeating
+the same request is never the answer to a deterministic rejection; a
+*smaller* one can be. It also fixes the other case for free — if one window
+genuinely cannot be extracted, the split isolates it and only that window is
+lost.
+
+Three boundaries, each of which is the difference between a fix and a new
+bug:
+
+* **Only deterministic rejections split.** Splitting a rate-limited batch
+  makes two rate-limited calls against a budget that is already gone, and
+  `_invoke_with_retry` has already waited out what waiting can fix. A 429
+  still fails the document.
+* **A document whose every window is rejected still fails.** Degrading to
+  "extracted nothing" would mark the job `SUCCEEDED` with an empty graph —
+  indistinguishable from a document that genuinely had no facts in it, which
+  is worse than failing.
+* **A single lost window is logged, with its chunk index.** The loss is
+  visible rather than silent.
+
+**Verified live, on the rejection this was written for.** Re-queued against
+the rebuilt worker with quota available, `sdlc.pdf` produced exactly the
+sequence the fix describes:
+
+```
+Extraction batch of 3 window(s) for sdlc.pdf was rejected (BadRequestError);
+  splitting into 1 and 2 and retrying.
+Extraction failed for a window of chunk 1 in sdlc.pdf
+  (400 ... json_validate_failed ... 'failed_generation': ''); continuing
+  without that window's facts.
+Extracted sdlc.pdf with 1 of 9 window(s) lost.
+```
+
+The batch of three was rejected, split into 1 and 2, and the isolated single
+window was *still* rejected and dropped while the other two extracted
+normally. **One window lost instead of a document** — the same rejection
+previously ended `sdlc.pdf` outright, which is why it had sat at zero chunks.
+
+That the isolated window failed alone, at width 1, says both hypothesised
+causes were real: one window here genuinely cannot be extracted, and the
+other two were only collateral damage from sharing a call with it. The split
+is what tells them apart. `tech_stck.pdf` hit no rejection at all and
+succeeded straight through.
+
+**All 24 sources are now indexed**, for the first time: 77 chunks (from 67),
+491 entities (410), 768 values (708), 374 relations. 7 tests in
+`tests/ingestion/test_extraction_batching.py`; suite 846 → **853 passing**.
+
 **9. Route the EAV agent through `llm_credentials`.** ✅ **Done 2026-09-09.**
 `_default_extraction_agent` read `os.environ["GROQ_API_KEY"]` directly, so a
 key saved on the Admin › API Keys page switched *chat* over and left the
@@ -575,19 +666,30 @@ idempotency, retry policy, and dependency lifetime — not in its structure.
 
 ## 7. Suggested order of work
 
-1. **P0 1–4** together, with the data migration. This is the change that
-   takes the failure rate from 73% to something normal, and it is half a
-   day.
-2. **P1 6–7** (retry + dead-letter), which recovers most of what remains.
-3. **P2 10–11** (deps at startup, close the client), the biggest latency win
-   for the least risk.
-4. **P1 8** (batch the extraction calls) once retry exists to absorb the
-   remaining 429s.
-5. **P1 5** (superseded content) whenever the product question behind it is
+*Revised 2026-09-09, after items P0 1–4, 6 (timeout half), 8, 8b, 9, 10 and
+11 shipped. The ordering below is what is left, and the evidence for it is
+the live database rather than the original triage.*
+
+1. **P1 6 (retry half) + 7** — `attempt_count` / `next_attempt_at` on
+   `knowledge_injection_job`, exponential backoff for transient classes only,
+   and a terminal dead-letter state once attempts are exhausted. This is now
+   the top item rather than the second, because item 8b removed the
+   deterministic failures and **everything still failing is transient** — the
+   remaining blocker on the last two documents is a daily token ceiling that
+   a retry an hour later simply walks past. One migration, one worker change.
+2. **P3 13** (`failure_kind`) alongside it: the same table, the same
+   migration window, and it is what makes Admin › Jobs able to tell "will fix
+   itself" from "needs a human" — which is the whole point of item 7.
+3. **P3 15** (test the worker loop). `persistence.py` got its tests with the
+   P0 work; the worker loop is the one real coverage gap left, and item 1
+   above is about to change it.
+4. **P1 5** (superseded content) whenever the product question behind it is
    settled — it is the only item here that needs a decision before it needs
    code, and it becomes urgent the first time a document is updated with
    changed content.
-6. Everything else as it becomes convenient.
+5. **P2 12** (concurrent jobs) and **P3 14** (`trace_id`) as they become
+   convenient. Item 12 still needs more than the resource cache: a
+   `SentenceTransformer` is not safe to encode from several threads at once.
 
 A reasonable check that it worked: re-ingest the 24 existing sources and
 expect a failure rate in the low single digits, with any remaining failures

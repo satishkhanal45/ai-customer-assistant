@@ -181,6 +181,53 @@ while the tests more than doubled.
 - Migration `9a4f7c2b83d1`, with a partial unique index enforcing a single
   default provider in the database.
 
+### Fixed — ingestion extraction
+
+- **A deterministic model rejection was retried five times.**
+  `_is_retryable` matched on the substring `"json"`, and Groq's schema
+  rejection reads *"Failed to validate JSON"* — so each one was sent five
+  times at `temperature=0` with an identical prompt, for five identical
+  failures. Five times the tokens for a guaranteed failure, against the
+  200,000-token daily budget that decided whether a document finished at all.
+  The clause was written for *flaky* JSON output and was catching a
+  *deterministic* rejection.
+- **One rejected call failed a whole document.** Batching three windows into
+  one call also meant one bad call lost all three and failed the document —
+  which is why `sdlc.pdf` and `tech_stck.pdf` sat at zero chunks while the
+  other 22 sources indexed. `failed_generation` came back empty: a response
+  outgrowing what the model emits for three windows at once, not
+  unextractable content. A rejected batch is now split in half and retried,
+  recursively, down to single windows.
+- Boundaries that keep that from becoming a new bug: only *deterministic*
+  rejections split (splitting a rate-limited batch makes two rate-limited
+  calls); a document whose every window is rejected still fails, rather than
+  succeeding with an empty graph; and a lost window is logged with its chunk
+  index.
+
+### Added — ticket status lookup
+
+- Customers can ask what happened to a ticket. `CHECK_TICKET_STATUS` was
+  classified correctly and then answered with a fixed
+  "status lookups aren't available yet" string, while the `ticket` table held
+  real rows — so someone who had just been given a ticket id in a
+  confirmation could not ask about it.
+- `TicketStore.get_ticket(ticket_id)` is the read half of a store that until
+  now only wrote. A new `ticket_status` graph node answers the intent; it
+  sits beside the ticket agent rather than inside it, because that agent's
+  job is *creating* a ticket and routing a status question there would have
+  opened a second one.
+- Answers in a single turn when the message carries an id, and `interrupt()`s
+  once for the id when it does not — the pause/resume mechanism the
+  ticket-creation flow already used, so the serving layer is unchanged.
+- **Tickets are found by id, not by email.** An email lookup would be
+  friendlier and would let anyone who can name an address read that person's
+  tickets. Doing it by email needs the ticket bound to the authenticated
+  `AppUser`, which is a data-model change rather than a lookup change.
+- A malformed id is a miss rather than an error (the id is typed by a person
+  into a chat box), a miss is reported as "not found" rather than as a
+  status, and a pasted uppercase id is normalized before lookup so the id
+  echoed back matches the confirmation.
+
 ### Added — admin API
 
 - `GET /admin/knowledge-sources`, `/admin/jobs`, `/admin/stats`,
@@ -218,6 +265,7 @@ while the tests more than doubled.
   verification. It re-checks the peer address and discards the response
   instead, so a *blind* request to an internal host remains possible for an
   authenticated caller. Documented in `auth/ssrf.py`.
-- Ticket status lookup, the admin API and prompt management are unbuilt —
-  which is why the `admin` role currently gates only account creation.
+- The admin *write* surface and prompt management are unbuilt — no source
+  deletion, no re-index trigger, no ticket status *change*. A ticket's
+  status can be read but only the database can alter it.
 - No CI, no lint or type configuration.

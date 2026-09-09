@@ -160,7 +160,7 @@ def _out_of_scope_decision(_: Classification, __: int) -> RoutingDecision:
 _INTENT_TO_AGENT = {
     Intent.KNOWLEDGE_QUERY: NextAgent.KNOWLEDGE_AGENT,
     Intent.CREATE_TICKET: NextAgent.TICKET_AGENT,
-    Intent.CHECK_TICKET_STATUS: NextAgent.TICKET_AGENT,
+    Intent.CHECK_TICKET_STATUS: NextAgent.TICKET_STATUS_AGENT,
 }
 
 _INTENT_TO_TICKET_TYPE = {
@@ -210,22 +210,25 @@ def _build_routed_decision(
     )
 
 
-_CHECK_STATUS_UNAVAILABLE = (
-    "Ticket status lookups aren't available yet — I can help you answer questions from our knowledge base or open a new support ticket."
-)
-
-
 def _build_check_status_decision(_: Classification, __: int) -> RoutingDecision:
-    """CHECK_TICKET_STATUS is explicitly scoped out of MVP (§2.3): there is
-    no DB status lookup yet. Answer directly instead of routing into the
-    Ticket Agent, whose job is only creating tickets."""
+    """CHECK_TICKET_STATUS gets its own destination.
+
+    This used to answer directly with "status lookups aren't available yet",
+    because there was no read path. There is one now, so the intent routes to
+    the status node -- but it still does not go to the Ticket Agent, whose job
+    is only creating tickets.
+
+    No clarification tier applies. The node asks for a ticket id when the
+    message does not carry one, which is a better question than any the
+    classifier could ask, and it is the only thing a status lookup needs.
+    """
     return RoutingDecision(
-        next_agent=NextAgent.NONE,
+        next_agent=NextAgent.TICKET_STATUS_AGENT,
         clarification_required=False,
         clarification_question=None,
         clarification_attempts=0,
         ticket_type=None,
-        final_response=_CHECK_STATUS_UNAVAILABLE,
+        final_response=None,
     )
 
 
@@ -241,8 +244,9 @@ def _decision_case(needs_clarification: bool, exhausted: bool, intent: Intent) -
     return next(
         case
         for predicate, case in (
-            # CHECK_TICKET_STATUS is scoped out of MVP: answer directly
-            # regardless of confidence tier, before clarification/escalate.
+            # CHECK_TICKET_STATUS has a single destination regardless of
+            # confidence tier, ahead of clarification/escalate: the status
+            # node asks for the ticket id itself when one is needed.
             (intent is Intent.CHECK_TICKET_STATUS, "CHECK_STATUS"),
             (exhausted, "ESCALATE"),
             (needs_clarification, "CLARIFY"),

@@ -113,15 +113,30 @@ def _window_text(text: str, size: int, overlap: int) -> tuple[str, ...]:
     return tuple(windows)
 
 
+# Groq rejects a response that does not match the requested JSON schema with
+# a 400 whose message contains the word "JSON". That used to satisfy the
+# `"json" in lower` clause below, so the call was retried up to five times --
+# with `temperature=0` and an identical prompt, producing an identical
+# rejection each time. Five times the tokens for a guaranteed failure, spent
+# against the daily budget that was the binding constraint.
+#
+# Repeating a deterministic request is never the answer to it. Sending a
+# *smaller* one can be, which is what `_extract_batch_splitting` does.
+_DETERMINISTIC_MARKERS = ("json_validate_failed", "context_length", "too large")
+
+
+def _is_deterministic_rejection(exc: Exception) -> bool:
+    """Would this request fail identically however many times it is sent?"""
+    lower = str(exc).lower()
+    return any(marker in lower for marker in _DETERMINISTIC_MARKERS)
+
+
 def _is_retryable(exc: Exception) -> bool:
+    if _is_deterministic_rejection(exc):
+        return False
     text = str(exc)
     lower = text.lower()
-    return (
-        "429" in text
-        or "rate_limit" in lower
-        or "rate limit" in lower
-        or "json" in lower
-    )
+    return "429" in text or "rate_limit" in lower or "rate limit" in lower
 
 
 def _cooldown_seconds(exc: Exception) -> float | None:
@@ -378,6 +393,86 @@ def _extract_batch(
     )
 
 
+class ExtractionFailed(RuntimeError):
+    """Extraction produced nothing at all for a document."""
+
+
+@dataclass(frozen=True, slots=True)
+class _BatchOutcome:
+    extractions: tuple[ChunkExtraction, ...]
+    lost_windows: int
+
+
+def _extract_batch_splitting(
+    agent: ExtractionAgent,
+    *,
+    source_name: str,
+    batch: tuple[tuple[int, str], ...],
+) -> _BatchOutcome:
+    """One call for the batch; on a deterministic rejection, split and retry
+    the halves.
+
+    Batching made one bad call expensive: `_extract_batch` raises, and the
+    whole document fails, so three windows are lost over one. Two documents in
+    this deployment (`sdlc.pdf`, `tech_stck.pdf`) sat at zero chunks for
+    exactly that reason, with `json_validate_failed` and an *empty*
+    `failed_generation` -- the signature of a response outgrowing what the
+    model will emit for three windows at once, not of unextractable content.
+
+    Halving the request is the fix for that, and it is also the fix for the
+    other case: if one window genuinely cannot be extracted, the split
+    isolates it and only that window is lost.
+
+    Only deterministic rejections split. A rate limit must not: splitting a
+    throttled batch makes two throttled calls against a budget that is already
+    gone, and `_invoke_with_retry` has already waited out what waiting can fix.
+    """
+    try:
+        return _BatchOutcome(
+            _extract_batch(agent, source_name=source_name, batch=batch), 0
+        )
+    except Exception as exc:  # noqa: BLE001 - re-raised unless splitting helps
+        if not _is_deterministic_rejection(exc):
+            raise
+
+        if len(batch) == 1:
+            # Nothing left to split. Lose the window rather than the document,
+            # and say so -- `extract_document` still fails the job if every
+            # window ends up here.
+            chunk_index, _ = batch[0]
+            logger.warning(
+                "Extraction failed for a window of chunk %d in %s (%s); "
+                "continuing without that window's facts.",
+                chunk_index,
+                source_name,
+                exc,
+            )
+            return _BatchOutcome(
+                (_output_to_extraction(chunk_index, ExtractionOutput()),), 1
+            )
+
+        mid = len(batch) // 2
+        logger.warning(
+            "Extraction batch of %d window(s) for %s was rejected (%s); "
+            "splitting into %d and %d and retrying.",
+            len(batch),
+            source_name,
+            type(exc).__name__,
+            mid,
+            len(batch) - mid,
+        )
+        left = _extract_batch_splitting(
+            agent, source_name=source_name, batch=batch[:mid]
+        )
+        right = _extract_batch_splitting(
+            agent, source_name=source_name, batch=batch[mid:]
+        )
+        return _BatchOutcome(
+            left.extractions + right.extractions,
+            left.lost_windows + right.lost_windows,
+        )
+
+
 def _document_windows(chunks: tuple) -> tuple[tuple[int, str], ...]:
     """Flatten every chunk of a document into (chunk_index, window_text).
 
@@ -423,8 +518,30 @@ def extract_document(
     )
 
     per_window: list[ChunkExtraction] = []
+    lost = 0
     for batch in batches:
-        per_window.extend(_extract_batch(agent, source_name=source_name, batch=batch))
+        outcome = _extract_batch_splitting(
+            agent, source_name=source_name, batch=batch
+        )
+        per_window.extend(outcome.extractions)
+        lost += outcome.lost_windows
+
+    if lost == len(windows):
+        # Every window was rejected. Degrading to "extracted nothing" would
+        # mark the job SUCCEEDED with an empty graph, which reads as a
+        # document that simply had no facts in it -- the one failure mode
+        # worse than failing.
+        raise ExtractionFailed(
+            f"every one of {len(windows)} window(s) of {source_name} was "
+            f"rejected by the model"
+        )
+    if lost:
+        logger.warning(
+            "Extracted %s with %d of %d window(s) lost.",
+            source_name,
+            lost,
+            len(windows),
+        )
 
     # Back to one extraction per chunk, preserving the order the chunks came
     # in -- `_merge_windows` already knows how to fold several windows of one

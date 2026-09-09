@@ -207,11 +207,11 @@ async def test_two_resumes_same_request_id_create_one_row():
 
 
 # ---------------------------------------------------------------------------
-# CHECK_TICKET_STATUS -> clarification response (scoped out of MVP)
+# CHECK_TICKET_STATUS -> the status-lookup node
 # ---------------------------------------------------------------------------
 
 class TestCheckTicketStatusRouting:
-    def test_high_confidence_status_check_answers_directly(self) -> None:
+    def test_high_confidence_status_check_routes_to_status_node(self) -> None:
         decision = decide_route(
             _classification(
                 request_category=RequestCategory.DOMAIN_REQUEST,
@@ -220,21 +220,34 @@ class TestCheckTicketStatusRouting:
             ),
             prior_attempts=0,
         )
-        assert decision.next_agent is NextAgent.NONE
+        assert decision.next_agent is NextAgent.TICKET_STATUS_AGENT
         assert decision.clarification_required is False
         assert decision.ticket_type is None
-        assert decision.final_response is not None
-        assert "status" in decision.final_response.lower()
+        # No canned answer any more: the node does the lookup.
+        assert decision.final_response is None
 
-    def test_low_confidence_status_check_still_answers_directly(self) -> None:
-        # Even at low confidence a CHECK_TICKET_STATUS intent is answered in
-        # place, before the clarification tier logic would otherwise fire.
+    def test_low_confidence_status_check_still_routes_to_status_node(self) -> None:
+        # Even at low confidence a CHECK_TICKET_STATUS intent goes straight to
+        # the lookup, before the clarification tier logic would otherwise fire:
+        # the node asks for the ticket id itself when it needs one.
         decision = decide_route(
             _classification(
                 intent=Intent.CHECK_TICKET_STATUS, intent_confidence=0.2
             ),
             prior_attempts=0,
         )
-        assert decision.next_agent is NextAgent.NONE
-        assert decision.final_response is not None
-        assert "status" in decision.final_response.lower()
+        assert decision.next_agent is NextAgent.TICKET_STATUS_AGENT
+        assert decision.final_response is None
+
+    def test_status_check_never_routes_into_ticket_creation(self) -> None:
+        # The regression that matters: asking about an existing ticket must
+        # not open a new one.
+        for confidence in (0.05, 0.5, 0.99):
+            decision = decide_route(
+                _classification(
+                    intent=Intent.CHECK_TICKET_STATUS,
+                    intent_confidence=confidence,
+                ),
+                prior_attempts=0,
+            )
+            assert decision.next_agent is not NextAgent.TICKET_AGENT

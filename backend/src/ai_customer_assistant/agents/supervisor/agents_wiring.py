@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 import logging
 from typing import Any, Callable, Mapping, Optional
 
@@ -267,6 +268,111 @@ def make_ticket_agent_node(
         }
 
     return ticket_agent
+
+
+def make_ticket_status_node(
+    ticket_ops: TicketOps,
+) -> Callable[[SupervisorState], dict]:
+    """Build the ticket status-lookup node.
+
+    Until now `CHECK_TICKET_STATUS` was answered at classification time with
+    a hardcoded "not available yet" -- so a customer who had just been handed
+    a ticket id could not ask what had become of it. The intent was already
+    classified and the row already existed; only the read path was missing.
+
+    Two shapes, one interrupt at most:
+
+      1. the message already contains an id ("what's the status of
+         3f2a...?") -- answer immediately, no round trip;
+      2. it does not ("any update on my ticket?") -- `interrupt()` once for
+         the id, then answer.
+
+    Identity is the ticket id, not the email address. An email lookup would
+    be friendlier and would let anyone who can name an address read that
+    person's tickets; the id is the thing the confirmation gave them, and it
+    is unguessable.
+    """
+
+    async def ticket_status(state: SupervisorState) -> dict:
+        message = state.get("user_message", "")
+
+        ticket_id = _find_ticket_id(message)
+        if ticket_id is None:
+            supplied = interrupt(
+                {
+                    "type": "ticket_id_collection",
+                    "query": _TICKET_ID_QUESTION,
+                }
+            )
+            ticket_id = _find_ticket_id(_resume_text(supplied, key="ticket_id"))
+
+        ticket = await ticket_ops.get_ticket(ticket_id) if ticket_id else None
+        return {
+            "downstream_result": {
+                "status": "GROUNDED",
+                "response": _status_reply(ticket_id, ticket),
+            }
+        }
+
+    return ticket_status
+
+
+_TICKET_ID_QUESTION = (
+    "What is the ticket ID? It's in the confirmation we sent you — "
+    "something like 3f2a9c14-5b7e-4a21-9f03-8c6d1e4b7a92."
+)
+
+# Deliberately permissive about surroundings and strict about the id itself:
+# people paste "ticket 3f2a...?" or "ID: 3f2a...". Anchoring the match to a
+# uuid shape means punctuation around it is not the customer's problem.
+_TICKET_ID_PATTERN = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+    re.IGNORECASE,
+)
+
+
+def _find_ticket_id(text: str) -> str | None:
+    """Extract a ticket id, normalized to the canonical lowercase form.
+
+    Customers paste ids in whatever case their mail client rendered them.
+    Lowercasing here means the id that gets looked up and the id that gets
+    echoed back both match the one in the confirmation.
+    """
+    match = _TICKET_ID_PATTERN.search(text or "")
+    return match.group(0).lower() if match else None
+
+
+def _status_reply(ticket_id: str | None, ticket: Any) -> str:
+    """Render the answer.
+
+    Three outcomes, and they are kept distinct because they need different
+    things from the customer: no id given at all, an id that matches nothing,
+    and a real ticket.
+    """
+    if ticket_id is None:
+        return (
+            "I couldn't find a ticket ID in that. It looks like "
+            "3f2a9c14-5b7e-4a21-9f03-8c6d1e4b7a92 and is in the confirmation "
+            "we sent when the ticket was opened."
+        )
+
+    if ticket is None:
+        # Not "that ticket is closed" and not an error: an id that matches
+        # nothing is usually a typo, and saying so is more useful than
+        # implying the ticket once existed.
+        return (
+            f"I couldn't find a ticket with ID {ticket_id}. Please double-check "
+            f"it against the confirmation we sent — or tell me what you need and "
+            f"I can open a new ticket."
+        )
+
+    status = (getattr(ticket, "status", None) or "OPEN").replace("_", " ").lower()
+    reason = getattr(ticket, "reason", None)
+    about = f' about "{reason}"' if reason else ""
+    return (
+        f"Ticket {ticket.ticket_id}{about} is currently **{status}**. "
+        f"We'll follow up with you at {ticket.email}."
+    )
 
 
 _TICKET_REASON_QUESTION = "For what reason do you want to create a ticket?"
