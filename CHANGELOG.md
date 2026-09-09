@@ -154,6 +154,33 @@ while the tests more than doubled.
 - Migration `3d6f8b2c17ae` — `ticket.idempotency_key` with a unique
   constraint, and the `crawl_discovery` table.
 
+### Fixed — ingestion
+
+- **Chunk persistence was not idempotent**, which failed 31 of 82 ingestion
+  jobs and poisoned documents permanently: re-ingesting a version appended
+  its chunks a second time, and the lookup by `(version_id, chunk_index)`
+  then raised *"Multiple rows were found when exactly one was required"*
+  on every subsequent attempt. `persist_chunks` now replaces rather than
+  appends, a `uq_chunk_version_index` constraint makes the broken state
+  unrepresentable, and migration `b7d1e93a5c40` cleaned 58 redundant rows
+  from the existing data before adding it.
+- `_link_entity_to_chunk` no longer raises on a missing chunk — an
+  extraction naming an index the document does not have is one bad chunk,
+  not a failed document.
+
+### Added — provider API keys
+
+- Admin-only **API Keys** page and `GET/PUT/DELETE /admin/llm-providers`
+  (+ `POST .../default`). Groq is the seeded default provider.
+- Keys are **AES-GCM encrypted** under a key derived from `AUTH_SECRET`
+  (HKDF), and are **never returned over HTTP** — the API exposes the last
+  four characters and nothing else.
+- Resolution is saved-key first, environment second, so a deployment that
+  never opens the page behaves exactly as before. Rotating `AUTH_SECRET`
+  invalidates stored provider keys, which must then be re-entered.
+- Migration `9a4f7c2b83d1`, with a partial unique index enforcing a single
+  default provider in the database.
+
 ### Added — admin API
 
 - `GET /admin/knowledge-sources`, `/admin/jobs`, `/admin/stats`,

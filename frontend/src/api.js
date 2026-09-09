@@ -243,6 +243,19 @@
         return retryable(function () { return request('POST', path, { body: body, timeout: opts.timeout }); });
       });
     },
+    /* PUT and DELETE go through the same re-auth path as GET and POST.
+       Without that, a 401 on a save would surface as a failure rather than
+       refreshing and retrying, and the user would lose what they typed. */
+    put: function (path, body) {
+      return withReauth(path, function () {
+        return request('PUT', path, { body: body });
+      });
+    },
+    del: function (path) {
+      return withReauth(path, function () {
+        return request('DELETE', path);
+      });
+    },
     upload: function (path, file, extraFields) {
       return withReauth(path, function () {
         /* Rebuilt per attempt: a FormData that has been sent once cannot be

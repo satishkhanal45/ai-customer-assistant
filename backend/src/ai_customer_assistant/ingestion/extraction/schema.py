@@ -100,3 +100,26 @@ class ExtractionOutput(BaseModel):
     entities: list[ExtractedEntity] = []
     attributes: list[ExtractedAttribute] = []
     relations: list[ExtractedRelation] = []
+
+
+# ---------------------------------------------------------------------------
+# Batched output.
+#
+# The system prompt carries the whole canonical vocabulary -- 896 tokens of
+# the ~1,346 sent for a single window, so two thirds of every call was the
+# same text again. Sending several windows per call amortises it: at three
+# windows the prompt overhead per window falls by two thirds.
+#
+# `window_id` is the batch-local position, not the chunk index. A chunk can
+# span several windows, so the caller maps ids back to chunks; making the
+# model emit chunk indices instead would ask it to track a numbering it has
+# no reason to get right.
+# ---------------------------------------------------------------------------
+
+
+class BatchedWindowOutput(ExtractionOutput):
+    window_id: int = -1
+
+
+class BatchedExtractionOutput(BaseModel):
+    windows: list[BatchedWindowOutput] = []

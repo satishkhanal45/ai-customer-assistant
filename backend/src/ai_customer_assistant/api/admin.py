@@ -35,12 +35,16 @@ everyone who has opened a ticket -- so `require_admin`, not
 from __future__ import annotations
 
 import logging
+import os
+from datetime import datetime, timezone
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
-from sqlalchemy import case, func, select
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
+from sqlalchemy import case, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+import llm_credentials
 from auth.dependencies import Principal, require_admin
 from db.engine import get_session
 
@@ -306,3 +310,189 @@ async def list_tickets(
             for ticket in tickets
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# LLM provider credentials
+#
+# Write-only over HTTP: no endpoint here returns a key. A caller can learn
+# which providers are configured and the last four characters of each, which
+# is enough to recognise a key and not enough to use one.
+# ---------------------------------------------------------------------------
+
+
+class SaveKeyRequest(BaseModel):
+    # Generous bounds rather than a format check: every vendor's key looks
+    # different and the formats change. The provider will tell us soon
+    # enough whether it is valid; guessing here only rejects real keys.
+    api_key: str = Field(min_length=8, max_length=512)
+    make_default: bool = False
+
+
+def _provider_or_404(provider: str):
+    spec = llm_credentials.PROVIDERS_BY_NAME.get(provider)
+    if spec is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Unknown provider {provider!r}. Known: "
+            f"{', '.join(p.name for p in llm_credentials.PROVIDERS)}.",
+        )
+    return spec
+
+
+@router.get("/llm-providers")
+async def list_llm_providers(session: AsyncSession = Depends(get_session)) -> dict:
+    """Every supported provider, and how each one is currently configured.
+
+    `source` is the useful column: a provider can be configured by a key
+    saved here, or by an environment variable that was always there. Showing
+    which tells an administrator whether editing this page will change
+    anything -- a saved key shadows the environment, and without that
+    distinction "I changed the key and nothing happened" is unanswerable.
+    """
+    from db.models import LlmCredential
+
+    rows = {
+        row.provider: row
+        for row in (await session.execute(select(LlmCredential))).scalars().all()
+    }
+
+    providers = []
+    for spec in llm_credentials.PROVIDERS:
+        row = rows.get(spec.name)
+        has_saved = bool(row and row.encrypted_key)
+        from_env = bool(os.environ.get(spec.env_var))
+        providers.append(
+            {
+                "name": spec.name,
+                "label": spec.label,
+                "env_var": spec.env_var,
+                "docs_url": spec.docs_url,
+                "configured": has_saved or from_env,
+                "source": "saved" if has_saved else ("environment" if from_env else None),
+                "last4": row.last4 if has_saved else None,
+                "is_default": bool(row.is_default) if row else False,
+                "updated_at": row.updated_at.isoformat() if row and row.updated_at else None,
+            }
+        )
+
+    return {"providers": providers, "default": llm_credentials.default_provider()}
+
+
+@router.put("/llm-providers/{provider}")
+async def save_llm_key(
+    provider: str,
+    payload: SaveKeyRequest,
+    principal: Principal = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Store a provider key, encrypted.
+
+    The plaintext is used to derive `last4` and then encrypted; it is never
+    written to a log, and the request body is never echoed back.
+    """
+    from db.models import LlmCredential
+
+    _provider_or_404(provider)
+    api_key = payload.api_key.strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="The key is empty.",
+        )
+
+    row = await session.get(LlmCredential, provider)
+    if row is None:
+        row = LlmCredential(provider=provider)
+        session.add(row)
+
+    row.encrypted_key = llm_credentials.encrypt(api_key)
+    row.last4 = llm_credentials.last4(api_key)
+    row.updated_by = principal.id
+    row.updated_at = datetime.now(timezone.utc)
+
+    if payload.make_default:
+        await _clear_defaults(session)
+        row.is_default = True
+
+    # Commit before returning, not in the dependency's teardown. `get_session`
+    # commits after the response has been handed to the client, so the page's
+    # immediate reload can race the write and show the caller stale data --
+    # a user failing to read their own write. Observed, not theorised.
+    await session.commit()
+    await llm_credentials.refresh(session)
+    logger.info("Provider key for %s updated by %s.", provider, principal.email)
+
+    return {"provider": provider, "last4": row.last4, "is_default": row.is_default}
+
+
+@router.delete("/llm-providers/{provider}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_llm_key(
+    provider: str,
+    principal: Principal = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> None:
+    """Forget a saved key.
+
+    The row survives so `is_default` is not lost, and resolution falls back
+    to the environment variable if one is set -- deleting a key here should
+    return the deployment to how it behaved before anyone used this page,
+    not switch the provider off.
+    """
+    from db.models import LlmCredential
+
+    _provider_or_404(provider)
+    row = await session.get(LlmCredential, provider)
+    if row is not None:
+        row.encrypted_key = None
+        row.last4 = None
+        row.updated_by = principal.id
+        row.updated_at = datetime.now(timezone.utc)
+        await session.commit()
+        await llm_credentials.refresh(session)
+        logger.info("Provider key for %s cleared by %s.", provider, principal.email)
+    return None
+
+
+@router.post("/llm-providers/{provider}/default")
+async def set_default_provider(
+    provider: str,
+    principal: Principal = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Choose which provider new work uses."""
+    from db.models import LlmCredential
+
+    _provider_or_404(provider)
+
+    row = await session.get(LlmCredential, provider)
+    if row is None:
+        row = LlmCredential(provider=provider)
+        session.add(row)
+
+    await _clear_defaults(session)
+    row.is_default = True
+    row.updated_by = principal.id
+    row.updated_at = datetime.now(timezone.utc)
+
+    await session.commit()
+    await llm_credentials.refresh(session)
+    logger.info("Default LLM provider set to %s by %s.", provider, principal.email)
+
+    return {"default": provider}
+
+
+async def _clear_defaults(session: AsyncSession) -> None:
+    """Unset every default before setting one.
+
+    A partial unique index enforces "at most one default" in the database,
+    so this is not merely tidiness: without it the next insert violates the
+    constraint. Flushed immediately so the old row is cleared before the new
+    one is written, rather than both hitting the index in one statement.
+    """
+    from db.models import LlmCredential
+
+    await session.execute(
+        update(LlmCredential).where(LlmCredential.is_default).values(is_default=False)
+    )
+    await session.flush()

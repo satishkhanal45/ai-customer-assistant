@@ -13,9 +13,10 @@ queue.repository.previous_version_chunk_checksums.
 from __future__ import annotations
 
 import hashlib
+import logging
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -30,6 +31,8 @@ from db.models import (
 from ingestion.extraction.ontology import safe_canonicalize_entity_type
 from ingestion.pipeline_types import ChunkExtraction
 
+logger = logging.getLogger(__name__)
+
 
 def compute_chunk_checksum(text: str) -> str:
     """Pure: EmbeddedChunk has no checksum field, so we derive one here."""
@@ -42,9 +45,36 @@ async def persist_chunks(
     embedded_chunks: tuple,  # tuple[chunk_embed.types.EmbeddedChunk, ...]
     reused_embeddings: dict[str, tuple[float, ...]],
 ) -> tuple[str, ...]:
-    """Insert every chunk for this version. entity_id starts NULL for all
-    of them (step 4); _link_entity_to_chunk sets it once extraction (step 5)
-    resolves a real entity. Returns the checksums written, in order."""
+    """Replace this version's chunks. entity_id starts NULL for all of them
+    (step 4); _link_entity_to_chunk sets it once extraction (step 5)
+    resolves a real entity. Returns the checksums written, in order.
+
+    **Replace, not append.** This used to `add()` unconditionally, so
+    ingesting a version twice wrote every chunk twice -- and the lookup by
+    (version_id, chunk_index) in `_link_entity_to_chunk` then failed with
+    "Multiple rows were found when exactly one was required". 31 of the 82
+    jobs in this database failed that way, and the state was permanent:
+    once a version held duplicates, every later attempt failed identically,
+    so the document could never be ingested again.
+
+    Deleting first loses nothing. Chunks belong to a *version*, and a
+    version is an immutable snapshot -- `_stage_fetch_bytes` verifies the
+    bytes still match the version's recorded checksum before any of this
+    runs, and fails with `checksum_mismatch` if they do not. So the rows
+    being deleted were derived from the same bytes as the rows replacing
+    them. Superseded versions have different `version_id`s and are
+    untouched; `cutover` only marks them STALE.
+
+    (Whether those superseded versions should remain *searchable* is a
+    separate, open question -- status.md P1-7.)
+    """
+    # Same transaction as the insert below, so a failure mid-write leaves
+    # the previous chunks intact rather than deleting them and stopping.
+    await session.execute(
+        delete(EmbeddingChunk).where(EmbeddingChunk.version_id == version_id)
+    )
+    await session.flush()
+
     checksums: list[str] = []
     for embedded in embedded_chunks:  # one INSERT per row, needs its own values
         checksum = compute_chunk_checksum(embedded.chunk.text)
@@ -123,13 +153,37 @@ async def _resolve_attribute(
 
 
 async def _link_entity_to_chunk(session: AsyncSession, version_id: UUID, chunk_index: int, entity_id: UUID) -> None:
+    """Point one chunk at the entity its extraction resolved.
+
+    `scalar_one()` used to be the lookup here, which turned two data
+    problems into the same unhelpful crash. Duplicate chunks now cannot
+    exist -- `persist_chunks` replaces rather than appends, and
+    `uq_chunk_version_index` enforces it -- so the remaining case is a
+    *missing* chunk, which happens when the model returns an index the
+    document does not have. That is the extraction being wrong about one
+    chunk, not a reason to fail the whole document, so it is skipped with a
+    warning that names the version and the index rather than raising
+    "Multiple rows were found when exactly one was required" from three
+    frames away.
+    """
     chunk = (
         await session.execute(
             select(EmbeddingChunk).where(
-                EmbeddingChunk.version_id == version_id, EmbeddingChunk.chunk_index == chunk_index
+                EmbeddingChunk.version_id == version_id,
+                EmbeddingChunk.chunk_index == chunk_index,
             )
         )
-    ).scalar_one()
+    ).scalars().first()
+
+    if chunk is None:
+        logger.warning(
+            "Extraction referenced chunk_index %s of version %s, which does "
+            "not exist; skipping the entity link for it.",
+            chunk_index,
+            version_id,
+        )
+        return
+
     chunk.entity_id = entity_id
     session.add(KnowledgeSourceEntityMap(version_id=version_id, entity_id=entity_id, relationship_type="DERIVED_CHUNK"))
 

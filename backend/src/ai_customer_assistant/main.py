@@ -29,6 +29,7 @@ from auth.router import router as auth_router  # noqa: E402
 from auth.tokens import auth_secret  # noqa: E402
 from db.checkpointer import build_checkpointer  # noqa: E402
 from db.engine import dispose_engine, get_session_factory  # noqa: E402
+import llm_credentials  # noqa: E402
 from logging_config import configure_logging  # noqa: E402
 from services.chat_service import build_chat_service  # noqa: E402
 from services.embeddings import build_shared_embeddings  # noqa: E402
@@ -49,6 +50,22 @@ async def lifespan(app: FastAPI):
     # shared BGE instance and the async session factory are passed in.
     shared_embeddings = build_shared_embeddings()
     session_factory = get_session_factory()
+
+    # Load saved provider keys before anything constructs an LLM client, so
+    # a key entered on the Admin page is in effect from the first turn after
+    # a restart rather than only after someone saves it again. A database
+    # that is unreachable, or a key that will not decrypt, must not stop the
+    # app starting -- resolution simply falls back to the environment, which
+    # is where these keys lived before this table existed.
+    try:
+        async with session_factory() as session:
+            await llm_credentials.refresh(session)
+    except Exception:
+        logger.warning(
+            "Could not load saved LLM provider keys; falling back to the "
+            "environment.",
+            exc_info=True,
+        )
     service = await build_chat_service(
         checkpointer=checkpointer,
         shared_embeddings=shared_embeddings,

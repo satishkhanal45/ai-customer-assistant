@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from config import load_env
 from db.session import database_url  # read-only import, not modified
+from ingestion.pipeline import get_pipeline_resources, reset_pipeline_resources
 from ingestion.queue.config import PGQueueSettings
 from ingestion.queue.worker import WorkerDeps, run_worker
 
@@ -65,10 +66,25 @@ async def main() -> None:
     session_factory = async_sessionmaker(bind=engine, expire_on_commit=False)
 
     deps = WorkerDeps(session_factory=session_factory, settings=PGQueueSettings())
-    logging.getLogger(__name__).info(
+    log = logging.getLogger(__name__)
+
+    # Load the embedding model and tokenizer here, once, rather than letting
+    # the first job pay for it -- and, before this, every job after it too.
+    # Doing it up front also means a broken model or missing MinIO config
+    # fails at startup instead of turning the first document into a mystery
+    # failure.
+    get_pipeline_resources()
+
+    log.info(
         "ingestion worker starting, polling every %.1fs", deps.settings.poll_interval_seconds
     )
-    await run_worker(deps)
+    try:
+        await run_worker(deps)
+    finally:
+        # The HTTP client is owned by the process now, so the process closes
+        # it. Previously one was created per job and never closed at all.
+        reset_pipeline_resources()
+        await engine.dispose()
 
 
 

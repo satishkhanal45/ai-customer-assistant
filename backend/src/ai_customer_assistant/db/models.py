@@ -224,6 +224,48 @@ class RefreshToken(Base):
     user_agent: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
 
+class LlmCredential(Base):
+    """One LLM provider's API key, encrypted, plus which one is default.
+
+    The key never leaves the server: `api/admin.py` returns `last4` and the
+    fact that a key exists, and nothing else. What is stored is AES-GCM
+    ciphertext under a key derived from `AUTH_SECRET` (see
+    `llm_credentials.py`), so a database dump on its own is not a usable
+    credential.
+
+    One row per provider, keyed by the provider name rather than a surrogate
+    id -- there is exactly one key per vendor, and making that a primary key
+    means the schema says so instead of an application check.
+    """
+
+    __tablename__ = "llm_credential"
+
+    provider: Mapped[str] = mapped_column(String(32), primary_key=True)
+    # Base64 of nonce || ciphertext. Nullable so a provider row can record
+    # "this is the default" without a key having been saved for it yet.
+    encrypted_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The last four characters, in clear. Enough to answer "is this the key
+    # I think it is?", not enough to use.
+    last4: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    # Both defaults, as on AppUser.id and for the same reason. The
+    # server_default is what a raw INSERT (a migration, psql) gets; the
+    # Python default is what the ORM sends. They are not interchangeable:
+    # `server_default="false"` is a *string* literal, which Postgres reads
+    # as the boolean but SQLite stores as the text 'false' -- and 'false'
+    # is truthy, so a freshly inserted row came back claiming to be the
+    # default provider. Caught by a test; harmless on Postgres, wrong
+    # everywhere else.
+    is_default: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    updated_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("app_user.id", ondelete="SET NULL"), nullable=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class RateLimitBucket(Base):
     """One fixed window of one rate-limit key.
 
@@ -361,9 +403,33 @@ class KnowledgeSourceVersion(Base):
 
 class EmbeddingChunk(Base):
     __tablename__ = "embedding_chunk"
+    __table_args__ = (
+        # A version has exactly one chunk at each index. Before this
+        # constraint existed, `persist_chunks` appended rather than
+        # replaced, so re-ingesting a version wrote every chunk a second
+        # time -- and `_link_entity_to_chunk`'s lookup by
+        # (version_id, chunk_index) then raised "Multiple rows were found
+        # when exactly one was required". That single defect accounted for
+        # 31 of the 82 ingestion jobs in this database failing, and it was
+        # self-perpetuating: once a version held duplicates, every later
+        # attempt failed the same way.
+        #
+        # The write path is idempotent now, but the constraint is what makes
+        # the broken state unrepresentable rather than merely unlikely, and
+        # turns any future regression into an immediate integrity error at
+        # the line that caused it.
+        UniqueConstraint("version_id", "chunk_index", name="uq_chunk_version_index"),
+    )
 
+    # Both defaults, as on AppUser.id: server_default is what a plain SQL
+    # INSERT gets, `default` is what the ORM sends. The Python side is what
+    # keeps this insert portable off Postgres, which is what lets the
+    # chunk-persistence tests run the real statement.
     chunk_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=func.gen_random_uuid(),
     )
     version_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -376,12 +442,16 @@ class EmbeddingChunk(Base):
     text: Mapped[str] = mapped_column(Text, nullable=False)
     # Postgres gets pgvector's real type -- that is what the HNSW index and
     # the `<=>` distance operator need, and `with_variant` leaves it
-    # untouched there. The SQLite variant exists only so the table can be
-    # *created* off Postgres: `/admin/stats` counts this table, and without
-    # it any test of that endpoint has to mock the query rather than run
-    # it. Nothing off Postgres can do similarity search, and nothing tries.
+    # untouched there.
+    #
+    # The SQLite variant is JSON rather than Text because it has to accept a
+    # write, not just exist: a vector arrives as a Python list, and binding a
+    # list to a Text column fails outright. JSON round-trips it, which is
+    # what lets the chunk-persistence tests exercise the real INSERT instead
+    # of mocking the one statement they are about. Nothing off Postgres can
+    # do similarity search, and nothing tries.
     embedding: Mapped[list[float]] = mapped_column(
-        Vector(768).with_variant(Text(), "sqlite"), nullable=False
+        Vector(768).with_variant(JSON(), "sqlite"), nullable=False
     )
     page: Mapped[int | None] = mapped_column(Integer, nullable=True)
     token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)

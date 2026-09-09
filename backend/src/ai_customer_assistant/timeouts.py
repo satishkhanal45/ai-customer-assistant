@@ -157,6 +157,49 @@ LLM_ANSWER_RETRY_BUDGET_S: float = _float_env("LLM_ANSWER_RETRY_BUDGET_S", 34.0)
 LLM_CALL_TIMEOUT_S: float = LLM_SHORT_TIMEOUT_S
 LLM_RETRY_BUDGET_S: float = LLM_SHORT_RETRY_BUDGET_S
 
+# --------------------------------------------------------------------------
+# Ingestion budgets
+#
+# Deliberately NOT part of the ladder above. That ladder exists because a
+# person is waiting on a chat turn and the client gives up at 60 seconds.
+# Ingestion is background work with nobody watching, so it can afford to be
+# slower — but "slower" is not "unbounded", which is what it was.
+#
+# Observed 2026-09-09: one document sat in RUNNING for 28 minutes with no
+# log output and no progress. The worker finishes one job before claiming
+# another, so the entire queue stopped behind it, and the stale-job reaper
+# could not help — it runs once at worker startup, so a worker that is alive
+# and stuck blocks forever. A single hung HTTP call became an indefinitely
+# stalled pipeline.
+#
+# Two numbers, because they bound different things:
+#
+#   * the CALL timeout is handed to the provider client, so the underlying
+#     HTTP request actually terminates. This is the one that unwedges a
+#     stuck thread;
+#   * the STAGE budget bounds the whole document, because extraction makes
+#     one call per chunk and a 40-chunk document can be slow without any
+#     single call being slow.
+#
+# 30s per call is three times the chat short-stage timeout: extraction emits
+# structured JSON over a chunk of prose, and nobody is watching a progress
+# spinner. 10 minutes for a document is generous enough that hitting it
+# means something is genuinely wrong rather than merely large.
+INGEST_EXTRACTION_CALL_TIMEOUT_S: float = _float_env(
+    "INGEST_EXTRACTION_CALL_TIMEOUT_S", 30.0
+)
+INGEST_EXTRACTION_STAGE_BUDGET_S: float = _float_env(
+    "INGEST_EXTRACTION_STAGE_BUDGET_S", 600.0
+)
+
+# How many times the provider client retries a transient failure of its own
+# accord. The SDK's backoff is what absorbed every 429 in the 2026-09-09
+# re-run, so it is worth keeping — but bounded, so the retries fit inside
+# the call timeout rather than extending it indefinitely.
+INGEST_EXTRACTION_MAX_RETRIES: int = int(
+    _float_env("INGEST_EXTRACTION_MAX_RETRIES", 3)
+)
+
 
 def sleep_within_budget(requested: float, deadline: float, call_timeout: float) -> bool:
     """Sleep for ``requested`` seconds, but only if a retry still fits.
