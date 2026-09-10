@@ -14,9 +14,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,9 +25,11 @@ from db.models import (
     Attribute,
     Entity,
     EmbeddingChunk,
+    KnowledgeSource,
     KnowledgeSourceEntityMap,
     Relation,
     Value,
+    ValueProvenance,
 )
 from ingestion.extraction.ontology import safe_canonicalize_entity_type
 from ingestion.pipeline_types import ChunkExtraction
@@ -188,7 +191,12 @@ async def _link_entity_to_chunk(session: AsyncSession, version_id: UUID, chunk_i
     session.add(KnowledgeSourceEntityMap(version_id=version_id, entity_id=entity_id, relationship_type="DERIVED_CHUNK"))
 
 
-async def _persist_one_extraction(session: AsyncSession, version_id: UUID, extraction: ChunkExtraction) -> UUID | None:
+async def _persist_one_extraction(
+    session: AsyncSession,
+    version_id: UUID,
+    extraction: ChunkExtraction,
+    multivalued: frozenset[tuple[str, str]] = frozenset(),
+) -> UUID | None:
     """Write one chunk's resolved entity + facts + relations. Returns the
     resolved entity_id, or None if there was no primary entity.
 
@@ -214,12 +222,27 @@ async def _persist_one_extraction(session: AsyncSession, version_id: UUID, extra
 
     for fact in extraction.facts:
         attribute_id = await _resolve_attribute(
-            session, fact.namespace, fact.attribute_name, fact.value_type, fact.multivalue
+            session,
+            fact.namespace,
+            fact.attribute_name,
+            fact.value_type,
+            # `multivalue` arrived hardcoded False from the extractor, so every
+            # attribute in the database claimed to hold one value while dozens
+            # held several. Observing the document is more reliable than asking
+            # the model: if this document states four `client_industries` for
+            # one entity, the attribute takes more than one value, and that is
+            # a fact about the data rather than a judgement call.
+            fact.multivalue
+            or (fact.namespace, fact.attribute_name) in multivalued,
         )
         fact_entity_id = await resolve(fact.entity_type, fact.entity_name)
-        # ON CONFLICT DO NOTHING (unique on entity+attribute+value) makes
-        # fact writes idempotent: re-extracting the same fact from another
-        # chunk or re-ingesting the document can't create duplicate rows.
+        # Unique on (entity, attribute, value), so re-extracting the same fact
+        # from another chunk or re-ingesting the document cannot create a
+        # duplicate row. DO UPDATE rather than DO NOTHING purely so the id
+        # comes back on a conflict too -- provenance has to be recorded for a
+        # fact this version restates, not only for one it states first, or a
+        # document would appear to have stopped asserting everything it shares
+        # with another.
         stmt = (
             pg_insert(Value)
             .values(
@@ -228,11 +251,21 @@ async def _persist_one_extraction(session: AsyncSession, version_id: UUID, extra
                 value=fact.value,
                 searchable=fact.searchable,
             )
+            .on_conflict_do_update(
+                index_elements=[Value.entity_id, Value.attribute_id, Value.value],
+                set_={"searchable": fact.searchable},
+            )
+            .returning(Value.id)
+        )
+        value_id = (await session.execute(stmt)).scalar_one()
+
+        await session.execute(
+            pg_insert(ValueProvenance)
+            .values(value_id=value_id, version_id=version_id)
             .on_conflict_do_nothing(
-                index_elements=[Value.entity_id, Value.attribute_id, Value.value]
+                index_elements=[ValueProvenance.value_id, ValueProvenance.version_id]
             )
         )
-        await session.execute(stmt)
 
     for relation in extraction.relations:
         source_id = await resolve(relation.source_entity_type, relation.source_entity_name)
@@ -260,14 +293,121 @@ async def _persist_one_extraction(session: AsyncSession, version_id: UUID, extra
     return entity_id
 
 
+def _multivalued_attributes(
+    extractions: tuple[ChunkExtraction, ...],
+) -> frozenset[tuple[str, str]]:
+    """Attributes this document gives more than one value for, on one entity.
+
+    Computed across the whole document rather than per chunk, because a
+    document's four `client_industries` are usually spread over four chunks --
+    per-chunk counting would see one each and conclude the attribute is
+    single-valued.
+
+    Distinct values only: the same fact restated in two chunks is one value,
+    not evidence of a list.
+    """
+    seen: dict[tuple[str, str, str, str], set[str]] = {}
+    for extraction in extractions:
+        for fact in extraction.facts:
+            key = (
+                fact.entity_type,
+                fact.entity_name,
+                fact.namespace,
+                fact.attribute_name,
+            )
+            seen.setdefault(key, set()).add(fact.value)
+    return frozenset(
+        (namespace, attribute_name)
+        for (_, _, namespace, attribute_name), values in seen.items()
+        if len(values) > 1
+    )
+
+
 async def persist_chunk_extractions(
     session: AsyncSession, version_id: UUID, extractions: tuple[ChunkExtraction, ...]
 ) -> int:
     """Persist every chunk's EAV extraction (steps 5-6). Returns the count
     of distinct entities resolved, for job reporting."""
+    multivalued = _multivalued_attributes(extractions)
     resolved_ids = set()
     for extraction in extractions:  # each may write rows depending on prior ones
-        entity_id = await _persist_one_extraction(session, version_id, extraction)
+        entity_id = await _persist_one_extraction(
+            session, version_id, extraction, multivalued
+        )
         resolved_ids.add(entity_id)
     await session.flush()
     return len(resolved_ids - {None})
+
+
+async def resolve_superseded_values(session: AsyncSession) -> tuple[int, int]:
+    """Recompute which facts are current. Returns (superseded, restored).
+
+    A value is **current** when at least one version that asserts it is its
+    source's `current_version_id`, and **superseded** when none of them are.
+    Nothing here is incremental: the state is derived from provenance every
+    time, so a re-ingest, a rollback, or a document that stops being current
+    all converge on the same answer without anyone having to reason about the
+    order they happened in.
+
+    Two rules, and the second matters as much as the first:
+
+    * A fact no current document asserts is marked superseded. It is not
+      deleted -- the rate that used to apply is a real historical fact, and
+      the mark is what stops it being answered as though it still applied.
+    * A fact that becomes current again is **un-marked**. Facts come back:
+      a value removed in v2 and restored in v3 is current again, and a
+      one-way mark would leave it permanently invisible.
+
+    Runs after cutover, not before. `current_version_id` is what "current"
+    means here, and the cutover is what sets it -- running this first would
+    mark the version being ingested as superseded, since it is not yet the
+    current one.
+
+    Values with no provenance at all are never touched. Every row that
+    predates provenance tracking is in that state, so this is safe to run
+    against a database whose history was never recorded: those facts stay
+    current, which is what they were before this existed.
+    """
+    asserted_by_a_current_version = (
+        select(ValueProvenance.value_id)
+        .join(
+            KnowledgeSource,
+            KnowledgeSource.current_version_id == ValueProvenance.version_id,
+        )
+        .where(ValueProvenance.value_id == Value.id)
+        .exists()
+    )
+    has_any_provenance = (
+        select(ValueProvenance.value_id)
+        .where(ValueProvenance.value_id == Value.id)
+        .exists()
+    )
+
+    superseded = (
+        await session.execute(
+            update(Value)
+            .where(
+                Value.superseded_at.is_(None),
+                has_any_provenance,
+                ~asserted_by_a_current_version,
+            )
+            .values(superseded_at=datetime.now(UTC).replace(tzinfo=None))
+        )
+    ).rowcount
+
+    restored = (
+        await session.execute(
+            update(Value)
+            .where(Value.superseded_at.is_not(None), asserted_by_a_current_version)
+            .values(superseded_at=None)
+        )
+    ).rowcount
+
+    await session.flush()
+    if superseded or restored:
+        logger.info(
+            "fact currency: %d superseded, %d restored to current",
+            superseded,
+            restored,
+        )
+    return superseded, restored

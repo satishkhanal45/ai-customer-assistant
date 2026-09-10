@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
@@ -21,6 +21,7 @@ from db.models import (
     KnowledgeSource,
     KnowledgeSourceVersion,
 )
+from ingestion.queue import retry
 from ingestion.pipeline_types import (
     FileType,
     JobRef,
@@ -47,9 +48,16 @@ async def claim_next_job(session: AsyncSession) -> JobRef | None:
         .where(running.source_id == KnowledgeInjectionJob.source_id, running.status == "RUNNING")
         .exists()
     )
+    # A job waiting out its backoff is QUEUED but not yet *eligible*. Without
+    # this clause a retry would be claimed on the very next poll, which is a
+    # busy-wait against whatever was rate-limiting us in the first place.
+    ready = or_(
+        KnowledgeInjectionJob.next_attempt_at.is_(None),
+        KnowledgeInjectionJob.next_attempt_at <= datetime.now(UTC).replace(tzinfo=None),
+    )
     stmt = (
         select(KnowledgeInjectionJob)
-        .where(KnowledgeInjectionJob.status == "QUEUED", ~guard)
+        .where(KnowledgeInjectionJob.status == "QUEUED", ready, ~guard)
         .order_by(KnowledgeInjectionJob.started_at.nulls_first(), KnowledgeInjectionJob.job_id)
         .with_for_update(skip_locked=True)
         .limit(1)
@@ -60,6 +68,10 @@ async def claim_next_job(session: AsyncSession) -> JobRef | None:
 
     row.status = "RUNNING"
     row.started_at = datetime.now(UTC)
+    # The backoff has been served. Keeping the column meaningful -- set only
+    # while a job is actually waiting -- is what lets "is this job held back?"
+    # stay a single-column question.
+    row.next_attempt_at = None
     await session.flush()
     await session.commit()
 
@@ -70,6 +82,7 @@ async def claim_next_job(session: AsyncSession) -> JobRef | None:
         job_type=JobType(row.job_type),
         status=JobStatus(row.status),
         triggered_by=row.triggered_by,
+        attempt_count=row.attempt_count or 0,
     )
 
 
@@ -96,9 +109,27 @@ async def reset_stale_running_jobs(session: AsyncSession, *, older_than_seconds:
     ).scalars().all()
 
     for job in stale:
-        job.status = "QUEUED"
+        # An abandoned job has consumed an attempt. Without counting it, a
+        # document that kills the worker every time -- an OOM on a huge PDF,
+        # say -- is requeued forever, and because the reaper runs at startup
+        # it gets a fresh worker to kill each time. Counting it means such a
+        # job reaches DEAD_LETTER like any other repeat offender.
+        decision = retry.decide(
+            failure_kind=retry.WORKER_ABANDONED,
+            attempt_count=job.attempt_count or 0,
+        )
+        job.status = decision.status
         job.started_at = None
+        job.attempt_count = decision.attempt_count
+        job.next_attempt_at = _naive(decision.next_attempt_at)
+        job.failure_kind = retry.WORKER_ABANDONED
         job.error_details = "requeued: worker did not finish this job"
+        if not decision.will_retry:
+            job.completed_at = datetime.now(UTC).replace(tzinfo=None)
+            job.error_details = (
+                f"worker did not finish this job after "
+                f"{decision.attempt_count} attempt(s)"
+            )
 
     if stale:
         await session.flush()
@@ -198,6 +229,15 @@ async def cutover(
     await session.commit()
 
 
+def _naive(moment: datetime | None) -> datetime | None:
+    """Drop the tzinfo for columns declared without timezone.
+
+    `started_at` / `completed_at` / `next_attempt_at` are all naive DateTime,
+    and SQLite rejects an aware value outright rather than coercing it.
+    """
+    return moment.replace(tzinfo=None) if moment is not None else None
+
+
 async def complete_job(
     session: AsyncSession,
     *,
@@ -206,12 +246,43 @@ async def complete_job(
     chunks_created_count: int,
     entities_created_count: int,
     error_details: str | None,
-) -> None:
+    failure_kind: str | None = None,
+) -> JobStatus:
+    """Record a finished job, applying the retry policy to a failed one.
+
+    Returns the status actually written, which is not always the one passed
+    in: a FAILED outcome whose failure kind is transient and still has budget
+    is written back as QUEUED with a `next_attempt_at`, and one that has run
+    out of budget becomes DEAD_LETTER. Success is recorded as-is.
+
+    The policy lives in `retry.decide`; this function is the write.
+    """
     job = await session.get(KnowledgeInjectionJob, job_id)
-    job.status = status.value
-    job.completed_at = datetime.now(UTC)
     job.chunks_created_count = chunks_created_count
     job.entities_created_count = entities_created_count
     job.error_details = error_details
+    job.failure_kind = failure_kind
+
+    if status is not JobStatus.FAILED:
+        job.status = status.value
+        job.completed_at = datetime.now(UTC).replace(tzinfo=None)
+        job.next_attempt_at = None
+        await session.flush()
+        await session.commit()
+        return status
+
+    decision = retry.decide(
+        failure_kind=failure_kind, attempt_count=job.attempt_count or 0
+    )
+    job.status = decision.status
+    job.attempt_count = decision.attempt_count
+    job.next_attempt_at = _naive(decision.next_attempt_at)
+    # A job going back on the queue has not completed. Leaving a stale
+    # `completed_at` on it would make the Jobs page sort a pending retry in
+    # among the finished work.
+    job.completed_at = (
+        None if decision.will_retry else datetime.now(UTC).replace(tzinfo=None)
+    )
     await session.flush()
     await session.commit()
+    return JobStatus(decision.status)

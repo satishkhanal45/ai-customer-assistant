@@ -131,12 +131,23 @@ def _is_deterministic_rejection(exc: Exception) -> bool:
     return any(marker in lower for marker in _DETERMINISTIC_MARKERS)
 
 
-def _is_retryable(exc: Exception) -> bool:
+def is_rate_limited(exc: Exception) -> bool:
+    """Did the provider throttle us, rather than object to the request?
+
+    Public because the queue's retry policy needs the same answer: a
+    throttled document is worth trying again in ten minutes, and a rejected
+    one never will be. Keeping the test in one place is what stops the two
+    layers drifting into different definitions of the same word.
+    """
     if _is_deterministic_rejection(exc):
         return False
     text = str(exc)
     lower = text.lower()
     return "429" in text or "rate_limit" in lower or "rate limit" in lower
+
+
+def _is_retryable(exc: Exception) -> bool:
+    return is_rate_limited(exc)
 
 
 def _cooldown_seconds(exc: Exception) -> float | None:

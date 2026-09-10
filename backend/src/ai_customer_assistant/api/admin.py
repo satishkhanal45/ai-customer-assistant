@@ -213,6 +213,14 @@ async def list_jobs(
                 "started_at": job.started_at.isoformat() if job.started_at else None,
                 "completed_at": job.completed_at.isoformat() if job.completed_at else None,
                 "error_details": job.error_details,
+                # Retry state. Without these the page can see that a job
+                # failed but not whether it is going to try again -- which is
+                # the whole distinction DEAD_LETTER exists to draw.
+                "failure_kind": job.failure_kind,
+                "attempt_count": job.attempt_count,
+                "next_attempt_at": (
+                    job.next_attempt_at.isoformat() if job.next_attempt_at else None
+                ),
             }
             for job, source_name in rows
         ],

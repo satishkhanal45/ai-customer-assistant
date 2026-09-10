@@ -22,7 +22,8 @@
   var STATUS_BADGES = {
     PENDING: 'badge-muted', PROCESSING: 'badge-accent', INDEXED: 'badge-ok',
     FAILED: 'badge-bad', STALE: 'badge-warn', ARCHIVED: 'badge-muted',
-    QUEUED: 'badge-muted', RUNNING: 'badge-accent', SUCCEEDED: 'badge-ok'
+    QUEUED: 'badge-muted', RUNNING: 'badge-accent', SUCCEEDED: 'badge-ok',
+    DEAD_LETTER: 'badge-bad'
   };
 
   var roots = {};
@@ -147,6 +148,19 @@
       table(['Name', 'Type', 'Category', 'Status', 'Updated', 'Active'], rows);
   }
 
+  /* "Will this fix itself?" is the question this table exists to answer, and
+     status alone cannot: a QUEUED row holding a future next_attempt_at is a
+     pending retry, not fresh work. */
+  function attempts(j) {
+    var n = j.attempt_count == null ? 0 : j.attempt_count;
+    if (!n) return '—';
+    if (j.next_attempt_at) {
+      return '<span class="badge badge-warn" title="Next attempt ' +
+        NS.utils.esc(NS.utils.formatDate(j.next_attempt_at)) + '">' + n + ' · retrying</span>';
+    }
+    return NS.utils.esc(String(n));
+  }
+
   function renderJobs(data) {
     var rows = (Array.isArray(data) ? data : (data && data.jobs) || []).map(function (j) {
       /* Which document failed is the first thing anyone asks of this
@@ -154,6 +168,8 @@
       return '<td>' + NS.utils.esc(j.source_name || String(j.source_id || '').slice(0, 8) || '—') + '</td>' +
         '<td>' + NS.utils.esc(j.job_type || '—') + '</td>' +
         '<td>' + badge(j.status) + '</td>' +
+        '<td>' + attempts(j) + '</td>' +
+        '<td>' + NS.utils.esc(j.failure_kind || '—') + '</td>' +
         '<td>' + NS.utils.esc(j.chunks_created_count == null ? '—' : j.chunks_created_count) + '</td>' +
         '<td>' + NS.utils.esc(j.entities_created_count == null ? '—' : j.entities_created_count) + '</td>' +
         '<td>' + NS.utils.esc(NS.utils.formatDate(j.started_at)) + '</td>' +
@@ -161,7 +177,7 @@
         '<td>' + (j.error_details ? '<span class="err-detail" title="' + NS.utils.esc(j.error_details) + '">' + NS.utils.esc(String(j.error_details).slice(0, 60)) + '</span>' : '—') + '</td>';
     });
     roots.body.innerHTML = summary(data, 'jobs') +
-      table(['Source', 'Type', 'Status', 'Chunks', 'Entities', 'Started', 'Completed', 'Error'], rows);
+      table(['Source', 'Type', 'Status', 'Attempts', 'Failure', 'Chunks', 'Entities', 'Started', 'Completed', 'Error'], rows);
   }
 
   function renderStats(data) {

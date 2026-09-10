@@ -181,6 +181,120 @@ while the tests more than doubled.
 - Migration `9a4f7c2b83d1`, with a partial unique index enforcing a single
   default provider in the database.
 
+### Added — concurrent ingestion lanes and trace ids
+
+- **Every ingestion log line now carries the run that produced it**
+  (`[1c66bbf2.1]`). The id names the *run*, not the job: a job can be retried
+  four times, so `job_id` alone would label four separate runs identically.
+  Carried in a ContextVar rather than a parameter, because the lines that need
+  labelling are emitted deep inside modules with no reason to know about jobs
+  — and ContextVars propagate through `asyncio.to_thread`, which is where
+  extraction runs.
+- **The worker runs `PGQUEUE_CONCURRENCY` lanes** (default 2) in one process,
+  sharing one copy of the embedding model — a second *process* would load its
+  own 400 MB copy, which was the stated blocker. Set to 1 for the previous
+  strictly serial behaviour.
+- What that buys, stated plainly: extraction is bound by a provider token
+  budget, not by this worker, so lanes do not double throughput against a
+  daily ceiling. They stop one slow document holding the queue head.
+- **A `SentenceTransformer` is not safe to encode from several threads at
+  once**, and `chunk_and_embed` runs under `to_thread` with a shared model, so
+  lanes would have done exactly that. Encoding is now serialised with a lock;
+  it is a small fraction of a document's time.
+- **Fixed a race the plan had assumed away.** `FOR UPDATE SKIP LOCKED` stops
+  two lanes taking the same row, but the one-job-per-source guard is a
+  different question: a lane's RUNNING transition is invisible to the others
+  until it commits, so two lanes could each take a *different* job for the
+  *same* source. Claims are now serialised for the duration of the claim only.
+
+### Added — fact history and supersession
+
+- **Two contradictory facts could be returned as equally true.** `value` rows
+  are unique on (entity, attribute, value), so when a rate changed from $500
+  to $800 both survived under the same entity and attribute, with no version
+  link and nothing marking which was current — and structured lookup returned
+  both. A missing answer is visibly missing; two prices delivered confidently
+  is a wrong one.
+- History is **kept and marked**, not pruned. `value.superseded_at` is NULL
+  for current facts; retrieval filters on it, so the contradiction stops while
+  the old rate stays recoverable for a temporal feature later.
+- `value_provenance` records which document version asserted which fact. It is
+  a link table rather than a column because a `value` row is global — the same
+  fact is often stated by several documents — and without that, supersession
+  is not decidable: a fact dropped by one document may still be asserted by
+  another.
+- Currency is **derived, not accumulated**: `resolve_superseded_values`
+  recomputes the whole state from provenance each run, so a re-ingest, a
+  rollback, or a document ceasing to be current all converge without anyone
+  reasoning about order. Facts that come back are un-marked. Values with no
+  provenance are never touched, which is why the migration needs no backfill.
+- Semantic search over chunks is **deliberately unchanged** — it still sees
+  only current versions, so no answer can cite replaced content.
+- `Attribute.multivalue` arrived hardcoded `False` from the extractor while 48
+  entity+attribute pairs held several values. It is now observed from the
+  document: several distinct values for one entity means the attribute takes
+  more than one, counted across the whole document and per entity.
+- Both value queries gained an `ORDER BY` (newest first). Neither had one, so
+  several current values came back in scan order and read as a list of
+  equally-weighted facts.
+- Migration `d5a91c3f7b28`.
+
+### Fixed — a reaped job waited ten minutes for nothing
+
+- The retry work gave every transient failure a backoff, and a job abandoned
+  by a dead worker counts as transient — so an ordinary deploy silently cost
+  every in-flight document ten idle minutes before it resumed. A backoff
+  answers "the condition that caused this needs time to clear"; a worker that
+  died has already cleared, because the process reaping the row is its
+  replacement. `retry.IMMEDIATE_KINDS` names the kinds that requeue with no
+  delay. The attempt cap still applies to them, which is what actually
+  protects against a document that kills every worker that touches it.
+- Found by the new worker-loop tests, not in production: the two halves were
+  individually correct and only their composition was wrong.
+
+### Added — worker loop tests
+
+- `tests/ingestion/test_worker_loop.py` covers `poll_once` and `run_worker`,
+  which had no tests at all despite being where a claimed job, a handler and
+  the retry policy meet. Dispatch by `job_type`, one job per tick, the crash
+  path that stops a job stranding in RUNNING, all four statuses the retry work
+  made possible, startup reaping, the poll-interval sleep, and the
+  one-job-per-source guard — which had never been tested despite being what
+  makes `FOR UPDATE SKIP LOCKED` safe for more than one worker.
+
+### Added — ingestion retry and dead-letter
+
+- **Every ingestion failure used to be terminal.** `complete_job` wrote
+  `FAILED` and that was the end of the document, whatever the reason — worst
+  for the most common failure of all, provider throttling, where waiting ten
+  minutes is the entire fix. A transient failure now goes back on the queue
+  with an exponential backoff (10 minutes, capped at 60), up to four
+  attempts.
+- **`DEAD_LETTER`**, a terminal state distinct from `FAILED`. `FAILED` means
+  "this cannot work as it stands"; `DEAD_LETTER` means "this kept failing for
+  a reason that usually passes, and we stopped trying". Both need a human,
+  but they need different things from one.
+- **`failure_kind`**, a real column beside `error_details`, backfilled from
+  the 49 failures already in the database. The retry policy dispatches on it;
+  grouping failures no longer means splitting an error sentence on its first
+  colon.
+- Rate limiting got its own `Err` code, split from `eav_extraction_failed`
+  where the exception is still in hand, using the same `is_rate_limited`
+  predicate the extraction agent's own backoff uses.
+- The policy (`ingestion/queue/retry.py`) is a pure function of failure kind
+  and attempt count — no I/O, no clock beyond `now` — so it is unit-testable
+  without a database or a provider. Only five failure kinds are transient;
+  anything unclassified is terminal, so a new failure kind cannot quietly
+  consume a retry budget.
+- The stale-job reaper now counts its requeue as an attempt, so a document
+  that kills the worker every time dead-letters instead of being requeued
+  forever.
+- `GET /admin/jobs` serves `failure_kind`, `attempt_count` and
+  `next_attempt_at`; the Jobs page gained an **Attempts** column that marks a
+  pending retry, because status alone cannot say whether a `QUEUED` row is
+  fresh work or a job waiting out its backoff.
+- Migration `c4f8b2e17a90`.
+
 ### Fixed — ingestion extraction
 
 - **A deterministic model rejection was retried five times.**
