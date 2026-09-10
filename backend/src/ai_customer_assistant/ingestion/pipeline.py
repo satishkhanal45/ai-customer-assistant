@@ -36,7 +36,11 @@ import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ingestion.chunk_embed.types import ExtractedDocument as ChunkerDocument
-from ingestion.extraction.agent import ExtractionAgent, extract_document
+from ingestion.extraction.agent import (
+    ExtractionAgent,
+    extract_document,
+    is_rate_limited,
+)
 from ingestion.pipeline_types import (
     ChunkExtraction,
     ExtractedDocument,
@@ -196,6 +200,14 @@ def _stage_eav_extraction(deps: PipelineDeps) -> Callable[[IngestionContext], Aw
                 f"for {len(ctx.chunks)} chunk(s)",
             )
         except Exception as exc:  # noqa: BLE001
+            # Throttling and refusal arrive through the same `except` and
+            # mean opposite things to the queue: the first passes on its own
+            # once quota returns, the second will fail identically forever.
+            # Splitting them here -- where the exception is still in hand --
+            # is what lets the retry policy dispatch on a code instead of
+            # re-parsing an error sentence two layers away.
+            if is_rate_limited(exc):
+                return Err("eav_extraction_rate_limited", str(exc))
             return Err("eav_extraction_failed", str(exc))
         return Ok(replace(ctx, chunk_extractions=extractions))
 
@@ -222,6 +234,29 @@ def _stage_cutover(deps: PipelineDeps) -> Callable[[IngestionContext], Awaitable
             new_version_id=ctx.version.version_id,
             old_version_id=ctx.source.current_version_id,
         )
+        # Only now is `current_version_id` the version we just ingested, and
+        # "current" is what decides which facts are still asserted. Running
+        # this before the cutover would mark the incoming version's own facts
+        # superseded, since it is not yet the current one.
+        #
+        # Deliberately not fatal. The facts are written and the document is
+        # indexed; a currency pass that fails leaves stale values readable,
+        # which is worse than nothing but far better than failing a job whose
+        # real work succeeded -- and the pass is derived from scratch each
+        # time, so the next ingestion of any document repairs it.
+        try:
+            from ingestion.persistence import resolve_superseded_values
+
+            await resolve_superseded_values(deps.session)
+            await deps.session.commit()
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "fact currency pass failed after cutover of version %s; "
+                "superseded values may still read as current until the next "
+                "ingestion",
+                ctx.version.version_id,
+                exc_info=True,
+            )
         return Ok(ctx)
 
     return stage
@@ -306,6 +341,7 @@ async def run_ingestion(session: AsyncSession, job: JobRef, deps: PipelineDeps |
                 version_id=version.version_id,
                 status=JobStatus.FAILED,
                 error_details=f"{reason}: {detail}",
+                failure_kind=reason,
             )
 
 
@@ -391,16 +427,31 @@ def build_pipeline_resources() -> PipelineResources:
     async def fetch_raw_bytes(storage_uri: str) -> bytes:
         return await asyncio.to_thread(storage_client.get_object, storage_uri)
 
+    # One embedding model is shared by every lane of the worker, and a
+    # `SentenceTransformer` is not safe to encode from several threads at
+    # once -- which is exactly what concurrent lanes would do, since this runs
+    # under `to_thread`. The alternative, a model per lane, costs 400 MB each
+    # and is the thing hoisting the model to process scope was meant to avoid.
+    #
+    # Serialising encode is cheap here: a document's wall clock is dominated
+    # by the extraction calls, and embedding is a small fraction of it. The
+    # lock covers `to_thread` rather than living inside `process_document`
+    # because the tokenizer is shared too.
+    embed_lock = asyncio.Lock()
+
     async def chunk_and_embed(document: ChunkerDocument) -> tuple:
-        return await asyncio.to_thread(
-            process_document,
-            document,
-            settings=chunk_settings,
-            tokenizer=tokenizer,
-            embedding_model=embedding_model,
-            long_form_source_types=frozenset({t.value for t in FileType} | {"external_integration"}),
-            structured_source_types=frozenset(),
-        )
+        async with embed_lock:
+            return await asyncio.to_thread(
+                process_document,
+                document,
+                settings=chunk_settings,
+                tokenizer=tokenizer,
+                embedding_model=embedding_model,
+                long_form_source_types=frozenset(
+                    {t.value for t in FileType} | {"external_integration"}
+                ),
+                structured_source_types=frozenset(),
+            )
 
     return PipelineResources(
         http_client=httpx.Client(),

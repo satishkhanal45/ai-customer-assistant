@@ -96,9 +96,51 @@ class Value(Base):
     value: Mapped[str] = mapped_column(Text, nullable=False)
     searchable: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
     created_at: Mapped[datetime] = mapped_column(nullable=False, server_default=func.now())
+    # When this fact stopped being asserted by any current document.
+    #
+    # NULL means current. A superseded row is kept rather than deleted: the
+    # rate that used to apply is a real historical fact, and deleting it makes
+    # "what was the previous rate?" permanently unanswerable. Retrieval
+    # filters on this, so a superseded value cannot be presented as current --
+    # which was the actual danger, since two contradictory prices returned as
+    # equally true is a *wrong* answer delivered confidently, where a missing
+    # one is at least visibly missing.
+    superseded_at: Mapped[datetime | None] = mapped_column(nullable=True, index=True)
 
     entity: Mapped["Entity"] = relationship(back_populates="values")
     attribute: Mapped["Attribute"] = relationship(back_populates="values")
+
+
+class ValueProvenance(Base):
+    """Which document version asserted which fact.
+
+    A `value` row is global -- unique on (entity, attribute, value) -- because
+    the same fact is often stated by several documents, and storing it once is
+    what makes "Alpinist Studios employs Justin Flores" appear once rather
+    than five times. That dedup is worth keeping, but it left no way to answer
+    "who still says this?", and without that, supersession is not expressible:
+    a fact dropped by one document may still be asserted by another.
+
+    So provenance is a link table rather than a column. A value is current
+    when at least one version that asserts it is its source's
+    `current_version_id`, and superseded when none of them are.
+    """
+
+    __tablename__ = "value_provenance"
+
+    value_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("value.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("knowledge_source_version.version_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        nullable=False, server_default=func.now()
+    )
 
 
 class Relation(Base):
@@ -320,7 +362,10 @@ RelationshipTypeEnum = SAEnum(
     name="knowledge_relationship_type",
 )
 JobTypeEnum = SAEnum("INITIAL_INGEST", "REINDEX", "UPDATE", "DELETE", name="knowledge_job_type")
-JobStatusEnum = SAEnum("QUEUED", "RUNNING", "SUCCEEDED", "FAILED", name="knowledge_job_status")
+JobStatusEnum = SAEnum(
+    "QUEUED", "RUNNING", "SUCCEEDED", "FAILED", "DEAD_LETTER",
+    name="knowledge_job_status",
+)
 
 
 class KnowledgeSource(Base):
@@ -500,6 +545,22 @@ class KnowledgeInjectionJob(Base):
     started_at: Mapped[datetime | None] = mapped_column(nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(nullable=True)
     error_details: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The failing stage as a bare code ("eav_extraction_rate_limited"), beside
+    # the human-readable `error_details`. Grouping failures used to mean
+    # `split_part(error_details, ':', 1)` in every caller.
+    failure_kind: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Retry bookkeeping. `attempt_count` is how many times this job has been
+    # tried; `next_attempt_at` holds a requeued job back until its backoff
+    # has elapsed, and is NULL for a job that is ready now.
+    #
+    # Both carry a Python-side default alongside the server default: a bare
+    # `server_default="0"` is the *string* "0" on SQLite, which is truthy and
+    # is not an int -- the same portability trap `LlmCredential.is_default`
+    # hit with "false".
+    attempt_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0", default=0
+    )
+    next_attempt_at: Mapped[datetime | None] = mapped_column(nullable=True)
     triggered_by: Mapped[str] = mapped_column(Text, nullable=False)
     chunks_created_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     entities_created_count: Mapped[int | None] = mapped_column(Integer, nullable=True)

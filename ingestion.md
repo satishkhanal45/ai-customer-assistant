@@ -351,45 +351,111 @@ longer run.
 ### P1 — reliability and correctness over time
 
 **5. Decide what happens to superseded content — and make the two halves
-agree.** *(Raised by the question "if the rate changed, can the assistant
-still tell me what it used to be?")*
+agree.** ✅ **Done 2026-09-10.** *(Raised by the question "if the rate changed,
+can the assistant still tell me what it used to be?")*
 
-Today the two retrieval paths answer that question in opposite, and both
-wrong, ways:
+The two retrieval paths answered that question in opposite, and both wrong,
+ways:
 
-* **Chunks keep history and hide it.** `cutover` marks the old version
-  `STALE` and deletes nothing, so every superseded chunk is still in the
-  database. But `vector_search.py` filters
+* **Chunks kept history and hid it.** `cutover` marks the old version `STALE`
+  and deletes nothing, but `vector_search.py` filters
   `WHERE knowledge_source_version.version_id = knowledge_source.current_version_id`,
-  so semantic search can never reach them. *"What was the previous rate?"* is
-  unanswerable, and the data needed to answer it is sitting right there.
-* **Facts keep history and cannot distinguish it.** `value` rows are written
-  with `ON CONFLICT DO NOTHING` on `(entity_id, attribute_id, value)`. When a
-  price changes from $500 to $800, **both rows survive**, under the same
-  entity and attribute, with no timestamp and no version link. Structured
-  lookup returns both, and nothing marks which is current.
+  so semantic search can never reach a superseded passage.
+* **Facts kept history and could not distinguish it.** `value` rows are
+  written with `ON CONFLICT DO NOTHING` on `(entity_id, attribute_id, value)`.
+  When a price changes from $500 to $800, **both rows survive**, under the
+  same entity and attribute, with no timestamp and no version link. Structured
+  lookup returned both, and nothing marked which was current.
 
-The second is the more serious of the two: a missing answer is visibly
-missing, whereas two contradictory prices presented as equally true is a
-*wrong* answer delivered confidently.
+The second is the more serious: a missing answer is visibly missing, whereas
+two contradictory prices presented as equally true is a *wrong* answer
+delivered confidently.
 
-Not yet visible in this deployment — all 125 chunks currently belong to
-current versions, because nothing has been re-ingested with changed content
-yet. It becomes real the first time a document is updated.
+**The decision taken: keep history and mark it.** The rate that used to apply
+is a real fact, and deleting it makes the original question permanently
+unanswerable. Retrieval filters to current values, so the contradiction stops;
+the history accumulates for a temporal feature that can be built later without
+a migration. **The chunk half is deliberately unchanged** — semantic search
+still sees only current versions, so no answer can cite content that has been
+replaced.
 
-Two coherent positions, and the work differs:
+### What the live data actually showed
 
-* **History matters.** Chunks carry their version into retrieval, temporal
-  questions are allowed to reach `STALE` versions, and every answer says
-  which version a fact came from. `value` gains a version reference so
-  "current" is derivable. This is a feature, not a fix.
-* **Only current truth matters.** Re-ingest supersedes old values rather
-  than accumulating them, and superseded chunks are pruned on a retention
-  schedule.
+Worth recording, because it is not what this item predicted. There were **48
+entity+attribute pairs holding several values** — but `STALE` versions
+numbered **zero**, so none of them were superseded content. They were three
+different things wearing the same shape:
 
-Either is defensible. The present state — half of one and half of the other
-— is not. **This needs a product decision before it needs code**, which is
-why it is listed first in this tier but last in the suggested order of work.
+| Pair | Values | What it is |
+|---|---|---|
+| `Alpinist Studios / client_industries` | E-commerce, Fintech, Health Tech, Enterprise | genuinely multi-valued — all true at once |
+| `MVP / definition` | five paraphrases of one sentence | extraction noise |
+| *a changed price* | — | zero instances |
+
+And `Attribute.multivalue` — the column that exists precisely to tell the
+first row from the third — was **hardcoded `False`** in
+`extraction/agent.py`, so every attribute in the database claimed to be
+single-valued while dozens were not.
+
+### The design
+
+**Provenance is a link table, not a column.** A `value` row is global — unique
+on (entity, attribute, value) — because the same fact is often stated by
+several documents, and storing it once is what keeps "Alpinist Studios employs
+Justin Flores" from appearing five times. A single `version_id` column could
+not express that, and without it supersession is not *decidable*: a fact
+dropped by one document may still be asserted by another.
+
+**Currency is derived, not accumulated.** `resolve_superseded_values` recomputes
+the whole state from provenance on every run: a value is current when at least
+one version asserting it is its source's `current_version_id`, superseded when
+none are. Nothing is incremental, so a re-ingest, a rollback, or a document
+that stops being current all converge on the same answer without anyone
+reasoning about the order they happened in.
+
+Four decisions that each prevent a bug:
+
+* **Facts that come back are un-marked.** A value removed in v2 and restated
+  in v3 is current again; a one-way mark would leave it permanently invisible.
+* **The pass runs after cutover, not before** — `current_version_id` is what
+  "current" means, and the cutover is what sets it. Running it first would
+  mark the incoming version's own facts as superseded.
+* **A failed currency pass does not fail the job.** The facts are written and
+  the document is indexed; the pass is derived from scratch each time, so the
+  next ingestion of any document repairs it.
+* **Values with no provenance are never touched.** Every row predating this
+  change is in that state, which is why the migration needs no backfill —
+  which version asserted an existing fact is not recoverable, so they stay
+  current, exactly as they were.
+
+**`multivalue` is now observed rather than asked for.** If a document states
+four `client_industries` for one entity, the attribute takes more than one
+value — a fact about the data, not a judgement call. Counted across the whole
+document (a document's four industries are usually spread over four chunks, so
+per-chunk counting would see one each) and per entity (fifteen people with one
+role each does not make `role` multi-valued — verified live: 15 people, 15
+roles, still `multivalue=false`). Distinct values only, so the same fact
+restated in two chunks is one value.
+
+Retrieval also gained an **ORDER BY**. Neither value query had one, so several
+current values came back in scan order and the caller read them as a list of
+equally-weighted facts; newest-first is at least defensible, and arbitrary is
+not.
+
+**What this does not fix:** the paraphrase noise above (`MVP / definition` ×5)
+is an extraction-quality problem, not a currency one — five near-identical
+sentences are five distinct `value` rows because the unique constraint is on
+exact text, and no amount of supersession logic will merge them.
+
+**Verified on live Postgres**, not only SQLite — the correlated `EXISTS`
+subqueries are what SQLite cannot prove. A throwaway source with two versions:
+with v1 current, `$500` stood and `$800` was superseded; cutting over to v2
+swapped them (1 superseded, 1 restored); a re-run changed nothing `(0, 0)`;
+rolling back to v1 swapped them again. Then a real document was re-ingested —
+15 provenance rows recorded, **0 values wrongly superseded**, corpus unchanged
+at 777 values across 24 indexed sources. Migration `d5a91c3f7b28`; 14 tests in
+`tests/ingestion/test_fact_supersession.py` and 3 in
+`test_structured_lookup.py`. Suite 897 → **911 passing**.
 
 **6. Bound the extraction stage with a timeout, and retry transient
 failures with backoff.**
@@ -404,6 +470,8 @@ single hung call stops every remaining document (§4.4).
 `knowledge_injection_job` and retry `tika_transient` and 429 with
 exponential backoff up to a small limit (3–4). The `Result` type already
 distinguishes transient from terminal; the queue just needs to honour it.
+
+**The retry half shipped 2026-09-10**, with item 7 — see below.
 
 **Measured 2026-09-09**, re-running the 15 failed documents against a fresh
 Groq key: rate-limit *failures* went to **zero** — the Groq SDK's own backoff
@@ -435,10 +503,77 @@ that cannot finish inside any sane wall clock. **The timeout converted an
 invisible hang into a visible, correctly-labelled failure; item 8 is what
 would actually ingest them.**
 
-**7. Cap attempts and dead-letter the rest.**
-A job that has exhausted its retries should reach a terminal state that is
-visibly different from "failed once" — otherwise the Admin › Jobs page
-cannot distinguish "will fix itself" from "needs a human".
+**7. Cap attempts and dead-letter the rest.** ✅ **Done 2026-09-10**, together
+with the retry half of item 6 and item 13.
+
+Every ingestion failure used to be terminal: `complete_job` wrote `FAILED` and
+that was the end of the document, whatever the reason. That was worst for
+exactly the most common failure — provider throttling — where waiting ten
+minutes is the entire fix. With the deterministic failures gone (items 8 and
+8b), *everything still failing in this database was transient*: the last two
+documents died on a daily token ceiling that a retry an hour later simply
+walks past.
+
+**The policy is a pure function.** `ingestion/queue/retry.py` decides on
+`(failure_kind, attempt_count)` and nothing else — no I/O, no clock beyond
+`now` — so "does this failure deserve another go?" is answerable in a unit
+test without a database or a provider. The queue layer owns the write; the
+policy owns the decision.
+
+Three outcomes, and the third is the point of this item:
+
+| Outcome | When | What it tells a human |
+|---|---|---|
+| `QUEUED` + `next_attempt_at` | transient, budget left | nothing — it will fix itself |
+| `DEAD_LETTER` | transient, budget spent | it kept failing for a reason that usually passes |
+| `FAILED` | terminal | it cannot work as it stands |
+
+`FAILED` and `DEAD_LETTER` both need a human but need *different things* from
+one, which is why collapsing them was the gap.
+
+**Decisions worth recording.**
+
+* **Terminal by default.** Only five kinds are transient
+  (`tika_transient`, `eav_extraction_rate_limited`, `eav_extraction_timeout`,
+  `storage_fetch_failed`, `worker_abandoned`). A failure kind nobody has
+  classified yet stops after one attempt and stays visible, rather than
+  quietly spending a full retry budget on every job that hits it.
+* **429 got its own `Err` code.** Throttling and refusal used to arrive at
+  the queue as the same `eav_extraction_failed`, distinguishable only by
+  re-parsing the message two layers away. `_stage_eav_extraction` now splits
+  them where the exception is still in hand, using the same
+  `is_rate_limited` predicate the extraction agent's own backoff uses — one
+  definition, two callers, no drift.
+* **Backoff starts at 10 minutes, caps at 60.** Chosen against what is being
+  waited for: a per-minute token bucket refills many times over in ten
+  minutes, and the cap keeps the last attempt inside the same working day, so
+  a document that fails in the morning is not first retried after midnight.
+* **Four attempts.** Every retry re-runs the *whole* pipeline — fetch, Tika,
+  chunk, embed, extract — so an attempt is expensive, and against a daily
+  quota a job retrying forever spends the budget that the jobs which would
+  succeed need.
+* **A worker death consumes an attempt.** The stale-job reaper now counts its
+  requeue. Without that, a document that kills the worker every time — an OOM
+  on a huge PDF — is requeued forever, and because the reaper runs at startup
+  it gets a fresh worker to kill each time. Now it dead-letters like any other
+  repeat offender.
+* **A requeued job clears `completed_at`.** A pending retry has not completed,
+  and a stale timestamp would sort it in among the finished work on the Jobs
+  page.
+* **The claim query honours the backoff.** Without
+  `next_attempt_at IS NULL OR next_attempt_at <= now()`, "retry in ten
+  minutes" would mean "retry on the next poll" — a busy-wait against the very
+  thing that was throttling us. `NULL` means ready now, which is why the rows
+  already in the database needed no backfill.
+
+**Verified against live Postgres**, not only SQLite — the enum value and the
+claim SQL are the parts SQLite cannot prove. A temporary job row was held back
+by its backoff (not claimed), became claimable once it elapsed, was requeued
+on a simulated 429 with `completed_at` left null, reached `DEAD_LETTER` when
+its budget ran out, and a `checksum_mismatch` on a fresh row went straight to
+`FAILED` after one attempt. The row was removed afterwards.
+
+22 tests in `tests/ingestion/test_job_retry.py`; suite 853 → **875 passing**.
 
 **8. Reduce the LLM calls per document.** ✅ **Done 2026-09-09.**
 
@@ -606,31 +741,148 @@ it lives in `PipelineResources` now, created once and closed by
 `reset_pipeline_resources()` in the worker's `finally`. Previously one was
 created per job and never closed: a file descriptor leaked per document.
 
-**12. Consider concurrent jobs.**
-The worker is strictly serial: claim one, finish, claim the next. The
-`FOR UPDATE SKIP LOCKED` claim is already safe for multiple workers, and the
-one-job-per-source guard already prevents two workers colliding on one
-document. The blocker is memory — each worker process loads its own copy of
-the embedding model — which is exactly why fix 9 comes first.
+**12. Consider concurrent jobs.** ✅ **Done 2026-09-10.**
 
-*Items 10 and 11 done. Item 12 remains; note that it needs more than this
-cache — a `SentenceTransformer` is not safe to encode from several threads at
-once, so concurrent jobs need a lock or a model per worker.*
+The worker was strictly serial: claim one, finish, claim the next. It now runs
+`PGQUEUE_CONCURRENCY` lanes (default **2**) — several claim-process-record
+loops in **one process**, not several processes. That distinction is what made
+this affordable: a second process loads its own 400 MB copy of the embedding
+model, which was the stated blocker, and lanes share one copy.
+
+**What it buys, stated honestly.** Extraction dominates a document's wall
+clock and is bound by a provider token budget, not by this worker — so two
+lanes do not double throughput against a daily ceiling. What they do is stop
+one slow document holding the queue head: while a lane waits on the model,
+another fetches, runs Tika and embeds. A document that fails early no longer
+makes everything behind it wait. Two rather than more, because past that the
+extra lanes mostly generate 429s, and spending quota on backoff is not
+throughput.
+
+**Two hazards, both real, both closed.**
+
+*The shared embedding model.* This item already warned that a
+`SentenceTransformer` is not safe to encode from several threads at once, and
+`chunk_and_embed` runs `process_document` under `to_thread` with a shared
+tokenizer and model — so lanes would have done exactly that. An
+`asyncio.Lock` around the call serialises encoding, which costs almost nothing
+because embedding is a small fraction of a document's time.
+
+*A race the doc did not anticipate.* This item states that `FOR UPDATE SKIP
+LOCKED` and the one-job-per-source guard already make concurrent claiming
+safe. The first is true; **the second is not, and the two are not the same
+question.** `SKIP LOCKED` stops two lanes taking the same *row*. The guard
+asks "does this source already have a RUNNING job?" — and a lane's RUNNING
+transition is invisible to the others until it commits, so two lanes selecting
+at the same instant can each pick a *different* job for the *same* source and
+both proceed, which is precisely what the guard exists to prevent. Claims are
+now serialised with a lock held only for the claim; it is fast, so this costs
+nothing measurable. The lock lives on `WorkerDeps` rather than at module
+scope, because an `asyncio.Lock` binds to the loop that first acquires it and
+a process-global one outlives the loop it was bound to.
+
+That window remains, pre-existing, between two worker *processes*.
+`PGQueueSettings.visibility_lock_id_namespace` is the hook for closing it with
+a Postgres advisory lock if a deployment ever runs more than one.
+
+**Verified live.** Two documents claimed 187 ms apart and extracting
+simultaneously:
+
+```
+04:18:12.466 [1c66bbf2.1] claimed job ... attempt 1
+04:18:12.653 [3754e16c.1] claimed job ... attempt 1
+04:18:15.426 [1c66bbf2.1] Extracting Contact: 1 chunk(s), 1 window(s)...
+04:18:15.740 [3754e16c.1] Extracting Contact: 1 chunk(s), 1 window(s)...
+```
+
+Three jobs, all `SUCCEEDED`, corpus unchanged. Note that both documents are
+named `Contact` — without item 14's trace ids those four lines would be
+unreadable, which is why that item went first. 5 tests in
+`tests/ingestion/test_worker_loop.py`.
+
+*Items 10 and 11 done 2026-09-09; item 12 done 2026-09-10.*
 
 ### P3 — observability and hygiene
 
-**13. Structure the failure reason.** A `failure_kind` column beside
-`error_details` makes the Admin › Jobs page groupable and makes "what is
-failing and why" a query rather than a `split_part`.
+**13. Structure the failure reason.** ✅ **Done 2026-09-10**, with items 6 and
+7 — the retry policy has to dispatch on the failure kind, and doing that by
+splitting `error_details` on its first colon is exactly the fragility this
+item was about. `failure_kind` is a real column now, backfilled from the
+existing `error_details` so the 49 failures already in the database became
+groupable immediately rather than only newly-failing ones. `attempt_count`,
+`next_attempt_at` and `failure_kind` are all served by `GET /admin/jobs` and
+shown on the Jobs page, which gained an **Attempts** column that marks a
+pending retry — status alone cannot say whether a `QUEUED` row is fresh work
+or a job waiting out its backoff.
 
-**14. Emit the `trace_id`.** It is threaded through the chat path and absent
-from ingestion; a job cannot currently be correlated with its logs.
+**14. Emit the `trace_id`.** ✅ **Done 2026-09-10.**
 
-**15. Test the pipeline core.** `persistence.py` has no dedicated test, and
-neither does the worker loop. `test_partial_commit_rollback.py` and
-`test_stale_job_reaper.py` cover adjacent behaviour. The bug in §4.1 lives
-in exactly the gap between them — a test that ingests the same version twice
-would have caught it immediately.
+Every log line now carries the run that produced it:
+
+```
+2026-09-10 04:18:15,426 INFO [1c66bbf2.1] Extracting Contact: 1 chunk(s)...
+2026-09-10 04:18:02,192 INFO [-] ingestion worker starting: 2 lane(s)...
+```
+
+**The id names the *run*, not the job.** `job_id` alone stopped being enough
+the moment item 6 shipped: a job can be retried four times, so one id would
+label four separate runs. `<job8>.<attempt>` separates them while keeping the
+job's prefix, so one grep still finds every attempt of a document.
+
+**A ContextVar, not a parameter.** The lines that need labelling are emitted
+deep inside modules with no reason to know about jobs — the extraction agent
+warning about a dropped window, `persistence` about a missing chunk. Threading
+an id through all of them would be a far worse trade than reading it from the
+ambient context. ContextVars are copied per asyncio task *and* propagated by
+`asyncio.to_thread`, so a line logged from the extraction thread carries the
+id of the coroutine that started it — which matters, because extraction is the
+part that runs in a thread.
+
+The filter is attached to the **handler**, not a logger: a filter on a logger
+is not applied to records that reach the root handler by propagation, and
+propagation is how nearly every line in this codebase is emitted. It must also
+be installed before the first line is logged, because a format naming
+`trace_id` raises inside `logging` on a record that lacks the attribute — an
+unlabelled record gets `-` rather than an exception.
+
+This became a prerequisite rather than a nicety once item 12 landed: two
+concurrent lanes interleave into one stream, and the live run below happened
+to process two different documents both named `Contact`. Without the id those
+lines are indistinguishable. 5 tests in `test_worker_loop.py`.
+
+**15. Test the pipeline core.** ✅ **Done 2026-09-10.** `persistence.py` got
+its tests with the P0 work (`test_chunk_persistence.py`); the worker loop was
+the half still missing. `poll_once` is where a claimed job, a handler and the
+retry policy meet, and the adjacent files covered everything around it —
+the reaper, the pipeline's rollback — but not the thing that calls them.
+
+22 tests in `tests/ingestion/test_worker_loop.py`, backed by real SQLite rows
+and fake handlers so the claim query and the status writes are exercised while
+Tika, MinIO and the provider stay out of it. What they pin: dispatch by
+`job_type` (a table lookup, so a `DELETE` job can never run the ingestion
+pipeline), one job per tick, the crash path, the four statuses the retry work
+made possible, startup reaping, the poll-interval sleep, and the
+one-job-per-source guard — which had no test at all despite being what makes
+`FOR UPDATE SKIP LOCKED` safe to point at more than one worker.
+
+**It immediately found a defect in item 7, one day old.** The retry work gave
+every transient failure a ten-minute backoff, and `worker_abandoned` is
+transient — so an ordinary deploy silently cost *every in-flight document* ten
+idle minutes before it resumed. The reaper runs at worker startup, and a
+stale-but-reaped job was no longer claimable on the tick that reaped it.
+
+The fix is a distinction the policy was missing. A backoff answers *"the
+condition that caused this needs time to clear"* — a token bucket refilling, a
+Tika coming back up. A worker that died has already cleared by definition: the
+process doing the reaping is its replacement. `retry.IMMEDIATE_KINDS` now
+names the kinds that go back on the queue with no delay. The attempt cap still
+applies to them, which is what actually protects against a document that kills
+every worker that touches it — the backoff never did.
+
+That is the argument for this item in one example: the behaviour was wrong in
+a way no unit test of `retry.decide` would have shown, because both halves
+were individually correct and only their composition was not.
+
+Suite 875 → **897 passing**.
 
 **16. Resolve `reconcile.py`.** Give it an entry point and a test, or delete
 it. 366 lines that nothing calls will rot.
@@ -670,26 +922,26 @@ idempotency, retry policy, and dependency lifetime — not in its structure.
 11 shipped. The ordering below is what is left, and the evidence for it is
 the live database rather than the original triage.*
 
-1. **P1 6 (retry half) + 7** — `attempt_count` / `next_attempt_at` on
-   `knowledge_injection_job`, exponential backoff for transient classes only,
-   and a terminal dead-letter state once attempts are exhausted. This is now
-   the top item rather than the second, because item 8b removed the
-   deterministic failures and **everything still failing is transient** — the
-   remaining blocker on the last two documents is a daily token ceiling that
-   a retry an hour later simply walks past. One migration, one worker change.
-2. **P3 13** (`failure_kind`) alongside it: the same table, the same
-   migration window, and it is what makes Admin › Jobs able to tell "will fix
-   itself" from "needs a human" — which is the whole point of item 7.
-3. **P3 15** (test the worker loop). `persistence.py` got its tests with the
-   P0 work; the worker loop is the one real coverage gap left, and item 1
-   above is about to change it.
-4. **P1 5** (superseded content) whenever the product question behind it is
-   settled — it is the only item here that needs a decision before it needs
-   code, and it becomes urgent the first time a document is updated with
-   changed content.
-5. **P2 12** (concurrent jobs) and **P3 14** (`trace_id`) as they become
-   convenient. Item 12 still needs more than the resource cache: a
-   `SentenceTransformer` is not safe to encode from several threads at once.
+*Items 5, 6, 7, 12, 13, 14 and 15 shipped 2026-09-10.*
+
+**Every item in this document is now closed.** 16 (`reconcile.py`) was
+already effectively resolved — it has a `__main__` entry point and
+`tests/ingestion/test_reconcile.py` — and 17 (stale docstrings) was cleaned up
+with item 10.
+
+What is left is not on this list, because it was found while working through
+it:
+
+1. **Extraction produces paraphrase duplicates.** `MVP / definition` holds five
+   near-identical sentences, and `Agile / flexibility` holds "high", "True"
+   and "offers flexibility" twice. They are distinct `value` rows because the
+   unique constraint is on exact text. This is an extraction-quality problem —
+   supersession will not merge them, and item 5 deliberately did not try.
+2. **The crawler ingests error pages.** One of the two `Contact` sources in
+   this corpus is a 404 page whose text begins "# Oops!". It was chunked,
+   embedded and indexed like any other document, and is now retrievable.
+3. **A worker advisory lock**, if a deployment ever runs more than one worker
+   process — see item 12.
 
 A reasonable check that it worked: re-ingest the 24 existing sources and
 expect a failure rate in the low single digits, with any remaining failures

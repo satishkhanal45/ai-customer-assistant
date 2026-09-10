@@ -217,3 +217,108 @@ async def test_membership_lookup_excludes_non_person_targets(session):
     # Only the person-targeted relation survives; the partner relation is dropped.
     assert relations == {"employs"}
     assert all(fact.value == "Justin Flores" for fact in facts)
+
+
+# ---------------------------------------------------------------------------
+# Superseded facts must not be answered as current (ingestion.md P1 item 5).
+#
+# `value` rows are unique on (entity, attribute, value), so when a rate changes
+# from $500 to $800 both rows survive under the same entity and attribute.
+# Retrieval used to return both, in scan order, as equally-weighted facts —
+# two contradictory prices delivered confidently, which is worse than no answer.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+async def priced(session):
+    """One service with a rate that has changed once."""
+    now = datetime.now(timezone.utc)
+    service, rate = _uid(), _uid()
+
+    await session.execute(
+        entity_table.insert(),
+        [{"id": service, "label": service, "entity_type": "Service",
+          "name": "Website Build", "created_at": now}],
+    )
+    await session.execute(
+        attribute_table.insert(),
+        [{"id": rate, "namespace": "general", "name": "rate",
+          "value_type": "string", "multivalue": False}],
+    )
+    await session.execute(
+        value_table.insert(),
+        [
+            {"id": _uid(), "entity_id": service, "attribute_id": rate,
+             "value": "$500", "searchable": True,
+             "created_at": now.replace(year=now.year - 1),
+             "superseded_at": now},
+            {"id": _uid(), "entity_id": service, "attribute_id": rate,
+             "value": "$800", "searchable": True, "created_at": now,
+             "superseded_at": None},
+        ],
+    )
+    await session.commit()
+    return session
+
+
+async def test_a_superseded_value_is_not_returned(priced):
+    facts = await structured_lookup(
+        StructuredQuery(entity_type="Service", entity_label="Website Build",
+                        attribute="rate"),
+        session=priced,
+    )
+
+    values = [f.value for f in facts]
+    assert values == ["$800"]
+    assert "$500" not in values
+
+
+async def test_a_general_lookup_also_excludes_superseded_values(priced):
+    """The attribute path is not the only way in; a general lookup over an
+    entity must not reintroduce what the specific one filtered out."""
+    facts = await structured_lookup(
+        StructuredQuery(entity_type="Service", entity_label="Website Build"),
+        session=priced,
+    )
+
+    assert "$500" not in [f.value for f in facts]
+
+
+async def test_current_values_come_back_newest_first(session):
+    """Neither value query had an ORDER BY, so several current values came
+    back in whatever order the scan produced. Among equally-current facts the
+    most recently learned one is the better first answer, and an arbitrary
+    order is not a defensible alternative to any order."""
+    now = datetime.now(timezone.utc)
+    company, industries = _uid(), _uid()
+
+    await session.execute(
+        entity_table.insert(),
+        [{"id": company, "label": company, "entity_type": "Company",
+          "name": "Alpinist Studios", "created_at": now}],
+    )
+    await session.execute(
+        attribute_table.insert(),
+        [{"id": industries, "namespace": "general", "name": "client_industries",
+          "value_type": "string", "multivalue": True}],
+    )
+    await session.execute(
+        value_table.insert(),
+        [
+            {"id": _uid(), "entity_id": company, "attribute_id": industries,
+             "value": "Fintech", "searchable": True,
+             "created_at": now.replace(year=now.year - 2), "superseded_at": None},
+            {"id": _uid(), "entity_id": company, "attribute_id": industries,
+             "value": "Health Tech", "searchable": True,
+             "created_at": now, "superseded_at": None},
+        ],
+    )
+    await session.commit()
+
+    facts = await structured_lookup(
+        StructuredQuery(entity_type="Company", entity_label="Alpinist Studios",
+                        attribute="client_industries"),
+        session=session,
+    )
+
+    # Genuinely multi-valued: both are current and both come back.
+    assert [f.value for f in facts] == ["Health Tech", "Fintech"]

@@ -23,7 +23,7 @@ This is a **multi-agent RAG customer-support assistant** for Alpinist Studios, b
 | Scalability | **Much improved.** All four P1 items are fixed: pgvector-native retrieval, LLM calls off the event loop, one shared connection pool, and ingestion moved out of the web process into a worker service. Two pieces of per-process state that quietly broke horizontal scaling now live in the database (P2-5). |
 | Repo hygiene | **Good.** The duplicated ontology is gone (P2-1); dead files, the committed AI-assistant note, the crawl artefact and the committed debug values are all gone, and the README is real (P2-6). Only the stale branches are left, deliberately untouched. |
 
-**Every P0 and P2 is fixed, and P1-1 through P1-6** — see the changelog. **P1-7 is open**: superseded document versions are retained but unreachable by semantic search, while superseded structured facts accumulate with no way to tell which is current. It needs a product decision (keep history, or supersede it) before it needs code, and it becomes visible the first time a document is re-ingested with changed content — see §6. P0-3, the last blocker, closed on 2026-09-08: the API is authenticated and authorised, CORS is an env-driven allowlist, requests are rate limited per user, and the crawler refuses to fetch anything that is not a publicly-routable host.
+**Every P0, P1 and P2 is fixed** — see the changelog. **P1-7 closed 2026-09-10**: superseded structured facts used to accumulate with no way to tell which was current, so two contradictory prices could be returned as equally true. Facts now carry provenance and a supersession mark, retrieval returns only current values, and the old value is kept rather than deleted so a temporal feature remains buildable. Semantic search over chunks deliberately still sees only current versions. P0-3, the last blocker, closed on 2026-09-08: the API is authenticated and authorised, CORS is an env-driven allowlist, requests are rate limited per user, and the crawler refuses to fetch anything that is not a publicly-routable host.
 
 What is left is *unbuilt features* rather than defects — the admin write API, prompt management, CI and lint configuration, and structured logging with metrics. Those are listed in §5 and §7.
 
@@ -72,6 +72,153 @@ The page's `source` column ("saved" vs "from environment") exists because a save
 Two defects found by measurement rather than reasoning. **(1) A read-after-write race:** `get_session` commits during dependency teardown, *after* the response reaches the client, so the page's immediate reload could miss its own write — observed as a save that appeared not to take. The mutating handlers now commit before returning. **(2) `server_default="false"` is a string literal**, which Postgres reads as the boolean but SQLite stores as the text `'false'` — and `'false'` is truthy, so a freshly inserted row came back claiming to be the default provider. Fixed with a Python-side `default=False` alongside it. Harmless on Postgres, wrong everywhere else; a test caught it.
 
 Migration `9a4f7c2b83d1`, with a partial unique index enforcing at most one default in the database rather than in whoever remembers to clear the old one. Suite 774 → **798 passing**.
+
+**2026-09-10 — Trace ids and concurrent lanes (P3-14, P2-12).** Two items
+that turned out to be one: concurrency makes the log unreadable, and trace ids
+are what make it readable again.
+
+Every ingestion log line now carries `[<job8>.<attempt>]`. The id names the
+*run* rather than the job, because a job can now be retried four times and
+`job_id` alone would label all four identically. It travels in a ContextVar
+rather than a parameter — the lines that need labelling come from modules with
+no reason to know about jobs, and ContextVars propagate through
+`asyncio.to_thread`, which is where extraction runs. The filter is attached to
+the handler rather than a logger, since propagation is how nearly every line
+here is emitted.
+
+The worker now runs `PGQUEUE_CONCURRENCY` lanes (default 2) in **one process**,
+sharing one copy of the embedding model. That is what made it affordable: a
+second process loads its own 400 MB copy, which was the stated blocker. What
+it buys is worth being honest about — extraction is bound by the provider's
+token budget, not by this worker, so lanes do not double throughput against a
+daily ceiling; they stop one slow document holding the queue head.
+
+Two hazards. The shared `SentenceTransformer` is not safe to encode from
+several threads at once and `chunk_and_embed` runs under `to_thread`, so
+encoding is now serialised with a lock — cheap, because embedding is a small
+fraction of a document's time. And a race the plan had assumed away: `FOR
+UPDATE SKIP LOCKED` stops two lanes taking the same *row*, but the
+one-job-per-source guard is a different question, and a lane's RUNNING
+transition is invisible to the others until it commits — so two lanes could
+each take a different job for the same source. Claims are now serialised for
+the duration of the claim.
+
+Verified live: two documents claimed 187 ms apart and extracting
+simultaneously, three jobs all `SUCCEEDED`, corpus unchanged. Both documents
+were named `Contact`, which is exactly why the trace ids had to come first.
+Suite 911 → **921 passing**. **Every item in `ingestion.md` is now closed.**
+
+**2026-09-10 — Superseded facts (P1-5), the last open ingestion item.** The
+question that raised it: *"if the rate to build a website changed, can the
+assistant still tell me what it used to be — and does it know which one is
+current?"* No on both counts. `value` rows are unique on (entity, attribute,
+value), so $500 and $800 both survived under the same entity and attribute
+with no version link, and structured lookup returned both. Two contradictory
+prices presented as equally true is a *wrong* answer delivered confidently,
+which is worse than a missing one.
+
+**Decision: keep history and mark it, rather than prune it.** The old rate is
+a real fact, and deleting it makes the original question permanently
+unanswerable. Retrieval filters to current values, so the contradiction stops;
+the history accumulates for a temporal feature that can be built later without
+another migration. The chunk half is deliberately unchanged — semantic search
+still sees only current versions, so no answer can cite replaced content.
+
+The live data was not what the item predicted. 48 entity+attribute pairs held
+several values, but there were **zero** `STALE` versions — so none were
+superseded content. They were genuinely multi-valued attributes (four client
+industries, all true), extraction noise (five paraphrases of one sentence),
+and no changed prices at all. `Attribute.multivalue`, the column that exists
+to tell the first from the third, was hardcoded `False`.
+
+Provenance is a link table rather than a column, because a `value` row is
+global — the same fact is often stated by several documents — and without that
+supersession is not decidable. Currency is *derived* from provenance on every
+run rather than accumulated, so a re-ingest, a rollback, or a document ceasing
+to be current all converge on the same answer without anyone reasoning about
+order. Facts that come back are un-marked; the pass runs after cutover, since
+`current_version_id` is what "current" means; a failed pass does not fail the
+job; and values with no provenance are never touched, which is why the
+migration needs no backfill.
+
+`multivalue` is now observed rather than asked for, counted across the whole
+document and per entity — verified live: 15 people with one role each, still
+`multivalue=false`. Both value queries also gained an `ORDER BY`; neither had
+one.
+
+Verified on live Postgres. A throwaway source with two versions: `$500` stood
+under v1 and `$800` was superseded; cutting over to v2 swapped them; a re-run
+changed nothing; rolling back to v1 swapped them again. Then a real document
+was re-ingested — 15 provenance rows, 0 values wrongly superseded, corpus
+unchanged at 777 values across 24 indexed sources. Migration `d5a91c3f7b28`.
+Suite 897 → **911 passing**. **Every P0 and P1 item in `ingestion.md` is now
+closed.**
+
+**2026-09-10 — The worker loop gets tests, and they find a day-old bug.**
+`poll_once` is the seam where a claimed job, a handler and the retry policy
+meet, and it had no test at all. The files around it covered the reaper and
+the pipeline's rollback but not the thing that calls them — and after the
+retry work `poll_once` can write four different statuses, which is the
+difference between a document that recovers by itself and one that stops
+forever.
+
+The tests immediately caught a defect introduced the previous day. The retry
+policy gave every transient failure a ten-minute backoff, and a job abandoned
+by a dead worker is classified transient — so an ordinary deploy silently cost
+*every in-flight document* ten idle minutes before it resumed. Both halves
+were individually correct; only their composition was wrong, which is why no
+unit test of `retry.decide` would have shown it.
+
+The fix is a distinction the policy was missing. A backoff answers "the
+condition that caused this needs time to clear" — a token bucket refilling, a
+Tika restarting. A worker that died has already cleared by definition: the
+process doing the reaping is its replacement. `retry.IMMEDIATE_KINDS` names
+the kinds that requeue with no delay; the attempt cap still applies, which is
+what actually protects against a document that kills every worker that touches
+it.
+
+Also newly covered: the one-job-per-source guard, which had never been tested
+despite being what makes `FOR UPDATE SKIP LOCKED` safe to point at more than
+one worker. Suite 875 → **897 passing**.
+
+**2026-09-10 — Ingestion retry, dead-letter, and structured failures.**
+Every ingestion failure was terminal. `complete_job` wrote `FAILED` and the
+document stopped there, whatever the reason — so a job that hit a per-minute
+rate limit, or a Tika that happened to be restarting, needed a human to notice
+and re-queue it by hand. Once the deterministic failures were gone, that was
+the *only* kind of failure left in this database: the last two documents died
+on a daily token ceiling that a retry an hour later simply walks past.
+
+`ingestion/queue/retry.py` decides on `(failure_kind, attempt_count)` and
+nothing else — no I/O, no clock beyond `now` — so the interesting question is
+answerable in a unit test without a database or a provider. A transient
+failure is requeued with a backoff; one that exhausts its four attempts
+becomes `DEAD_LETTER`; a terminal failure stays `FAILED` after one attempt.
+`FAILED` and `DEAD_LETTER` both need a human but need different things from
+one, which is why collapsing them was the gap.
+
+Failures are classified **terminal by default** — only five kinds are
+transient — so a failure nobody has classified yet stops after one attempt and
+stays visible rather than quietly spending a retry budget. Rate limiting got
+its own `Err` code, split from `eav_extraction_failed` where the exception is
+still in hand rather than by re-parsing a message two layers away. The
+stale-job reaper now counts its requeue as an attempt, so a document that
+kills the worker every time dead-letters instead of being requeued forever by
+the very mechanism meant to rescue it.
+
+`failure_kind` became a real column (the long-standing item 13) because the
+policy has to dispatch on it, and doing that with `split_part(error_details,
+':', 1)` is exactly the fragility that item was about. It was backfilled, so
+the 49 failures already in the database are groupable immediately. The Jobs
+page gained **Attempts** and **Failure** columns; status alone cannot say
+whether a `QUEUED` row is fresh work or a job waiting out its backoff.
+
+Verified against live Postgres, not only SQLite — the enum value and the claim
+SQL are what SQLite cannot prove. A temporary job row was held back by its
+backoff, became claimable when it elapsed, was requeued on a simulated 429
+with `completed_at` left null, reached `DEAD_LETTER` when its budget ran out,
+and a `checksum_mismatch` went straight to `FAILED` after one attempt; the row
+was then removed. Migration `c4f8b2e17a90`. Suite 853 → **875 passing**.
 
 **2026-09-09 — Ingestion: the last two unindexed documents.** With the P0
 persistence work and the quota problems behind it, 22 of 24 sources were
@@ -971,7 +1118,7 @@ Migration `3d6f8b2c17ae` is additive: nothing dropped, no row changed, exact dow
 3. ~~Implement JWT auth + CORS allowlist + SSRF guard on the crawler (P0-3).~~ **Done 2026-09-08.**
 4. ~~Replace `print()` node logging with redacted structured logging (P0-4).~~ **Done 2026-09-06**
 5. ~~Fall back to vector search when a structured-only lookup returns nothing (P1-6).~~ **Done 2026-09-06**
-6. **Decide the superseded-content policy (P1-7)** and implement whichever half is missing — either let temporal questions reach `STALE` versions, or stop `value` accumulating undated duplicates. Today the two retrieval paths disagree with each other.
+6. ~~**Decide the superseded-content policy (P1-7)**~~ **Done 2026-09-10.** The decision taken was to keep history and mark it: `value_provenance` records which version asserted each fact, `value.superseded_at` marks the ones no current document still asserts, and structured lookup returns current values only. Chunk search is unchanged by choice — `STALE` versions stay out of semantic search, so no answer can cite replaced content. What is deliberately *not* built is the temporal query itself ("what was the previous rate?"); the data to answer it now accumulates.
 7. Mark DB/Playwright tests with `@pytest.mark.integration` and add a `-m "not integration"` default so the unit suite is green on a clean checkout.
 
 ### 7.2 Performance & scale

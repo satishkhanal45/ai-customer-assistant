@@ -29,6 +29,7 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from config import load_env
+from logging_config import install_trace_filter
 from db.session import database_url  # read-only import, not modified
 from ingestion.pipeline import get_pipeline_resources, reset_pipeline_resources
 from ingestion.queue.config import PGQueueSettings
@@ -58,7 +59,14 @@ def _silence_noisy_loggers() -> None:
     warnings.filterwarnings("ignore", category=UserWarning)
 
 async def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # `[trace]` labels every line with the run that produced it. Without it,
+    # concurrent lanes interleave into an unreadable stream and a job's four
+    # retry attempts are indistinguishable from one another.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(trace_id)s] %(message)s",
+    )
+    install_trace_filter()  # must precede the first line logged through it
     _silence_noisy_loggers()  # ADDED
     load_env()
 
@@ -76,7 +84,9 @@ async def main() -> None:
     get_pipeline_resources()
 
     log.info(
-        "ingestion worker starting, polling every %.1fs", deps.settings.poll_interval_seconds
+        "ingestion worker starting: %d lane(s), polling every %.1fs",
+        deps.settings.concurrency,
+        deps.settings.poll_interval_seconds,
     )
     try:
         await run_worker(deps)
