@@ -365,3 +365,99 @@ class TestRetryPredicate:
         # have been five identical ones.
         assert len(client.calls) == 5
         assert [_windows_in(c) for c in client.calls] == [3, 1, 2, 1, 1]
+
+
+# ---------------------------------------------------------------------------
+# Windows must not cut mid-word (ingestion.md: paraphrase duplicates).
+#
+# The live corpus contains the `MVP / definition` value **"smallest yet fun"**
+# — which is "smallest yet fun|ctional version of the product ..." with a
+# window boundary through the middle of "functional". The model extracted the
+# fragment as a complete fact, and it was stored beside the real definition as
+# a second, contradictory one.
+#
+# No similarity rule repairs that afterwards: the two strings diverge entirely
+# after the cut, so they do not look like restatements of each other. It has to
+# be prevented at the split.
+# ---------------------------------------------------------------------------
+
+class TestWindowBoundaries:
+    def _windows(self, text, size=1800, overlap=150):
+        return extraction_agent._window_text(text, size, overlap)
+
+    def test_no_window_ends_mid_word(self):
+        text = "MVP means the smallest yet functional version of the product. " * 40
+        windows = self._windows(text)
+
+        assert len(windows) > 1
+        for window in windows[:-1]:
+            # Ends on whitespace or a sentence terminator, never inside a word.
+            assert window[-1].isspace() or window.rstrip()[-1] in ".!?"
+
+    def test_no_window_starts_mid_word(self):
+        """Every window begins where a word begins.
+
+        Built from unique tokens so each window has exactly one position in
+        the source -- with repeating text `str.index` finds an earlier
+        occurrence and the offsets are meaningless.
+        """
+        text = " ".join(f"token{i:04d}" for i in range(600))
+        windows = self._windows(text)
+
+        assert len(windows) > 1
+        for window in windows[1:]:
+            start = text.index(window)
+            assert text[start - 1].isspace()
+
+    def test_the_reported_truncation_cannot_happen(self):
+        """The exact shape of the bug: a boundary landing inside 'functional'
+        must not produce a window ending in 'fun'."""
+        prefix = "x" * 1795
+        text = prefix + " smallest yet functional version of the product."
+        windows = self._windows(text)
+
+        assert not any(w.endswith("fun") for w in windows)
+
+    def test_a_sentence_boundary_is_preferred_to_a_word_boundary(self):
+        text = ("Sentence one is here. " * 90) + "tail"
+        windows = self._windows(text)
+
+        assert windows[0].rstrip().endswith(".")
+
+    def test_text_with_no_boundaries_still_advances(self):
+        """A table, a URL, a run of CJK. A hard cut is better than a window a
+        third of the intended size, and far better than an infinite loop."""
+        windows = self._windows("x" * 5000)
+
+        assert len(windows) == 3
+        assert sum(len(w) for w in windows) >= 5000
+
+    def test_no_text_is_lost_between_windows(self):
+        """Snapping the overlap forward only ever shortens the overlap, so the
+        windows still cover the document end to end.
+
+        Checked as coverage rather than reassembly: each window's span is
+        recorded and the union must be the whole document with no gap.
+        """
+        text = " ".join(f"token{i:04d}" for i in range(600))
+        windows = self._windows(text)
+
+        covered = 0
+        for window in windows:
+            start = text.index(window)
+            assert start <= covered, "gap between windows"
+            covered = max(covered, start + len(window))
+        assert covered == len(text)
+
+    def test_every_token_survives_windowing(self):
+        """The property a customer would notice: no word of the document goes
+        unseen by the extractor."""
+        text = " ".join(f"token{i:04d}" for i in range(600))
+        seen = set()
+        for window in self._windows(text):
+            seen.update(window.split())
+
+        assert seen == set(text.split())
+
+    def test_a_short_document_is_one_window(self):
+        assert self._windows("short enough") == ("short enough",)

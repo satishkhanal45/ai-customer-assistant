@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 
@@ -98,18 +99,65 @@ _RETRY_BASE_DELAY = 3.0
 _MAX_COOLDOWN_WAIT = 60.0
 
 
+# A window may give up this much of its length to end on a boundary. Below
+# that the text has no usable break -- a table, a URL, a run of CJK -- and a
+# hard cut is better than a window a third the intended size.
+_MIN_WINDOW_FRACTION = 0.6
+
+# Preferred break points, best first: the end of a sentence, then any
+# whitespace.
+_SENTENCE_END = re.compile(r"[.!?](?=\s)|\n")
+_ANY_SPACE = re.compile(r"\s")
+
+
+def _break_before(text: str, floor: int, end: int) -> int:
+    """The best place to end a window at or before `end`, never below `floor`.
+
+    Returns `end` unchanged when the span holds no break worth using.
+    """
+    for pattern in (_SENTENCE_END, _ANY_SPACE):
+        last = None
+        for match in pattern.finditer(text, floor, end):
+            last = match
+        if last is not None:
+            return last.end()
+    return end
+
+
 def _window_text(text: str, size: int, overlap: int) -> tuple[str, ...]:
+    """Split `text` into overlapping windows that end on a boundary.
+
+    Cutting at a raw character offset splits words, and the model extracts
+    the fragment as though it were the whole fact: this corpus contains the
+    value **"smallest yet fun"**, which is "smallest yet fun|ctional version
+    of the product ..." with a window boundary through the middle of
+    "functional". The truncated half was then stored beside the complete one
+    as a second, contradictory definition.
+
+    No similarity rule can repair that afterwards -- the two strings diverge
+    completely after the cut, so they do not look like restatements of each
+    other, and the fragment is not recoverable from what was sent. It has to
+    be prevented here.
+    """
     if len(text) <= size:
         return (text,)
+
     windows = []
     start = 0
     n = len(text)
     while start < n:
         end = min(start + size, n)
+        if end < n:
+            end = _break_before(text, start + int(size * _MIN_WINDOW_FRACTION), end)
         windows.append(text[start:end])
-        if end == n:
+        if end >= n:
             break
-        start = end - overlap
+        # Snapping the overlap forward to a boundary only ever *shortens* the
+        # overlap, so no text is skipped -- everything before `end` is already
+        # in the window just emitted.
+        resume = end - overlap
+        space = _ANY_SPACE.search(text, resume, end)
+        start = space.end() if space is not None else resume
     return tuple(windows)
 
 

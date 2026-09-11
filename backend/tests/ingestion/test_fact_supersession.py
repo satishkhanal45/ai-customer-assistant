@@ -31,7 +31,7 @@ from db.models import (
     ValueProvenance,
 )
 from ingestion.persistence import (
-    _multivalued_attributes,
+    _analyze_document_facts,
     resolve_superseded_values,
 )
 from ingestion.pipeline_types import ChunkExtraction, ExtractedFact
@@ -270,6 +270,15 @@ class TestSupersession:
 
         assert await _superseded(session_factory, old) is None
         assert await _superseded(session_factory, new) is not None
+
+
+def _multivalued_attributes(extractions):
+    """The `multivalue` half of the document analysis.
+
+    A thin reader rather than a second implementation: the analysis also
+    folds restated values now, and these cases are about the flag.
+    """
+    return _analyze_document_facts(extractions).multivalued
 
 
 class TestMultivaluedAttributes:

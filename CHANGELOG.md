@@ -7,11 +7,11 @@ Entries are grouped by the identifiers those documents use: `P0`/`P1`/`P2` for
 problems found by reading the codebase, and `F1`–`F9` for defects found by
 running the assembled system against a browser.
 
-## Unreleased — 2026-09-06
+## Unreleased — 2026-09-06 to 2026-09-11
 
 The test suite went from **268 passing with 10 failures and 6 errors** to
-**759 passing with none**, and the backend grew from ~14.8k to ~18k lines
-while the tests more than doubled.
+**969 passing with none**, and the backend grew from ~14.8k to ~21.6k lines
+while the tests more than tripled.
 
 ### Fixed — correctness
 
@@ -180,6 +180,67 @@ while the tests more than doubled.
   invalidates stored provider keys, which must then be re-entered.
 - Migration `9a4f7c2b83d1`, with a partial unique index enforcing a single
   default provider in the database.
+
+### Fixed — one thing stored as several entities
+
+- **Identity included the entity type**, so every type the model invented
+  minted a new entity. "Agile" was stored three times — `Methodology`,
+  `Process`, `Development Process` — holding 39, 14 and 2 facts: 55 facts
+  about one concept across three identities the database considered
+  unrelated. 62 of 538 entity names were fragmented this way.
+- `entity_type` is an *attribute*, not an identity discriminator. Entities now
+  resolve by normalized name alone. All 62 fragmented names were reviewed
+  first and none was a genuine homonym — every one was the same thing seen
+  through a different lens (`Technology` over `Library`, or Instagram as
+  Company/Platform/Product).
+- `reconcile` merges the existing ones, deciding three things independently:
+  the surviving **row** by fact count, the **label** by best casing (so a
+  merge cannot rename `PyTorch` to `pytorch`), and the **type** by corpus
+  rarity as a specificity proxy — restricted to types that carry a real share
+  of the group's facts, or `Development Process` beats `Methodology` on
+  rarity alone.
+- `PROPER_NOUN_MERGES` is no longer a separate pass; merging by name subsumes
+  it. Its reviewed types remain as an override, now keyed by normalized name.
+- Two bugs fixed in the repointing: colliding values were matched on exact
+  text after uniqueness had moved to `value_norm`, and the survivor was
+  relabelled before its duplicates were deleted — which fails when the
+  duplicate still holds the chosen `(type, name)`. The second was found only
+  by running it against the real database, and the repointing half now has
+  tests against real rows.
+- Live: 538 → 469 entities, 62 → 0 fragmented names, Agile's facts on one row.
+  Values fell 832 → 822 — the ten that were duplicates only because their
+  entities were.
+
+### Fixed — one fact stored several times
+
+- **`value` was unique on the exact text**, so `PHP Intern` and `php intern`,
+  or `pre-defined` written with an ASCII hyphen and with U+2011, were two
+  facts. `value_norm` holds a case-folded, whitespace-collapsed form with
+  Unicode punctuation mapped to ASCII, and `(entity, attribute, value_norm)`
+  is unique — the duplicate is unrepresentable rather than depending on every
+  writer to normalize. Migration `e7b04d2c9a13`, which repoints provenance
+  before deleting a duplicate: the FK cascades, so deleting one would drop the
+  record that a version asserted the fact and the survivor would then be
+  marked superseded.
+- **The model restates one fact across two overlapping windows** ("while it is
+  not polished" / "while not polished"). These are now folded within a
+  document, keeping the longer telling. The similarity threshold (0.92) was
+  measured against every duplicate pair in the corpus, not chosen: real
+  duplicates and real distinctions overlap below 0.91, so the line sits above
+  that band and deliberately misses one true duplicate rather than risk
+  merging two different prices.
+- **Windows cut mid-word.** The corpus contains the value "smallest yet fun" —
+  "smallest yet fun|ctional version of the product" with a boundary through
+  the middle of "functional", extracted as a complete fact. No similarity rule
+  repairs that (the strings score 0.35 against each other), so windows now end
+  on a sentence boundary or whitespace, with a hard cut as the fallback for
+  text that has neither.
+- `multivalue` is derived from what survives collapsing, not before it —
+  otherwise two tellings of one definition read as evidence that the attribute
+  takes several values.
+- Attributes that genuinely take several values are untouched: `Agile / stage`
+  keeps its six stages and `Alpinist Studios / objective` its six objectives,
+  both pinned by tests.
 
 ### Added — concurrent ingestion lanes and trace ids
 
