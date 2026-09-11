@@ -28,7 +28,15 @@ from sqlalchemy import (
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    mapped_column,
+    relationship,
+    validates,
+)
+
+from text_normalization import normalize_value
 
 
 class Base(DeclarativeBase):
@@ -82,8 +90,16 @@ class Attribute(Base):
 class Value(Base):
     __tablename__ = "value"
 
+    # Uniqueness is on the *normalized* value, not the exact text. The exact
+    # form let `PHP Intern` and `php intern`, or `pre-defined` written with an
+    # ASCII hyphen and with U+2011, sit side by side as two facts. The old
+    # constraint is kept as well: it is implied by the new one and dropping it
+    # buys nothing.
     __table_args__ = (
         UniqueConstraint("entity_id", "attribute_id", "value", name="uq_value_entity_attribute_value"),
+        UniqueConstraint(
+            "entity_id", "attribute_id", "value_norm", name="uq_value_normalized"
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid())
@@ -94,6 +110,10 @@ class Value(Base):
         UUID(as_uuid=True), ForeignKey("attribute.id", ondelete="CASCADE"), nullable=False, index=True
     )
     value: Mapped[str] = mapped_column(Text, nullable=False)
+    # The comparison key for `value`: case-folded, whitespace-collapsed, with
+    # Unicode punctuation variants mapped to ASCII. Never displayed --
+    # `value` is what a customer sees. See `ingestion.values.normalize_value`.
+    value_norm: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     searchable: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
     created_at: Mapped[datetime] = mapped_column(nullable=False, server_default=func.now())
     # When this fact stopped being asserted by any current document.
@@ -109,6 +129,21 @@ class Value(Base):
 
     entity: Mapped["Entity"] = relationship(back_populates="values")
     attribute: Mapped["Attribute"] = relationship(back_populates="values")
+
+    @validates("value")
+    def _derive_value_norm(self, _key: str, value: str) -> str:
+        """Keep `value_norm` in step with `value`, always.
+
+        It is a derived column, so requiring every writer to remember it is a
+        trap: a forgotten one does not fail with "you forgot", it fails with a
+        unique violation on the empty string, several frames from the cause.
+
+        The ingestion write path uses a Core `insert()` and sets `value_norm`
+        itself -- Core statements do not run ORM validators -- so this covers
+        everything else.
+        """
+        self.value_norm = normalize_value(value or "")
+        return value
 
 
 class ValueProvenance(Base):

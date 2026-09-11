@@ -1,10 +1,10 @@
 # AI Customer Assistant — Project Status Report
 
 **Repository:** `/mnt/hdd/satish/ai-customer-assistant`
-**Branch:** `features/test` (last commit `ff24bd4`; the P0-4 / F1–F9 work is uncommitted at the time of writing)
+**Branch:** `features/ingestion` (last commit `d822ce5`; the value-normalization and entity-fragmentation work is uncommitted at the time of writing)
 **Report date:** 2026-09-05
-**Last updated:** 2026-09-06 — **P0-1**, **P0-2**, the **whole P1 tier** (including the newly-found P1-6), the **whole P2 tier**, and **F1–F7 + F9** from the live UI test; see the changelog
-**Method:** full read of `backend/src` (14.8k LOC), `backend/tests` (4.6k LOC), `frontend/src` (2.8k LOC), migrations, Docker/Make tooling and docs; plus a live run of the test suite.
+**Last updated:** 2026-09-11 — every P0/P1/P2 item, **P1-7** (superseded content), and **every item in `ingestion.md`**; see the changelog
+**Method:** full read of `backend/src` (21.6k LOC), `backend/tests` (14.2k LOC), `frontend/src` (4.8k LOC), migrations, Docker/Make tooling and docs; plus a live run of the test suite and of the Docker stack against the real database.
 
 ---
 
@@ -18,8 +18,8 @@ This is a **multi-agent RAG customer-support assistant** for Alpinist Studios, b
 |---|---|
 | Architecture & module design | **Strong.** Clean layering, dependency injection everywhere, pure functions separated from I/O, excellent docstrings. |
 | Feature completeness (MVP scope) | **~80%.** Chat, RAG, ingestion, crawling, graph browsing, ticket creation, ticket status lookup and the admin *read* surface all work. The admin *write* surface and prompt management do not. |
-| Test suite | **759 passing / 0 failing / 0 erroring / 2 skipped** (761 collected). **Fully green** — the Playwright browser is installed, so the last non-deterministic gap is closed. |
-| Production readiness | **No known blockers.** One open correctness issue, P1-7, which only bites once documents start being *updated* rather than added. Authentication, authorisation, a CORS allowlist, rate limiting and an SSRF guard on the crawler are all in place (P0-3). Conversation state no longer reaches the logs (P0-4). Secrets are no longer injected by import side effect (P0-2), and the client/server timeout ladder no longer inverts (P2-4). |
+| Test suite | **969 passing / 0 failing / 0 erroring / 2 skipped** (971 collected). **Fully green** — the Playwright browser is installed, so the last non-deterministic gap is closed. |
+| Production readiness | **No known blockers, and no open correctness issues** — P1-7 closed 2026-09-10. Authentication, authorisation, a CORS allowlist, rate limiting and an SSRF guard on the crawler are all in place (P0-3). Conversation state no longer reaches the logs (P0-4). Secrets are no longer injected by import side effect (P0-2), and the client/server timeout ladder no longer inverts (P2-4). |
 | Scalability | **Much improved.** All four P1 items are fixed: pgvector-native retrieval, LLM calls off the event loop, one shared connection pool, and ingestion moved out of the web process into a worker service. Two pieces of per-process state that quietly broke horizontal scaling now live in the database (P2-5). |
 | Repo hygiene | **Good.** The duplicated ontology is gone (P2-1); dead files, the committed AI-assistant note, the crawl artefact and the committed debug values are all gone, and the README is real (P2-6). Only the stale branches are left, deliberately untouched. |
 
@@ -72,6 +72,98 @@ The page's `source` column ("saved" vs "from environment") exists because a save
 Two defects found by measurement rather than reasoning. **(1) A read-after-write race:** `get_session` commits during dependency teardown, *after* the response reaches the client, so the page's immediate reload could miss its own write — observed as a save that appeared not to take. The mutating handlers now commit before returning. **(2) `server_default="false"` is a string literal**, which Postgres reads as the boolean but SQLite stores as the text `'false'` — and `'false'` is truthy, so a freshly inserted row came back claiming to be the default provider. Fixed with a Python-side `default=False` alongside it. Harmless on Postgres, wrong everywhere else; a test caught it.
 
 Migration `9a4f7c2b83d1`, with a partial unique index enforcing at most one default in the database rather than in whoever remembers to clear the old one. Suite 774 → **798 passing**.
+
+**2026-09-10 — One thing stored as several entities.** `"offers flexibility"`
+appeared twice under `Agile / flexibility`, beneath a unique constraint that
+should have made it impossible. The constraint was not violated: it is on
+`(entity_id, attribute_id, value)`, and there were **three Agiles** —
+`Methodology`, `Process` and `Development Process`, holding 39, 14 and 2 facts.
+55 facts about one concept, across three identities the database considered
+unrelated. 62 of 538 names were fragmented this way.
+
+Three reasonable decisions that contradict each other: identity is
+`(entity_type, name)`; the ontology passes unknown types through unchanged; and
+the extraction prompt explicitly invites the model to invent a type when none
+fits. The prompt asks for free-form types to protect recall while identity is
+keyed on them. Underneath it all, `entity_type` is an attribute, not an
+identity discriminator — "Python is a Programming Language" and "Python is a
+Technology" are both true and neither makes it a different Python.
+
+The cost was worse than the visible duplicates. `structured_lookup` matches on
+type and name, falling back to name alone — so a query naming one variant
+returned 39 facts and silently missed 16. A partial answer that looks complete
+is more dangerous than an obviously duplicated one.
+
+All 62 groups were reviewed before any code was written, and **not one was a
+genuine homonym**. Entities now resolve by normalized name; `reconcile` merges
+what was already there, deciding the surviving row (most facts), the label
+(best casing, so a merge cannot rename `PyTorch` to `pytorch`) and the type
+(rarest in the corpus as a specificity proxy, restricted to types carrying a
+real share of the facts) as three independent choices.
+
+Two bugs in the repointing, one found only by running it: colliding values were
+matched on exact text after uniqueness had moved to `value_norm`, and the
+survivor was relabelled before its duplicates were deleted — which fails when a
+duplicate still holds the chosen `(type, name)`. The live run stopped on
+`duplicate key value violates unique constraint "uq_entity_type_name"`. No
+pure-planner test could have caught it, so the repointing half now has tests
+against real rows, verified by reverting the fix and confirming they fail.
+
+Live: 538 → 469 entities, 62 → 0 fragmented names, Agile's 55 facts on one row
+(54 after the duplicate collapsed), values 832 → 822, provenance and relations
+preserved. The two documents that previously produced two `Low-fidelity
+Prototype` entities in a single run were re-ingested and produced zero new
+fragmentation. Suite 951 → **969 passing**.
+
+**2026-09-10 — One fact stored several times.** The corpus held five
+`MVP / definition` values where the document states at most two, and
+`Parbati B. / role` as both "PHP Intern" and "php intern". Reading the data
+before writing any code turned one problem into three, each needing a
+different fix.
+
+**Text that differs invisibly.** `pre-defined projects` appeared twice,
+differing by a single character — U+002D against U+2011 NON-BREAKING HYPHEN.
+Not paraphrase at all. `value_norm` now holds a case-folded,
+whitespace-collapsed, ASCII-punctuation form and `(entity, attribute,
+value_norm)` is unique, making the duplicate unrepresentable rather than
+relying on every writer. The migration repoints provenance before deleting a
+duplicate: the FK cascades, so deleting one would drop the record that a
+version asserted the fact, and the survivor would then be marked superseded —
+a merge deleting an answer through a side effect two tables away.
+
+**The model paraphrasing across overlapping windows.** Folded within a
+document, keeping the longer telling. The threshold was measured rather than
+picked: every duplicate pair in the corpus was scored, and real duplicates sit
+interleaved with real distinctions between 0.70 and 0.91 — two URLs at 0.893,
+two prices at 0.706, two different interests at 0.703. The line goes above
+that band at 0.92 and deliberately misses one true duplicate, because leaving
+a redundant row costs noise while merging two prices deletes an answer.
+
+**Windows cut mid-word.** The corpus contains "smallest yet fun" — "smallest
+yet fun|ctional version of the product" with a boundary through the middle of
+"functional", extracted as a complete fact. No similarity rule repairs it: the
+strings score 0.35 against each other, and the missing half was never sent to
+the model. Windows now end on a sentence boundary or whitespace.
+
+Throughout, the constraint was not to break genuinely multi-valued attributes:
+`Agile / stage` keeps six real stages and `Alpinist Studios / objective` six
+real objectives, both pinned by tests.
+
+**What this did not fix, and what the evidence now points at.** The dominant
+remaining source of apparent duplication is **entity fragmentation**, not
+value paraphrasing. Of 538 entities, 44 names are split across two or three
+`entity_type` values and 19 differ only by case — `Agile` exists as
+`Methodology`, `Process` and `Development Process`, and one re-ingest produced
+`Prototype / Low-fidelity prototype` and `Product / Low-fidelity Prototype` in
+the same run. Each variant collects its own facts and `structured_lookup`
+unions them, so one fact reads as several. `reconcile.py` merges only rows
+sharing a canonical type, so it does not touch these. That is entity
+resolution, and it needs a product judgement: merging `Agile` the Methodology
+with `Agile` the Process is right; merging `Architecture Review` the
+`Practice` with the `Service` may not be.
+
+Migration `e7b04d2c9a13` merged 2 rows live (777 → 775) with provenance
+intact. Suite 921 → **951 passing**.
 
 **2026-09-10 — Trace ids and concurrent lanes (P3-14, P2-12).** Two items
 that turned out to be one: concurrency makes the log unreadable, and trace ids
@@ -341,13 +433,15 @@ cd backend && env -u PYTHONPATH ./.venv/bin/python -m pytest -q
 → 10 failed, 268 passed, 6 errors in 170.19s
 ```
 
-**Current, after every P0, P1, P2, P1-6 and F1–F9 fix:**
+**Current, after every P0/P1/P2 item, P1-7, and the whole of `ingestion.md`:**
 ```
 cd backend && env -u PYTHONPATH ./.venv/bin/python -m pytest -q
-→ 759 passed, 2 skipped in 71.07s
+→ 969 passed, 2 skipped in 80.23s
 ```
 
-Collected: 761 tests, **no failures and no errors**. The last 121 arrived with
+Collected: 971 tests, **no failures and no errors**. The most recent 210
+arrived with the ingestion work: retry policy and dead-lettering, the worker
+loop, fact supersession, value duplication, entity merging. The last 121 arrived with
 P0-3: tokens, passwords, roles, the auth router, rate limiting, the SSRF
 guard, and `tests/api/test_route_protection.py`, which enumerates the
 assembled application and asserts every route is either on a four-entry
@@ -488,8 +582,8 @@ it — the list is a literal in the test, so widening it is a visible diff.
 - **Crawler v2** (`ingestion/crawler/`): Playwright-rendered, sitemap-first discovery with a link-BFS fallback, three configurable wait strategies (`fixed_timeout` / `networkidle` / `selector`), a two-phase `discover` → human review → `crawl_confirmed` flow, HTML→Markdown via trafilatura, and PDF/DOCX download classification.
 - **Storage** (`ingestion/storage/`): MinIO client, deterministic key scheme, uploader, repository.
 - **Chunk + embed** (`ingestion/chunk_embed/`): 500-token chunks / 75-token overlap, tokenizer-aware recursive splitting, batched normalised BGE embeddings. **97 tests — the best-covered subsystem in the repo.**
-- **EAV extraction** (`ingestion/extraction/`): a tool-calling agent over a 762-line canonical ontology, emitting entities / attribute-values / relations per chunk.
-- **Persistence** (`ingestion/persistence.py`): entity resolve-or-create with ontology canonicalisation and case-insensitive merge; `ON CONFLICT DO NOTHING` upserts make re-ingestion idempotent.
+- **EAV extraction** (`ingestion/extraction/`): a **JSON-mode** agent over the shared canonical ontology, emitting entities / attribute-values / relations. One call covers several ~1800-character windows, batched across chunk boundaries; a rejected batch is split rather than failing the document. (`extraction/tools.py` implements the older tool-calling path and is now referenced only by its own test — see §5.)
+- **Persistence** (`ingestion/persistence.py`): entity resolve-or-create **by normalized name**, so a type the model invents cannot mint a second identity; chunks are replaced rather than appended; values are unique on their normalized form, carry provenance per document version, and are marked superseded when no current document still asserts them.
 - **Queue** (`ingestion/queue/`): `knowledge_injection_job` used as a queue table with `FOR UPDATE SKIP LOCKED`, a one-job-per-source guard, chunk-embedding reuse across versions keyed by checksum, and an atomic cutover that flips `current_version_id` and marks the old version `STALE`.
 - **Result monad** (`ingestion/result.py`) for short-circuiting stage composition — genuinely elegant.
 
@@ -565,7 +659,7 @@ shell history and in `ps` output for every other user on the machine.
 | ~~**CHANGELOG**~~ | **Done** — `CHANGELOG.md` was written in the F-series and covers P0-3. |
 | **CI** | No `.github/`, no lint config, no formatter config, no coverage gate. |
 | ~~**Worker in Docker**~~ | **Done (P1-5)** — a `worker` service now runs `scripts/run_worker.py`; the API only enqueues. |
-| **Observability** | No structured logging, no metrics, no tracing. `trace_id` is generated and threaded but never actually logged anywhere. |
+| **Observability** | No structured (JSON) logging, no metrics, no tracing. Log lines now carry a `[trace_id]` column and **ingestion fills it** — each job run is labelled `<job8>.<attempt>`, which is what makes concurrent lanes and retried jobs legible. The **chat path still does not**: it threads a `trace_id` through the LangGraph config but never sets the logging context, so its lines print `-`. |
 | ~~**Streaming responses**~~ | **Done (F7)** — `POST /chat/stream` reports progress from ~50ms; `POST /chat` is unchanged as the fallback. |
 | ~~**Rate limiting / abuse control**~~ | **Done (P0-3)** — per authenticated user, counted in the database rather than a process dict, so it survives a restart and does not multiply by the instance count. 5 logins / 15 min (per address *and* per account), 20 chat turns / min and 500 / day, 10 ingest calls / min. |
 | **Session management UI** | `refresh_token` records a user agent and issue time per session, but nothing surfaces them. "Sign out everywhere" exists as a code path (it fires on detected token reuse) with no button attached. |
@@ -574,7 +668,7 @@ shell history and in `ps` output for every other user on the machine.
 
 ## 6. Current problems, ranked
 
-### 🟠 P1-7 — Superseded content: chunks hide history, facts cannot date it — **OPEN**
+### ✅ P1-7 — Superseded content: chunks hide history, facts cannot date it — **FIXED 2026-09-10**
 
 **Found 2026-09-09**, while reviewing the ingestion pipeline. Not caused by any recent change; it has been true since retrieval was written. Surfaced by the question *"if the rate to build a website changed, can the assistant still tell me what it used to be?"*
 
@@ -592,14 +686,18 @@ so a superseded chunk can never be retrieved. *"What was the previous rate?"* is
 
 **The second is the more serious.** A missing answer is visibly missing. Two contradictory prices returned as equally true is a *wrong* answer delivered with confidence — and the F-series showed that structured facts lead the answer prompt, so the model is being handed the contradiction first.
 
-**Not yet visible in this deployment.** All 125 chunks currently belong to current versions; nothing has been re-ingested with changed content. It becomes real the first time a document is updated — which is exactly when nobody will be looking for it.
+**It was not yet visible when found.** Every chunk belonged to a current version; nothing had been re-ingested with changed content. It would have become real the first time a document was updated — which is exactly when nobody would be looking for it.
 
-**This needs a product decision before it needs code.** Two coherent positions:
+**The decision taken: keep history and mark it.** The old rate is a real fact, and deleting it makes the question that raised this permanently unanswerable. So:
 
-1. **History matters.** Chunks carry their version into retrieval, temporal questions are allowed to reach `STALE` versions, `value` gains a version reference so "current" is derivable, and answers cite which version a fact came from. A feature, not a fix.
-2. **Only current truth matters.** Re-ingest supersedes old `value` rows rather than accumulating them, and superseded chunks are pruned on a retention schedule.
+* `value_provenance` records which document version asserted each fact — a link table rather than a column, because a `value` row is global and a fact one document drops may still be asserted by another.
+* `value.superseded_at` marks the facts no current version still asserts. Currency is *derived* from provenance on every run rather than accumulated, so a re-ingest, a rollback, or a document ceasing to be current all converge without anyone reasoning about order.
+* `structured_lookup` returns current values only, so the contradiction stops.
+* **The chunk half is deliberately unchanged.** Semantic search still sees only current versions, so no answer can cite replaced content.
 
-Either is defensible; the present state — half of one, half of the other — is not. Full analysis, and the ingestion-side work it implies, in [`ingestion.md`](ingestion.md) §5 item 5.
+What is deliberately *not* built is the temporal query itself — *"what was the previous rate?"* — but the data to answer it now accumulates, and no further migration is needed to build it.
+
+Verified on live Postgres: with v1 current, `$500` stood and `$800` was superseded; cutting over to v2 swapped them; a re-run changed nothing; rolling back swapped them again. Migration `d5a91c3f7b28`. Full analysis in [`ingestion.md`](ingestion.md) §5 item 5.
 
 ---
 
@@ -1146,7 +1244,7 @@ Migration `3d6f8b2c17ae` is additive: nothing dropped, no row changed, exact dow
 21. **Ticket lifecycle** — `updated_at`, `resolved_at`, assignee, a `thread_id` FK linking a ticket back to its conversation, and inbound email replies.
 
 ### 7.5 Operations
-22. Structured JSON logging that actually emits the `trace_id` already threaded through every node. (Log *levels* were fixed with F5 — `logging_config.configure_logging()`; the remaining work is structure and the trace id.)
+22. Structured JSON logging. (Log *levels* were fixed with F5; the `trace_id` column was added 2026-09-10 and ingestion fills it, so what remains is JSON structure and setting the same context on the chat path, which still logs `-`.)
 23. Prometheus metrics: chat latency by stage, retrieval hit rate, LLM token spend, job queue depth.
 24. `/health` should check Postgres, MinIO and Tika — it currently returns `{"status": "ok"}` unconditionally.
 25. ~~A stale-job reaper.~~ **Done 2026-09-05** with P1-5.
@@ -1208,9 +1306,9 @@ POSTGRES_HOST=localhost POSTGRES_PORT=5433 \
   env -u PYTHONPATH PYTHONPATH=src/ai_customer_assistant ./.venv/bin/python -m alembic upgrade head
 ```
 
-**Codebase size:** backend `src` ~18 000 lines · tests ~11 000 lines · frontend ~4 200 lines. The test suite nearly tripled over this work — 268 → **759 passing**.
+**Codebase size:** backend `src` ~21 600 lines · tests ~14 200 lines · frontend ~4 800 lines. The test suite more than tripled over this work — 268 → **969 passing**.
 
-**Largest modules:** `frontend/src/pages/graph.js` (930) · `ontology/vocabulary.py` (596) · `frontend/src/pages/ingest.js` (509) · `agents/knowledge/structured_lookup.py` (455) · `api/ingest.py` (~470).
+**Largest modules:** `frontend/src/pages/graph.js` (930) · `db/models.py` (687) · `ingestion/extraction/agent.py` (615) · `ontology/vocabulary.py` (596) · `services/chat_service.py` (558) · `ingestion/pipeline.py` (541).
 
 ### Configuration
 

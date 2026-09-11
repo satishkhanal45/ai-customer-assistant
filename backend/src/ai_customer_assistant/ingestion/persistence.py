@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -33,6 +34,7 @@ from db.models import (
 )
 from ingestion.extraction.ontology import safe_canonicalize_entity_type
 from ingestion.pipeline_types import ChunkExtraction
+from ingestion.values import collapse_near_duplicates, normalize_value
 
 logger = logging.getLogger(__name__)
 
@@ -100,38 +102,50 @@ async def persist_chunks(
 
 
 async def _resolve_entity(session: AsyncSession, entity_type: str, name: str) -> UUID:
-    """Resolve-or-create an entity, deduplicating as aggressively as the
-    schema allows without a migration:
+    """Resolve-or-create an entity. **A name is one entity, whatever its type.**
 
-    1. Canonicalize ``entity_type`` through the ingestion ontology, so the
-       same real-world type always maps to one canonical string (e.g. both
-       ``company`` and ``organization`` -> ``Company``) — this is what stops
-       "Alpinist Studios" from being stored once per type label.
-    2. Reuse an existing row whose *canonical* type and case-insensitive
-       name match, so name-case variants also merge into one entity.
-    3. Fall back to the ``(entity_type, name)`` upsert — the DB unique
-       constraint remains the final guarantee.
+    Identity used to include the type, and that fragmented the graph. The
+    schema is unique on ``(entity_type, name)``, the ontology passes types it
+    does not recognise through unchanged, and the extraction prompt actively
+    invites the model to invent a type when none of the canonical ones fit --
+    so every invented type minted a new entity. "Agile" ended up stored three
+    times, as ``Methodology``, ``Process`` and ``Development Process``,
+    holding 39, 14 and 2 facts: 55 facts about one concept, split across three
+    identities the database considered unrelated.
 
-    Keeping the raw ``name`` as the display value means the merge never
-    changes what users see; only identity is normalized."""
+    The error underneath it is that ``entity_type`` is an *attribute*, not an
+    identity discriminator. "Python is a Programming Language" and "Python is
+    a Technology" are both true, and neither makes it a different Python.
+
+    So the lookup is by normalized name alone. All 62 fragmented names in this
+    corpus were the same real-world thing seen through different lenses --
+    supertype/subtype pairs (``Technology`` over ``Library``, ``Phase`` over
+    ``SDLC Phase``) or facets (Instagram is a Company *and* a Platform *and* a
+    Product) -- with no genuine homonyms among them.
+
+    The caveat that comes with that: a true homonym *would* now merge. In a
+    single-company knowledge base that is a remote risk and a visible one (the
+    facts contradict each other), where fragmentation was certain and silent.
+
+    Canonicalizing the type still matters for the row this creates, and the
+    ``(entity_type, name)`` upsert remains the final guarantee. Keeping the raw
+    ``name`` as the display value means identity is normalized without changing
+    what anyone sees.
+    """
     canonical_type = safe_canonicalize_entity_type(entity_type)
     normalized_name = name.strip()
 
     existing = (
         await session.execute(
             select(Entity.id)
-            .where(
-                func.lower(Entity.name) == normalized_name.lower(),
-                Entity.entity_type == canonical_type,
-            )
-            .order_by(Entity.id)
-            .limit(2)
+            .where(func.lower(Entity.name) == normalized_name.lower())
+            .order_by(Entity.created_at, Entity.id)
+            .limit(1)
         )
     ).scalars().all()
     if existing:
-        # Reuse the oldest row as the canonical identity (case-variant
-        # duplicates may still exist from pre-fix data; this stops the
-        # write path from creating any new ones).
+        # Oldest row wins, so the identity a document resolves to does not
+        # depend on which type the model happened to emit this time.
         return existing[0]
 
     stmt = (
@@ -195,7 +209,7 @@ async def _persist_one_extraction(
     session: AsyncSession,
     version_id: UUID,
     extraction: ChunkExtraction,
-    multivalued: frozenset[tuple[str, str]] = frozenset(),
+    document: "_DocumentFacts | None" = None,
 ) -> UUID | None:
     """Write one chunk's resolved entity + facts + relations. Returns the
     resolved entity_id, or None if there was no primary entity.
@@ -220,7 +234,20 @@ async def _persist_one_extraction(
         entity_id = await resolve(entity_type, name)
         await _link_entity_to_chunk(session, version_id, extraction.chunk_index, entity_id)
 
+    document = document or _DocumentFacts(surviving={}, multivalued=frozenset())
+
     for fact in extraction.facts:
+        fact_key = (
+            fact.entity_type,
+            fact.entity_name,
+            fact.namespace,
+            fact.attribute_name,
+        )
+        # Another window of this document already said this, in slightly
+        # different words. Writing it again would store one fact twice.
+        if not document.keeps(fact_key, fact.value):
+            continue
+
         attribute_id = await _resolve_attribute(
             session,
             fact.namespace,
@@ -233,7 +260,7 @@ async def _persist_one_extraction(
             # one entity, the attribute takes more than one value, and that is
             # a fact about the data rather than a judgement call.
             fact.multivalue
-            or (fact.namespace, fact.attribute_name) in multivalued,
+            or (fact.namespace, fact.attribute_name) in document.multivalued,
         )
         fact_entity_id = await resolve(fact.entity_type, fact.entity_name)
         # Unique on (entity, attribute, value), so re-extracting the same fact
@@ -249,10 +276,18 @@ async def _persist_one_extraction(
                 entity_id=fact_entity_id,
                 attribute_id=attribute_id,
                 value=fact.value,
+                value_norm=normalize_value(fact.value),
                 searchable=fact.searchable,
             )
+            # On the normalized form, so a value that differs only by case or
+            # by which Unicode hyphen the model reached for is recognised as
+            # the fact it already is.
             .on_conflict_do_update(
-                index_elements=[Value.entity_id, Value.attribute_id, Value.value],
+                index_elements=[
+                    Value.entity_id,
+                    Value.attribute_id,
+                    Value.value_norm,
+                ],
                 set_={"searchable": fact.searchable},
             )
             .returning(Value.id)
@@ -293,20 +328,37 @@ async def _persist_one_extraction(
     return entity_id
 
 
-def _multivalued_attributes(
-    extractions: tuple[ChunkExtraction, ...],
-) -> frozenset[tuple[str, str]]:
-    """Attributes this document gives more than one value for, on one entity.
+FactKey = tuple[str, str, str, str]
 
-    Computed across the whole document rather than per chunk, because a
-    document's four `client_industries` are usually spread over four chunks --
-    per-chunk counting would see one each and conclude the attribute is
-    single-valued.
 
-    Distinct values only: the same fact restated in two chunks is one value,
-    not evidence of a list.
+@dataclass(frozen=True, slots=True)
+class _DocumentFacts:
+    """What a whole document says, once its restatements are folded together.
+
+    Both answers here need the *document*, not a chunk: a document's four
+    `client_industries` are usually spread over four chunks, and the two
+    tellings of one definition usually land in two overlapping windows.
     """
-    seen: dict[tuple[str, str, str, str], set[str]] = {}
+
+    surviving: dict[FactKey, frozenset[str]]
+    multivalued: frozenset[tuple[str, str]]
+
+    def keeps(self, key: FactKey, value: str) -> bool:
+        survivors = self.surviving.get(key)
+        return survivors is None or value in survivors
+
+
+def _analyze_document_facts(
+    extractions: tuple[ChunkExtraction, ...],
+) -> _DocumentFacts:
+    """Fold each entity+attribute's values, then decide which are lists.
+
+    Order matters: `multivalue` is derived from what *survives* collapsing.
+    Deriving it first would read two tellings of one definition as evidence
+    that `definition` takes several values, which is the opposite of what
+    they are evidence of.
+    """
+    grouped: dict[FactKey, list[str]] = {}
     for extraction in extractions:
         for fact in extraction.facts:
             key = (
@@ -315,11 +367,27 @@ def _multivalued_attributes(
                 fact.namespace,
                 fact.attribute_name,
             )
-            seen.setdefault(key, set()).add(fact.value)
-    return frozenset(
-        (namespace, attribute_name)
-        for (_, _, namespace, attribute_name), values in seen.items()
-        if len(values) > 1
+            values = grouped.setdefault(key, [])
+            if fact.value not in values:
+                values.append(fact.value)
+
+    surviving = {
+        key: collapse_near_duplicates(values) for key, values in grouped.items()
+    }
+    if any(len(v) != len(grouped[k]) for k, v in surviving.items()):
+        logger.info(
+            "Collapsed %d restated fact(s) across %d attribute(s).",
+            sum(len(grouped[k]) - len(v) for k, v in surviving.items()),
+            sum(1 for k, v in surviving.items() if len(v) != len(grouped[k])),
+        )
+
+    return _DocumentFacts(
+        surviving={key: frozenset(values) for key, values in surviving.items()},
+        multivalued=frozenset(
+            (namespace, attribute_name)
+            for (_, _, namespace, attribute_name), values in surviving.items()
+            if len(values) > 1
+        ),
     )
 
 
@@ -328,11 +396,11 @@ async def persist_chunk_extractions(
 ) -> int:
     """Persist every chunk's EAV extraction (steps 5-6). Returns the count
     of distinct entities resolved, for job reporting."""
-    multivalued = _multivalued_attributes(extractions)
+    document = _analyze_document_facts(extractions)
     resolved_ids = set()
     for extraction in extractions:  # each may write rows depending on prior ones
         entity_id = await _persist_one_extraction(
-            session, version_id, extraction, multivalued
+            session, version_id, extraction, document
         )
         resolved_ids.add(entity_id)
     await session.flush()

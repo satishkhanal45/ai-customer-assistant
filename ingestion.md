@@ -1,11 +1,16 @@
 # The Ingestion Pipeline — how it works, and where it hurts
 
-**Status:** analysis, and the P0 tier is now **fixed** (2026-09-09) — see
-§5. The rest stands as written.
-**Date:** 2026-09-09
-**Measured against:** the live database on this machine — 24 knowledge
-sources, 24 versions, 82 ingestion jobs, 125 chunks, 339 entities, 242
-relations.
+**Status:** analysis, and **every item in §5 is now fixed** (P0 on
+2026-09-09; the rest by 2026-09-10). What remains is listed at the end of §5
+and was found while doing the work, not in the original triage.
+**Date:** 2026-09-09, last revised 2026-09-11.
+**Measured against:** the live database on this machine. Figures in §§1–4 are
+**as measured on 2026-09-09**, before any of this work — they are the evidence
+the analysis was built on, and are deliberately not restated, or the reasoning
+would no longer match the numbers it cites. For comparison, the same database
+today: 24 sources, 24 versions, 82 jobs, **77 chunks** (125 before, minus 58
+duplicates), **476 entities** (538 before merging), 874 values, 505 relations —
+and all 24 sources indexed, which was never true before.
 
 ---
 
@@ -141,7 +146,8 @@ none of the recommendations below disturb it.
 ### Details worth knowing
 
 - **Chunking**: 500 tokens, 75 overlap (15%). Measured on your live data:
-  125 chunks, mean 441 tokens, max 500 — the windowing is behaving.
+  125 chunks, mean 441 tokens, max 500 — the windowing is behaving. (125 was
+  inflated by the duplicate-chunk bug in §4.1; 77 after it was fixed.)
 - **Embedding reuse**: on a re-ingest, chunks whose text checksum matches
   the previous version reuse that embedding instead of recomputing. Real
   saving on a document where one paragraph changed.
@@ -255,7 +261,8 @@ That is not what the wiring does. The intent was right; the seam between
   **Admin › API Keys** page is used by chat but **not** by ingestion. Two
   sources of truth for one credential.
 - ~~**The ingestion LLM call has no timeout, and the worker is serial.**~~
-  **Timeout fixed 2026-09-09** (see §5 item 6). The serial worker remains.
+  **Both fixed** — timeout 2026-09-09 (§5 item 6), concurrent lanes 2026-09-10
+  (§5 item 12).
   Original finding:
   Found on 2026-09-09 while re-running the failed jobs against a fresh Groq
   key: one document sat in `RUNNING` for **28 minutes** with no log output
@@ -884,13 +891,25 @@ were individually correct and only their composition was not.
 
 Suite 875 → **897 passing**.
 
-**16. Resolve `reconcile.py`.** Give it an entry point and a test, or delete
-it. 366 lines that nothing calls will rot.
+**16. Resolve `reconcile.py`.** ✅ **Done.** It was already reachable — `python
+-m ingestion.reconcile`, with `tests/ingestion/test_reconcile.py` covering the
+pure planners — and §9 then made it the mechanism that merged 69 fragmented
+entities, so it is now load-bearing rather than at risk of rotting. The
+DB-executing half gained its own tests in that work.
 
-**17. Update the stale docstrings.** `pipeline.py` still carries
-"STILL TO CONFIRM", "ASSUMPTION", and the claim about model loading that
-§4.3 shows is false. A comment that contradicts the code is worse than no
-comment.
+**17. Update the stale docstrings.** ✅ **Done 2026-09-09** with item 10.
+`pipeline.py` no longer carries "STILL TO CONFIRM", "ASSUMPTION", or the claim
+about model loading that §4.3 showed was false.
+
+**18. `extraction/tools.py` is dead.** Found 2026-09-11 while checking the
+documentation against the code. 153 lines implementing the older tool-calling
+extraction path, imported by nothing except `tests/ingestion/test_extraction_tools.py`
+— the extractor has used JSON mode (`response_format={"type": "json_object"}`)
+since before this document was written, and `prompts.py` explains why: one call
+per chunk instead of ~6 tool-calling turns. This is item 16's problem exactly,
+in a module nobody had checked: a test keeps it compiling, so nothing reports
+it as unreachable. Delete it with its test, or wire it behind a flag if the
+tool-calling path is ever wanted back.
 
 ---
 
@@ -924,26 +943,267 @@ the live database rather than the original triage.*
 
 *Items 5, 6, 7, 12, 13, 14 and 15 shipped 2026-09-10.*
 
-**Every item in this document is now closed.** 16 (`reconcile.py`) was
-already effectively resolved — it has a `__main__` entry point and
-`tests/ingestion/test_reconcile.py` — and 17 (stale docstrings) was cleaned up
-with item 10.
+**Items 1–17 are all closed.** Item 18 was opened on 2026-09-11 by a pass
+checking this document against the code, which is also where the two
+corrections below came from.
 
-What is left is not on this list, because it was found while working through
-it:
+What is left — all of it found while working through the list, none of it on
+the original one:
 
-1. **Extraction produces paraphrase duplicates.** `MVP / definition` holds five
-   near-identical sentences, and `Agile / flexibility` holds "high", "True"
-   and "offers flexibility" twice. They are distinct `value` rows because the
-   unique constraint is on exact text. This is an extraction-quality problem —
-   supersession will not merge them, and item 5 deliberately did not try.
-2. **The crawler ingests error pages.** One of the two `Contact` sources in
+1. ~~**Extraction produces paraphrase duplicates.**~~ **Done 2026-09-10** —
+   see §8, "Restated facts".
+2. ~~**Entities fragment across type and case variants.**~~ **Done
+   2026-09-10** — see §9, "Entity fragmentation".
+3. **`extraction/tools.py` is dead code** — item 18.
+4. **The crawler ingests error pages.** One of the two `Contact` sources in
    this corpus is a 404 page whose text begins "# Oops!". It was chunked,
-   embedded and indexed like any other document, and is now retrievable.
-3. **A worker advisory lock**, if a deployment ever runs more than one worker
+   embedded and indexed like any other document, and is now retrievable. It is
+   a *crawler* problem, not an ingestion one: nothing downstream can tell a
+   404 body from a real page.
+5. **The entity type label is debatable for ~10 merged groups** — see the end
+   of §9. Descriptive metadata only; it does not affect retrieval.
+6. **A worker advisory lock**, if a deployment ever runs more than one worker
    process — see item 12.
+
+Two things this document said that the code did not, both corrected on
+2026-09-11: §4.4 claimed the worker was still serial after item 12 had made it
+concurrent, and items 16 and 17 were still written as open after being resolved
+in earlier work.
+
+---
+
+## 8. Restated facts (2026-09-10)
+
+The corpus held five `MVP / definition` values where the document states at
+most two definitions, and `Parbati B. / role` as both "PHP Intern" and
+"php intern". `value` is unique on the exact text, so anything short of a
+byte-identical repeat is a new fact as far as the database is concerned, and
+structured lookup returned all of them.
+
+**Reading the data first turned one problem into three**, each needing a
+different fix.
+
+### 1. Text that differs invisibly
+
+    Parbati B. / role         "PHP Intern"            "php intern"
+    Waterfall / suitable_for  "pre-defined projects"  "pre‑defined projects"
+
+The second pair differs by one character: U+002D HYPHEN-MINUS against U+2011
+NON-BREAKING HYPHEN. Not paraphrase at all — the same string, spelled two
+ways the database cannot see through.
+
+`value_norm` holds a case-folded, whitespace-collapsed form with Unicode
+punctuation classes mapped to ASCII, and `(entity, attribute, value_norm)` is
+unique — the duplicate is now unrepresentable rather than depending on every
+writer to normalize, the same shape as `uq_chunk_version_index` for chunks.
+NFKC alone is not enough: it folds U+2011 only as far as U+2010, which is
+still not the ASCII the rest of the corpus uses.
+
+Migration `e7b04d2c9a13` merged the existing pairs, **repointing provenance
+before deleting**. That ordering is not incidental: `value_provenance.value_id`
+is `ON DELETE CASCADE`, so deleting a duplicate would drop the record that a
+version asserted the fact, the survivor would then look unasserted, and
+`resolve_superseded_values` would mark a current fact superseded — a merge
+deleting an answer through a side effect two tables away.
+
+### 2. The model paraphrasing across overlapping windows
+
+    "... while it is not polished with final design and features"
+    "... while not polished with final design and features"
+
+`collapse_near_duplicates` folds these, keeping the longer telling. **The
+threshold was measured, not chosen.** Every pair in the corpus was scored:
+
+| Ratio | Pair | Verdict |
+|---:|---|---|
+| 0.980 | "while it is not polished" / "while not polished" | one fact |
+| 0.950 | "testing, validation, and refinement" / "testing, validation, refinement" | one fact |
+| 0.943 | "before full development" / "before full development phase" | one fact |
+| **0.92** | **threshold** | |
+| 0.905 | "linear and step-by-step" / "linear step-by-step" | one fact — *missed* |
+| 0.893 | `https://alpiniststudios.com/` / `.../about` | two URLs |
+| 0.706 | "0-8000" / "4,000 – 8,000" | two prices |
+| 0.703 | "Mobile App Development" / "Web Development" | two answers |
+
+Real duplicates and real distinctions overlap between 0.70 and 0.91, so the
+line goes above that band and accepts missing the 0.905 pair. Leaving a
+redundant row costs a little noise; merging two prices deletes an answer.
+
+The hard constraint throughout: `Agile / stage` holds six real stages and
+`Alpinist Studios / objective` six real objectives, and collapsing those would
+turn a correct answer into a lossy one. Both are pinned by tests.
+
+`multivalue` is now derived from what *survives* collapsing. Deriving it first
+would read two tellings of one definition as evidence that `definition` takes
+several values — the opposite of what they are evidence of.
+
+### 3. Windows cut mid-word
+
+The corpus contains the value **"smallest yet fun"**. That is "smallest yet
+fun|ctional version of the product ..." with a window boundary through the
+middle of "functional"; the model extracted the fragment as a complete fact
+and it was stored beside the real definition as a second, contradictory one.
+
+No similarity rule repairs this. The two strings diverge entirely after the
+cut, so they score *0.35* against each other — nothing marks them as
+restatements, and the missing half was never sent to the model. It had to be
+prevented at the split, so `_window_text` now ends windows on a sentence
+boundary, or failing that on whitespace, giving up at most 40% of a window's
+length before falling back to a hard cut (a table or a URL has no break to
+find, and a hard cut beats a window a third the intended size). The overlap is
+snapped forward to a word boundary too, which only ever shortens it, so no
+text is skipped.
+
+**Scope, honestly.** Collapsing is *within a document*, which is where
+overlapping windows create restatements. A new document restating what a
+different document already said is not folded — that would need a similarity
+search across the corpus on every write. Normalization-exact duplicates *are*
+caught globally, by the constraint.
+
+Live: migration merged 2 rows (777 → 775) with provenance intact; two
+documents re-ingested cleanly under the new windowing. 29 tests in
+`test_value_duplicates.py` and `test_extraction_batching.py`; suite 921 →
+**951 passing**.
 
 A reasonable check that it worked: re-ingest the 24 existing sources and
 expect a failure rate in the low single digits, with any remaining failures
 carrying a `failure_kind` that says something more useful than
 `persist_failed`.
+
+---
+
+## 9. Entity fragmentation (2026-09-10)
+
+`"offers flexibility"` appeared twice under `Agile / flexibility`, beneath a
+unique constraint that should have made that impossible. It was not violated:
+the constraint is `(entity_id, attribute_id, value)`, and there were **three
+Agiles**.
+
+```
+entity_type          facts  relations
+Methodology             39         12
+Process                 14          5
+Development Process      2          1
+```
+
+55 facts about one concept, split across three identities the database
+considered unrelated. Corpus-wide: of 538 entities, **62 names held more than
+one row**.
+
+### Why
+
+Three individually reasonable decisions that contradict each other.
+
+1. **Identity includes the type** — `uq_entity_type_name` is on
+   `(entity_type, name)`. Change the type, get a new entity.
+2. **The ontology only canonicalizes what it knows.**
+   `safe_canonicalize_entity_type` returns unknown types unchanged, so
+   `company`/`organization` collapse to `Company` while `Methodology` and
+   `Process` survive verbatim.
+3. **The extraction prompt invites invented types** — *"a CANONICALIZATION
+   GUIDE, not a whitelist… If NO canonical term fits, use a clear, concise,
+   descriptive type."*
+
+So the prompt asks for free-form types to protect recall, while identity is
+keyed on those same free-form types. Every invented type minted an entity.
+
+The error underneath: **`entity_type` is an attribute, not an identity
+discriminator.** "Python is a Programming Language" and "Python is a
+Technology" are both true, and neither makes it a different Python.
+
+### What it cost
+
+`structured_lookup` matches on type *and* name, falling back to name alone.
+Both paths were wrong: a type matching one variant returned 39 facts and
+silently missed 16 — a partial answer that looks complete — and the fallback
+unioned all three, producing the visible duplicates. The first is the worse
+one, because nothing signals the omission.
+
+### The evidence that decided the design
+
+All 62 groups were reviewed before any code was written. **Not one was a
+genuine homonym.** Every case was the same real-world thing seen through a
+different lens — supertype/subtype (`Technology` over `Library`, `Phase` over
+`SDLC Phase`) or facets (Instagram is a Company *and* a Platform *and* a
+Product). So identity moves to the name.
+
+The caveat that comes with it: a true homonym would now merge. In a
+single-company knowledge base that is a remote risk and a *visible* one — the
+facts contradict each other — where fragmentation was certain and silent.
+
+### Phase 1 — the write path
+
+`_resolve_entity` resolves by normalized name alone, oldest row wins, so the
+identity a document lands on no longer depends on which type the model emitted
+this time.
+
+### Phase 2 — merging what was already there
+
+`reconcile.build_entity_merge_groups` groups by normalized name. **Three
+choices, deliberately made independently** — letting one row win all three is
+what produced the bad outcomes when this was first measured:
+
+* **Which row survives** — most facts, so the merge repoints as little as
+  possible. Nothing user-visible depends on it.
+* **The display label** — the best-cased variant. The survivor is often the
+  lowercase row, and taking its name renamed `PyTorch` → `pytorch` and
+  `eBay` → `ebay`, in every answer.
+* **The type** — the rarest type in the corpus as a specificity proxy
+  (`Technology` spans 80 entities, `Programming Language` 2), **restricted to
+  types carrying a real share of the group's facts**. That restriction is not
+  decoration: without it, `Development Process` — rare precisely because the
+  model used it once — beat `Methodology`, which held 39 of Agile's facts.
+  `REVIEWED_ENTITY_TYPES` overrides the heuristic where a human already
+  decided (PostgreSQL is a `Database`, not a `Technology`).
+
+The old `PROPER_NOUN_MERGES` pass is gone: merging by name subsumes it, and
+what remains useful is its reviewed *type*, now keyed by normalized name so an
+entry cannot silently fail to match.
+
+### Two bugs, one found only by running it
+
+**Values that collide only after merging.** `_repoint_entity_merge` pre-deleted
+colliding values using the exact-text key, but uniqueness had moved to
+`value_norm` — so the collision was missed and the repointing `UPDATE` failed
+on the constraint. Merging is exactly what creates these: `"offers
+flexibility"` on `Methodology / Agile` and on `Process / Agile` only meet once
+the two entities are one.
+
+**Relabelling before deleting.** The survivor takes the group's chosen type and
+name — which a duplicate may still be holding. Merging the two `Design` rows
+relabels the `Phase` survivor to `SDLC Phase`, and the `SDLC Phase` duplicate
+still occupied it. The live run failed with
+`duplicate key value violates unique constraint "uq_entity_type_name"`. **No
+pure-planner test could have caught this**, which is why the repointing half
+now has its own tests against real rows; the regression test was checked by
+reverting the fix and confirming it fails.
+
+### Results
+
+| | before | after |
+|---|---:|---:|
+| entities | 538 | **469** |
+| fragmented names | 62 | **0** |
+| facts on `Agile` | 39 / 14 / 2 | **54 on one row** |
+| facts on `Python` | 15 / 14 | **26 on one row** |
+
+Values fell 832 → 822: the ten facts that were duplicates only because their
+entities were. Provenance, relations and chunk links all preserved. Labels came
+out right — `PyTorch`, `TensorFlow`, `eBay`, `PostgreSQL`, `Prototype` — and
+`PostgreSQL` took `Database` from the reviewed list.
+
+**Phase 1 verified separately:** the two documents that produced
+`Prototype / Low-fidelity prototype` and `Product / Low-fidelity Prototype` in
+a single run were re-ingested and produced **zero** new fragmentation.
+
+A backup of the affected tables was taken before the merge. 17 tests in
+`tests/ingestion/test_reconcile.py`; suite 951 → **969 passing**.
+
+### Not done
+
+The type label is still debatable for about ten groups — `pytorch` and
+`tensorflow` kept `Technology` because `Library` carried no facts and the
+support threshold ruled it out. That is the mirror of the `Development
+Process` failure, and tuning the threshold to catch one reintroduces the
+other. The label is descriptive metadata: it does not affect retrieval now
+that identity is name-based, and any label you disagree with is one `UPDATE`.
