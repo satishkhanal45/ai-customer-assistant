@@ -32,20 +32,26 @@
     apikeys: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="7.5" cy="15.5" r="3.5"/><path d="m10 13 8.5-8.5"/><path d="m16 7 2 2"/><path d="m19 4 2 2"/></svg>'
   };
 
-  /* `role: 'admin'` marks a page as administrative -- hidden from the
-     sidebar for everyone else, and refused by `render` if reached by URL.
-     The line is the one the backend draws between the two roles: uses the
-     system vs. changes the system. Prompt is on the admin side because
-     editing the agent's prompts changes how the system answers everyone.
+  /* `role` is the *minimum* tier a page needs, mirroring `auth/roles.py`.
+     Anything below it is hidden from the sidebar and refused by `render` if
+     reached by URL — though the guard that matters is the backend's; this
+     one only decides what to draw.
 
-     Only two roles exist, so `mayView` is a boolean rather than an
-     ordering. `auth/roles.py` is the authority; if a middle tier is ever
-     added this has to become a rank comparison rather than isAdmin(). */
+     The note that used to sit here said "only two roles exist, so `mayView`
+     is a boolean; if a middle tier is ever added this has to become a rank
+     comparison rather than isAdmin()". A tier was added — `visitor`, below
+     member — so it is one now.
+
+     Where the lines fall: a **visitor** is a stranger who signed themselves
+     up, so they get the conversation and nothing else. A **member** is a
+     colleague, so they get the pages that add to and inspect the corpus. An
+     **admin** gets the system's own controls, including Prompt, because
+     editing the agent's prompts changes how it answers everyone. */
   var LINKS = [
-    { key: 'overview', label: 'Overview', title: 'AI Customer Assistant — Overview' },
+    { key: 'overview', label: 'Overview', title: 'AI Customer Assistant — Overview', role: 'member' },
     { key: 'chat', label: 'Chat', title: 'AI Customer Assistant — Chat' },
-    { key: 'graph', label: 'Graph', title: 'AI Customer Assistant — Knowledge Graph' },
-    { key: 'ingest', label: 'Ingest', title: 'AI Customer Assistant — Ingest' },
+    { key: 'graph', label: 'Graph', title: 'AI Customer Assistant — Knowledge Graph', role: 'member' },
+    { key: 'ingest', label: 'Ingest', title: 'AI Customer Assistant — Ingest', role: 'member' },
     { key: 'prompt', label: 'Prompt', title: 'AI Customer Assistant — Agent Prompts', role: 'admin' },
     { key: 'admin', label: 'Admin', title: 'AI Customer Assistant — Admin', role: 'admin' },
     { key: 'apikeys', label: 'API Keys', title: 'AI Customer Assistant — API Keys', role: 'admin' }
@@ -58,9 +64,18 @@
     return null;
   }
 
+  /* Reachable without an account. One entry today, named rather than
+     hardcoded at the call site so adding a second is a visible decision --
+     the same reason the backend keeps an explicit public-route allowlist. */
+  var PUBLIC_PAGES = ['chat'];
+
+  function isPublic(key) {
+    return PUBLIC_PAGES.indexOf(key) !== -1;
+  }
+
   function mayView(key) {
     var link = linkFor(key);
-    return !link || !link.role || NS.session.isAdmin();
+    return !link || !link.role || NS.session.hasRole(link.role);
   }
 
   function afterLogin() {
@@ -101,7 +116,15 @@
     var key = parseHash();
     var signedIn = NS.session.isSignedIn();
 
-    if (!signedIn && key !== 'login') {
+    /* Chat is the front door, not a page behind a gate. A signed-out caller
+       asking for it gets it; one asking for a staff page is sent to sign in,
+       with where they were going remembered.
+
+       The distinction matters both ways. Bouncing an anonymous visitor to a
+       login form is the friction this flow exists to remove, and dropping
+       someone who deep-linked to `#/graph` into a chat window instead would
+       look like the app ignoring them. */
+    if (!signedIn && key !== 'login' && !isPublic(key)) {
       intended = key;
       NS.router.go('login');
       return;
@@ -119,13 +142,19 @@
 
     var page = NS.pages && NS.pages[key];
     if (!page) {
-      key = signedIn ? DEFAULT_PAGE : 'login';
+      key = DEFAULT_PAGE;
       page = NS.pages[key];
     }
 
     destroyCurrent();
     renderNav(key);
-    document.querySelector('.app').classList.toggle('signed-out', !signedIn);
+    var app = document.querySelector('.app');
+    app.classList.toggle('signed-out', !signedIn);
+    /* A visitor has one page, so the workspace chrome around it is furniture
+       with nothing to navigate. Stripping it is what turns "an internal tool
+       with the menu removed" into something that reads as a customer
+       assistant. Same mechanism the login page already uses. */
+    app.classList.toggle('visitor-mode', signedIn && !NS.session.hasRole('member'));
 
     var view = document.getElementById('view');
     currentEl = document.createElement('div');

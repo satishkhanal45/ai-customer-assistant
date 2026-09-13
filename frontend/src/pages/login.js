@@ -1,7 +1,9 @@
-/* Sign-in page.
+/* Sign-in page — for staff.
 
-   The only page reachable without a session, and the only one that collects
-   a password. Two things it deliberately does not do:
+   Reached from the quiet "Staff sign in" link in the header, not by being
+   bounced here: chat is the front door and a visitor never sees this page.
+   Accounts are created by an administrator; there is no self-signup, which
+   is why there is nothing on this form but a credential. Two things it deliberately does not do:
 
    * It does not tell the caller whether an address has an account. The
      server answers a wrong password and an unknown address identically, and
@@ -77,8 +79,9 @@
       '</aside>' +
 
       '<form class="login-form" id="loginForm" autocomplete="on" novalidate>' +
+
       '<h1 class="login-title">Sign in</h1>' +
-      '<p class="login-sub">Use the account your administrator created.</p>' +
+      '<p class="login-sub">For staff accounts. Visitors can use the assistant without signing in.</p>' +
 
       '<label class="login-label" for="loginEmail">Email</label>' +
       '<input class="login-input" id="loginEmail" type="email" name="email"' +
@@ -98,7 +101,7 @@
 
       '<div class="login-error" id="loginError" hidden></div>' +
       '<button class="btn btn-primary btn-full login-btn" id="loginSubmit" type="submit">Sign in</button>' +
-      '<p class="login-foot">No self-signup — accounts are created by an administrator.</p>' +
+      '<p class="login-foot"><a href="#/chat">Back to the assistant</a></p>' +
       '</form>' +
 
       '</div>' +
@@ -110,6 +113,9 @@
     var password = document.getElementById('loginPassword');
     var reveal = document.getElementById('loginReveal');
 
+    /* Listeners are tracked so `destroy` can remove them: the router tears
+       this page down on navigation, and a listener left behind on a node that
+       no longer exists is a leak per visit. */
     function on(node, event, fn) {
       node.addEventListener(event, fn);
       handlers.push([node, event, fn]);

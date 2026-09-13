@@ -11,6 +11,26 @@
   var forceParams = { charge: -80, linkDistance: 80, gravity: 0.5 };
   var enginesLoaded = { fg: false, three: false, fg3d: false };
   var roots = {};
+  /* What the canvas leaves out by default, and why.
+
+     Measured on this corpus: 479 entities, 507 relations, average degree
+     2.12. **116 entities (24%) have no relations at all** and 200 more (42%)
+     have exactly one -- so two thirds of the nodes are an unconnected cloud
+     or hair on a hub, and one node (Alpinist Studios, degree 78) carries 15%
+     of every edge. A force layout draws that faithfully and it is unreadable.
+
+     Neither of these hides information: the counts are shown, both are one
+     click away, and an isolated entity's facts were always reachable through
+     search. They change what the canvas leads with. */
+  var showIsolated = false;
+  var collapseLeaves = true;
+  //: A hub needs at least this many leaves before its hair is worth folding
+  //: away. Below it, collapsing costs a click and saves nothing.
+  var LEAF_FOLD_MIN = 3;
+  //: Types beyond this many are grouped into "Other" in the legend. 67 types,
+  //: 18 of them with a single member, is a list rather than a legend.
+  var LEGEND_TOP_N = 10;
+
   var radialMode = false;
   var rootNodeId = null;
   var depthLimit = 2; // default: show 2 hops around selected node
@@ -73,6 +93,7 @@
     roots.sidebar = sidePanel;
     sidePanel.innerHTML =
       '<section><h4>Entity Details</h4><div id="detail"><div class="hint">Click a node to inspect it.</div></div></section>' +
+      '<section><h4>View</h4><div id="viewOpts"></div></section>' +
       '<section><h4>Legend / Filters</h4><div id="legend"><div class="hint">Load a graph to see types.</div></div></section>' +
       '<section><h4>Stats</h4><div id="stats"><div class="hint">—</div></div></section>' +
       '<section><div class="hint">• Search a node to seed the graph.<br>• <b>Click</b> a node: details + expand.<br>• 2D: drag nodes, scroll zoom.<br>• 3D: drag orbit, scroll zoom.<br>• Path A/B → Find path.<br>• <b>e</b> export · <b>f</b> fit · <b>Esc</b> deselect.</div></section>';
@@ -205,10 +226,13 @@
     (nodes || []).forEach(function (n) {
       if (!n || !n.id || nodeTypes[n.id]) return;
       nodeTypes[n.id] = n.entity_type;
-      nodesArr.push({ id: n.id, name: n.label, entity_type: n.entity_type });
+      nodesArr.push({
+        id: n.id, name: n.label, entity_type: n.entity_type,
+        fact_count: n.fact_count || 0
+      });
       changed = true;
     });
-    if (changed) renderActive();
+    if (changed) { recomputeTopology(); renderActive(); }
   }
 
   function addEdges(edges) {
@@ -220,28 +244,86 @@
       linksArr.push({ id: e.id, source: e.source_entity_id, target: e.target_entity_id, label: e.relation_type });
       changed = true;
     });
-    if (changed) renderActive();
+    if (changed) { recomputeTopology(); renderActive(); }
+  }
+
+  /* Degree, and which leaf hangs off which hub.
+
+     Recomputed when the node or link set changes rather than on every lookup:
+     `visibleLinks` used to scan `nodesArr` twice per link to find its
+     endpoints, which on this graph is ~485,000 comparisons per render for an
+     answer that does not change between them. */
+  var topo = { degree: {}, leafHub: {}, hubLeaves: {}, byId: {} };
+
+  function recomputeTopology() {
+    var degree = {}, byId = {}, neighbour = {};
+    nodesArr.forEach(function (n) { byId[n.id] = n; degree[n.id] = 0; });
+    linksArr.forEach(function (l) {
+      var a = idOf(l.source), b = idOf(l.target);
+      degree[a] = (degree[a] || 0) + 1;
+      degree[b] = (degree[b] || 0) + 1;
+      neighbour[a] = b;
+      neighbour[b] = a;
+    });
+
+    /* A leaf is a node of degree 1; its hub is its only neighbour. Folded
+       only where a hub has several, so a two-node pair is left alone. */
+    var hubLeaves = {}, leafHub = {};
+    Object.keys(degree).forEach(function (id) {
+      if (degree[id] !== 1) return;
+      var hub = neighbour[id];
+      if (!hub || hub === id) return;
+      (hubLeaves[hub] = hubLeaves[hub] || []).push(id);
+    });
+    Object.keys(hubLeaves).forEach(function (hub) {
+      if (hubLeaves[hub].length < LEAF_FOLD_MIN) { delete hubLeaves[hub]; return; }
+      hubLeaves[hub].forEach(function (leaf) { leafHub[leaf] = hub; });
+    });
+
+    topo = { degree: degree, leafHub: leafHub, hubLeaves: hubLeaves, byId: byId };
+  }
+
+  /* force-graph rewrites `link.source`/`target` from an id to the node object
+     once it has laid out, so every read has to tolerate both. */
+  function idOf(end) { return (end && end.id) ? end.id : end; }
+
+  function isolatedCount() {
+    return Object.keys(topo.degree).filter(function (id) {
+      return topo.degree[id] === 0;
+    }).length;
+  }
+
+  function foldedCount() {
+    return Object.keys(topo.leafHub).length;
+  }
+
+  function nodeHidden(n) {
+    if (!n) return false;
+    if (hiddenTypes[n.entity_type]) return true;
+    if (!showIsolated && topo.degree[n.id] === 0) return true;
+    if (collapseLeaves && topo.leafHub[n.id]) return true;
+    return false;
   }
 
   function visibleNodes() {
-    return nodesArr.filter(function (n) { return !hiddenTypes[n.entity_type]; });
+    return nodesArr.filter(function (n) { return !nodeHidden(n); });
   }
 
   function visibleLinks() {
     return linksArr.filter(function (l) {
       if (hiddenRelations[l.label]) return false;
-      var a = nodesArr.filter(function (n) { return n.id === l.source; })[0];
-      var b = nodesArr.filter(function (n) { return n.id === l.target; })[0];
-      if (a && hiddenTypes[a.entity_type]) return false;
-      if (b && hiddenTypes[b.entity_type]) return false;
-      return true;
+      return !nodeHidden(topo.byId[idOf(l.source)]) &&
+             !nodeHidden(topo.byId[idOf(l.target)]);
     });
   }
 
   function updateHud() {
     var n = roots.hudNodes, l = roots.hudLinks, m = roots.hudMode;
-    if (n) n.textContent = nodesArr.length;
-    if (l) l.textContent = linksArr.length;
+    /* What is on screen, with what was loaded behind it. "NODES 163/479"
+       answers "is the canvas hiding things?" without opening a panel. */
+    var vn = visibleNodes().length, vl = visibleLinks().length;
+    if (n) n.textContent = vn === nodesArr.length ? vn : vn + '/' + nodesArr.length;
+    if (l) l.textContent = vl === linksArr.length ? vl : vl + '/' + linksArr.length;
     if (m) m.textContent = 'MODE ' + mode.toUpperCase();
   }
 
@@ -253,20 +335,51 @@
     var relCounts = {};
     linksArr.forEach(function (l) { relCounts[l.label] = (relCounts[l.label] || 0) + 1; });
 
+    /* Ranked by count and truncated. Extraction invents a type whenever none
+       of the canonical ones fit, so this corpus carries 67 of them and 18
+       have a single member -- an alphabetical list of all 67 is not a legend,
+       it is a directory. The tail stays reachable through the Stats panel,
+       which does list every one. */
+    var ranked = Object.keys(counts).sort(function (a, b) {
+      return counts[b] - counts[a] || a.localeCompare(b);
+    });
+    var shown = ranked.slice(0, LEGEND_TOP_N);
+    var rest = ranked.slice(LEGEND_TOP_N);
+
     var html = '<div class="legend-group"><b>Types</b></div>';
-    Object.keys(counts).sort().forEach(function (t) {
+    shown.forEach(function (t) {
       var hidden = !!hiddenTypes[t];
       html += '<div class="legend-row type-toggle" data-type="' + NS.utils.esc(t) + '" title="' + (hidden ? 'Click to show' : 'Click to hide') + '">' +
         '<span class="dot" style="color:' + colorFor(t) + ';background:' + colorFor(t) + '"></span>' +
         '<span' + (hidden ? ' style="opacity:.35;text-decoration:line-through"' : '') + '>' + NS.utils.esc(t) + ' · ' + counts[t] + '</span></div>';
     });
+    if (rest.length) {
+      var restTotal = rest.reduce(function (sum, t) { return sum + counts[t]; }, 0);
+      html += '<div class="legend-row legend-rest" title="' + NS.utils.esc(rest.join(', ')) + '">' +
+        '<span class="dot" style="background:var(--text-faint)"></span>' +
+        '<span>' + rest.length + ' more types · ' + restTotal + '</span></div>';
+    }
+    /* Relation types get the same treatment, and need it just as badly:
+       extraction names a relation as freely as it names a type. */
+    var rankedRels = Object.keys(relCounts).sort(function (a, b) {
+      return relCounts[b] - relCounts[a] || a.localeCompare(b);
+    });
+    var shownRels = rankedRels.slice(0, LEGEND_TOP_N);
+    var restRels = rankedRels.slice(LEGEND_TOP_N);
+
     html += '<div class="legend-group"><b>Relations</b></div>';
-    Object.keys(relCounts).sort().forEach(function (r) {
+    shownRels.forEach(function (r) {
       var hidden = !!hiddenRelations[r];
       html += '<div class="legend-row rel-toggle" data-rel="' + NS.utils.esc(r) + '" title="Click to ' + (hidden ? 'show' : 'hide') + '">' +
         '<span class="edge-line"' + (hidden ? ' style="opacity:.25"' : '') + '></span>' +
         '<span' + (hidden ? ' style="opacity:.35;text-decoration:line-through"' : '') + '>' + NS.utils.esc(r) + ' · ' + relCounts[r] + '</span></div>';
     });
+    if (restRels.length) {
+      var relRest = restRels.reduce(function (sum, r) { return sum + relCounts[r]; }, 0);
+      html += '<div class="legend-row legend-rest" title="' + NS.utils.esc(restRels.join(', ')) + '">' +
+        '<span class="edge-line"></span>' +
+        '<span>' + restRels.length + ' more relations · ' + relRest + '</span></div>';
+    }
     if (!Object.keys(counts).length) html = '<div class="hint">Load a graph to see types.</div>';
     leg.innerHTML = html;
 
@@ -285,6 +398,39 @@
         if (!hiddenRelations[r]) delete hiddenRelations[r];
         renderActive(); updateLegend();
       });
+    });
+  }
+
+  /* The two defaults, with their counts and a way to undo them.
+
+     A view that silently drops a quarter of the graph is lying; one that says
+     "116 unconnected · show" is summarising. The counts double as a read on
+     the corpus itself -- a large folded number means extraction produced
+     leaves rather than structure, which is a problem in `ingestion`, not
+     here. */
+  function updateViewOptions() {
+    var host = roots.viewOpts;
+    if (!host) return;
+    var isolated = isolatedCount(), folded = foldedCount();
+    if (!nodesArr.length) { host.innerHTML = '<div class="hint">—</div>'; return; }
+
+    host.innerHTML =
+      '<label class="view-opt"><input type="checkbox" id="optIsolated"' +
+      (showIsolated ? ' checked' : '') + '>' +
+      '<span>Unconnected entities <b>' + isolated + '</b></span></label>' +
+      '<label class="view-opt"><input type="checkbox" id="optCollapse"' +
+      (collapseLeaves ? ' checked' : '') + '>' +
+      '<span>Fold single-link neighbours <b>' + folded + '</b></span></label>' +
+      '<div class="hint" style="margin-top:6px">Node size shows how many facts ' +
+      'an entity carries.</div>';
+
+    var iso = document.getElementById('optIsolated');
+    var col = document.getElementById('optCollapse');
+    if (iso) iso.addEventListener('change', function () {
+      showIsolated = iso.checked; renderActive(); updateViewOptions();
+    });
+    if (col) col.addEventListener('change', function () {
+      collapseLeaves = col.checked; renderActive(); updateViewOptions();
     });
   }
 
@@ -314,6 +460,7 @@
     roots.hudLinks = document.getElementById('hudLinks');
     roots.hudMode = document.getElementById('hudMode');
     roots.legend = document.getElementById('legend');
+    roots.viewOpts = document.getElementById('viewOpts');
     roots.stats = document.getElementById('stats');
     roots.detail = document.getElementById('detail');
   }
@@ -327,7 +474,7 @@
     var filtered = filterByDepth(visible, links);
     if (mode === '2d') { create2D(); if (g2) g2.graphData({ nodes: filtered.nodes, links: filtered.links }); }
     else { create3D(); if (g3) g3.graphData({ nodes: filtered.nodes, links: filtered.links }); }
-    updateHud(); updateLegend();
+    updateHud(); updateLegend(); updateViewOptions();
   }
 
   function create2D() {
@@ -357,10 +504,29 @@
     }
   }
 
+  /* Radius by how much the entity knows, not uniformly.
+
+     226 of 479 entities in this corpus are connected but hold no facts at
+     all, so a canvas of identical dots makes half of them look worth a click
+     they do not repay. Square-rooted because the counts are long-tailed --
+     linear scaling would make one entity enormous and flatten the rest -- and
+     clamped so an empty node is still comfortably clickable. */
+  function radiusOf(node) {
+    var facts = Number(node.fact_count) || 0;
+    if (!(facts > 0)) return 5;
+    return Math.min(14, 5 + Math.sqrt(facts) * 1.6);
+  }
+
   function drawNode2D(node, ctx, gs) {
-    var r = 6.5;
-    var c = nodeColorOf(node);
     var cx = node.x, cy = node.y;
+    /* force-graph paints a node before the simulation has placed it, so on
+       the first frame after a graph is seeded the coordinates are undefined.
+       `createRadialGradient` throws on a non-finite argument, and one throw
+       inside the render loop takes the whole canvas down -- so skip the frame
+       instead. The next tick has real coordinates. */
+    if (!isFinite(cx) || !isFinite(cy)) return;
+    var r = radiusOf(node);
+    var c = nodeColorOf(node);
     var grad = ctx.createRadialGradient(cx, cy, r * 0.3, cx, cy, r * 3);
     grad.addColorStop(0, rgba(c, 0.55));
     grad.addColorStop(1, 'rgba(0,0,0,0)');
@@ -376,6 +542,26 @@
     ctx.shadowColor = c; ctx.shadowBlur = 6 / gs;
     ctx.fillText(node.name, cx, cy + r + 4 / gs);
     ctx.shadowBlur = 0;
+
+    /* What was folded away, said out loud. A hub that quietly drops 43
+       neighbours is hiding data; one that says "+43" is summarising it. */
+    var folded = collapseLeaves && topo.hubLeaves[node.id];
+    if (folded && folded.length) {
+      var badge = '+' + folded.length;
+      var bs = Math.max(8, 9.5 / gs);
+      ctx.font = '700 ' + bs + 'px Inter, sans-serif';
+      var bw = ctx.measureText(badge).width + 7 / gs;
+      var bh = bs + 5 / gs;
+      var bx = cx + r * 0.75, by = cy - r - bh * 0.6;
+      ctx.fillStyle = c;
+      ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(bx, by, bw, bh, bh / 2);
+      else ctx.rect(bx, by, bw, bh);
+      ctx.fill();
+      ctx.fillStyle = '#fff';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(badge, bx + bw / 2, by + bh / 2);
+    }
   }
 
   function applyForce() {
@@ -605,7 +791,7 @@
     if (g2) g2.graphData({ nodes: [], links: [] });
     if (g3) g3.graphData({ nodes: [], links: [] });
     var d = roots.detail; if (d) d.innerHTML = '<div class="hint">Click a node to inspect it.</div>';
-    updateLegend(); updateStats(); updateHud();
+    updateLegend(); updateStats(); updateHud(); updateViewOptions();
     flash('Cleared.');
   }
 

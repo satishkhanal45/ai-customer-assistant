@@ -77,6 +77,65 @@
     return NS.utils.formatDate(ts);
   }
 
+  /* A visitor is a stranger who signed themselves up — a prospective client
+     asking what you charge, not a colleague. They have one page, so the
+     conversation *is* the product.
+
+     Only the chrome differs. `roots` is what every other function here talks
+     to, so setting up the same four refs means sending, rendering, retrying,
+     the ticket interrupt flow and localStorage persistence all work unchanged
+     — and `renderThreadList` already no-ops when `roots.threadList` is
+     absent, which is what lets the thread sidebar simply not exist. */
+  function initVisitor(container) {
+    container.innerHTML = '';
+    container.style.padding = '0';
+
+    var shell = NS.utils.el('div', { class: 'visitor-shell' });
+    container.appendChild(shell);
+
+    var head = NS.utils.el('div', { class: 'visitor-head' });
+    head.innerHTML =
+      '<div class="visitor-mark">' +
+      '<svg viewBox="0 0 24 24" fill="none"><circle cx="6" cy="6" r="2.3" fill="currentColor"/><circle cx="18" cy="7" r="2.3" fill="currentColor"/><circle cx="12" cy="18" r="2.3" fill="currentColor"/><path d="M7.8 7.2 10.2 16 M16.2 8.2 13 16.3 M8.2 6 16 6.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" opacity=".85"/></svg>' +
+      '</div>' +
+      '<div class="visitor-head-text">' +
+      '<strong id="chatHeadTitle">Alpinist Studios</strong>' +
+      '<span>Ask about our services, process or pricing</span>' +
+      '</div>' +
+      '<span class="visitor-status"><i></i>Online</span>';
+    shell.appendChild(head);
+
+    roots.messages = NS.utils.el('div', { class: 'chat-messages visitor-messages' });
+    shell.appendChild(roots.messages);
+
+    var inputBar = NS.utils.el('div', { class: 'chat-input-bar visitor-input-bar' });
+    var input = NS.utils.el('input');
+    input.placeholder = 'Ask a question…';
+    input.setAttribute('autocomplete', 'off');
+    var send = NS.utils.el('button', { class: 'send-btn', title: 'Send' },
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/></svg>');
+    send.addEventListener('click', sendMessage);
+    input.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); sendMessage(); } });
+    inputBar.appendChild(input);
+    inputBar.appendChild(send);
+    shell.appendChild(inputBar);
+
+    shell.appendChild(NS.utils.el('div', { class: 'visitor-foot' },
+      'Answers come from our published documentation and can be imperfect. ' +
+      'Ask to open a support ticket and a person will follow up.'));
+
+    roots.input = input;
+    roots.sendBtn = send;
+    /* Deliberately not the head element: a visitor has one conversation, and
+       retitling the header to their first question would turn the company
+       name into "what do you charge f…". */
+    roots.headTitle = null;
+  }
+
+  function isVisitor() {
+    return !(NS.session && NS.session.hasRole && NS.session.hasRole('member'));
+  }
+
   function init(container) {
     load();
     var current = null;
@@ -84,7 +143,7 @@
     if (!current && threads.length) current = threads[0];
     if (!current) current = newThread();
     activeId = current.id;
-    renderShell(container);
+    if (isVisitor()) initVisitor(container); else renderShell(container);
     renderThreadList();
     renderMessages();
     focusComposer();
@@ -183,13 +242,17 @@
     if (!t || !t.messages.length) {
       area.appendChild(NS.utils.el('div', { class: 'welcome' },
         '<div class="welcome-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>' +
-        '<div class="welcome-title">How can I help you?</div>' +
-        '<div class="hint">Ask about our knowledge base, or say "create a ticket" to open a support request.</div>' +
-        '<div class="welcome-prompts">' +
-        '<button class="btn btn-ghost" data-p="What support plans do you offer?">What support plans do you offer?</button>' +
-        '<button class="btn btn-ghost" data-p="How do I request a refund?">How do I request a refund?</button>' +
-        '<button class="btn btn-ghost" data-p="Create a ticket">Create a ticket</button>' +
-        '</div>'));
+        '<div class="welcome-title">' + (isVisitor() ? 'How can we help?' : 'How can I help you?') + '</div>' +
+        '<div class="hint">' + (isVisitor()
+          ? 'Ask about our services, process or pricing — or ask to open a support ticket.'
+          : 'Ask about our knowledge base, or say "create a ticket" to open a support request.') + '</div>' +
+        /* A visitor arrives without knowing what this thing knows, so the
+           openers double as a statement of scope. They are the questions the
+           corpus actually answers well. */
+        '<div class="welcome-prompts">' + suggestions().map(function (q) {
+          return '<button class="btn btn-ghost" data-p="' + NS.utils.esc(q) + '">' +
+            NS.utils.esc(q) + '</button>';
+        }).join('') + '</div>'));
       var prompBtns = area.querySelectorAll('.welcome-prompts button');
       Array.prototype.forEach.call(prompBtns, function (b) {
         b.addEventListener('click', function () { roots.input.value = b.getAttribute('data-p'); sendMessage(); });
@@ -200,6 +263,42 @@
       area.appendChild(buildMessage(m));
     });
     area.scrollTop = area.scrollHeight;
+  }
+
+  /* Source names are internal artefacts: upload filenames and crawled URLs.
+     A visitor was being shown `compnay_vision.pdf` — internal, and with the
+     typo intact — as the authority behind an answer. This does not hide
+     anything (the same documents are what produced the answer either way); it
+     stops the citation reading like a leaked directory listing.
+
+     A URL becomes its page slug; a filename loses its extension and its
+     separators. Anything unrecognisable falls through unchanged rather than
+     being replaced by something vague, because a wrong-but-specific citation
+     is easier to report than a confident "our documentation". */
+  function friendlySource(name) {
+    var text = String(name || '').trim();
+    if (!text) return text;
+
+    if (/^https?:\/\//i.test(text)) {
+      var path = text.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+      var last = path.split('/').pop();
+      text = last && last.indexOf('.') === -1 ? last : path.split('/')[0];
+    }
+    text = text.replace(/\.(pdf|docx?|md|txt|html?)$/i, '');
+    text = text.replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!text) return String(name);
+    return text.charAt(0).toUpperCase() + text.slice(1);
+  }
+
+  function suggestions() {
+    return isVisitor()
+      ? ['What services do you offer?',
+         'How much does an MVP cost?',
+         'How do you run a project?',
+         'I want to talk to someone']
+      : ['What support plans do you offer?',
+         'How do I request a refund?',
+         'Create a ticket'];
   }
 
   function buildMessage(m) {
@@ -220,16 +319,29 @@
     } else {
       var html = '<div class="msg-bubble">' + renderAssistant(m.content) + '</div>';
       if (m.citations && m.citations.length) {
+        var visitor = isVisitor();
         var cites = m.citations.map(function (c) {
           var parts = [];
-          if (c.source_name) parts.push('<b>' + NS.utils.esc(c.source_name) + '</b>');
+          if (c.source_name) {
+            parts.push('<b>' + NS.utils.esc(
+              visitor ? friendlySource(c.source_name) : c.source_name) + '</b>');
+          }
           if (c.page != null) parts.push('p.' + NS.utils.esc(String(c.page)));
-          if (c.version_number != null) parts.push('v' + NS.utils.esc(String(c.version_number)));
+          /* Version numbers are corpus bookkeeping. They tell a curator which
+             ingestion produced a passage and tell a prospective client
+             nothing. */
+          if (!visitor && c.version_number != null) {
+            parts.push('v' + NS.utils.esc(String(c.version_number)));
+          }
           return '<div class="citation">' + parts.join(' · ') + '</div>';
         }).join('');
-        html += '<div class="citations">' + cites + '</div>';
+        html += '<div class="citations' + (visitor ? ' citations-visitor' : '') + '">' +
+          (visitor ? '<div class="citations-label">Sources</div>' : '') + cites + '</div>';
       }
-      if (m.traceId) {
+      /* Internal correlation id. Useful to whoever is debugging a bad
+         answer, meaningless to a prospective client, and it reads as
+         something leaking. */
+      if (m.traceId && !isVisitor()) {
         html += '<div class="debug"><span class="trace" title="trace_id">' + NS.utils.esc(m.traceId) + '</span></div>';
       }
       html += '<div class="msg-actions">' +
@@ -257,15 +369,37 @@
     );
   }
 
+  /* Inline markup, applied to already-escaped text.
+     `linkify` escapes first, so every tag introduced below is one this
+     function wrote -- never one the model emitted. That ordering is the whole
+     safety property: escape, then add markup, never the reverse. */
+  function inlineMarkup(text) {
+    return linkify(text)
+      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>')
+      .replace(/`([^`]+)`/g, '<code>$1</code>');
+  }
+
   function renderAssistant(content) {
     var lines = String(content || '').split(/\n/);
     var html = lines.map(function (line) {
       var t = line.trim();
       if (t === '') return '';
-      if (/^(#{1,3})\s/.test(t)) return '<div class="md-h">' + t.replace(/^#{1,3}\s/, '') + '</div>';
-      if (/^\s*[-*]\s/.test(t)) return '<div class="md-li">• ' + t.replace(/^\s*[-*]\s/, '') + '</div>';
-      if (/^\s*\d+[.)]\s/.test(t)) return '<div class="md-li">' + t + '</div>';
-      return '<p>' + linkify(t) + '</p>';
+      /* Every branch goes through `inlineMarkup`, which escapes.
+         Two of them used to interpolate the model's line *raw*: a heading or
+         a list item containing HTML was written straight into innerHTML. The
+         model's output is derived from ingested documents, so that was a path
+         from "someone uploads a document" to "script runs in another user's
+         browser" -- and it matters more now that the reader may be a visitor
+         rather than the colleague who did the uploading. */
+      if (/^(#{1,3})\s/.test(t)) {
+        return '<div class="md-h">' + inlineMarkup(t.replace(/^#{1,3}\s/, '')) + '</div>';
+      }
+      if (/^\s*[-*]\s/.test(t)) {
+        return '<div class="md-li">• ' + inlineMarkup(t.replace(/^\s*[-*]\s/, '')) + '</div>';
+      }
+      if (/^\s*\d+[.)]\s/.test(t)) return '<div class="md-li">' + inlineMarkup(t) + '</div>';
+      return '<p>' + inlineMarkup(t) + '</p>';
     }).join('');
     return html || '<p>' + NS.utils.esc(content || '') + '</p>';
   }

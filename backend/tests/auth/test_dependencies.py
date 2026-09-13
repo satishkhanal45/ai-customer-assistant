@@ -132,4 +132,23 @@ class TestRoles:
             roles.satisfies("superuser", roles.MEMBER)
 
     def test_the_ordering_is_ascending(self):
-        assert roles.ALL_ROLES == (roles.MEMBER, roles.ADMIN)
+        assert roles.ALL_ROLES == (roles.VISITOR, roles.MEMBER, roles.ADMIN)
+
+    def test_a_visitor_does_not_satisfy_member(self):
+        """The whole reason `visitor` was added *below* `member` rather than
+        renaming it: every existing `require_member` guard — ingestion,
+        crawling, the graph API — started excluding visitors without being
+        edited, because `satisfies` is a rank comparison."""
+        assert roles.satisfies(roles.VISITOR, roles.MEMBER) is False
+        assert roles.satisfies(roles.VISITOR, roles.ADMIN) is False
+        assert roles.satisfies(roles.VISITOR, roles.VISITOR) is True
+
+    def test_every_role_above_visitor_can_chat(self):
+        for role in roles.ALL_ROLES:
+            assert roles.satisfies(role, roles.VISITOR) is True
+
+    def test_the_ranks_leave_room_between_tiers(self):
+        """Spaced so a further tier can be inserted between any two without
+        renumbering — which is what made this change cheap."""
+        ranks = [roles.rank(r) for r in roles.ALL_ROLES]
+        assert all(b - a > 1 for a, b in zip(ranks, ranks[1:]))

@@ -36,6 +36,15 @@ PUBLIC_ROUTES = frozenset(
         ("POST", "/auth/login"),
         ("POST", "/auth/refresh"),
         ("POST", "/auth/logout"),
+        # Chat is the public front door. A prospective client asking what the
+        # company charges should not have to register first, and an account
+        # anyone can create in ten seconds was never access control -- it was
+        # friction pretending to be a gate. What replaces the gate is
+        # `enforce_chat_quota`: per-caller limits keyed on the address when
+        # there is no account, plus a global daily ceiling, because chat is
+        # the one public endpoint that spends money per request.
+        ("POST", "/chat"),
+        ("POST", "/chat/stream"),
     }
 )
 
@@ -167,9 +176,20 @@ async def test_every_route_is_public_by_declaration_or_refuses_anonymous(app):
 
 def test_the_public_allowlist_stays_small(app):
     """Every entry here is a route anyone on the internet can reach, so the
-    list is worth being hard to grow by accident."""
-    assert len(PUBLIC_ROUTES) == 4
-    assert all(path.startswith(("/health", "/auth/")) for _, path in PUBLIC_ROUTES)
+    list is worth being hard to grow by accident.
+
+    It went four -> five (signup) -> six on 2026-09-13, when chat became the
+    public front door and signup was removed as no longer having a purpose.
+    The count is hardcoded rather than derived precisely so that growing it is
+    a decision someone has to write down, and this is the note: `/chat` and
+    `/chat/stream` are public because nobody should need an account to ask a
+    company a question, and they are affordable because `enforce_chat_quota`
+    bounds both the caller and the deployment's total daily spend.
+    """
+    assert len(PUBLIC_ROUTES) == 6
+    assert all(
+        path.startswith(("/health", "/auth/", "/chat")) for _, path in PUBLIC_ROUTES
+    )
 
 
 def test_public_routes_actually_exist(app):
@@ -187,3 +207,90 @@ async def test_health_is_reachable_without_a_credential(app):
     ) as client:
         response = await client.get("/health")
     assert response.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# What a visitor may reach (2026-09-13).
+#
+# `visitor` was added below `member` so that self-service signup grants
+# something safe to give a stranger. The permission boundary is not written
+# in any endpoint — it falls out of `roles.satisfies` being a rank
+# comparison, which means no guard was edited to create it. That is exactly
+# why it needs a test: a boundary nobody typed is a boundary nobody reviewed.
+# ---------------------------------------------------------------------------
+
+VISITOR_MAY_REACH = {
+    # Their own identity. The frontend calls this on every page load to decide
+    # whether it is showing a signed-in shell, so refusing it would leave a
+    # visitor unable to tell they are signed in. Chat is not listed because it
+    # is public now -- PUBLIC_ROUTES covers it.
+    ("GET", "/auth/me"),
+}
+
+
+async def test_a_visitor_is_refused_everywhere_except_chat(app, make_user):
+    """Uploading, crawling and the graph API all still say `require_member`.
+    None of them changed; the rank did."""
+    from auth import roles, tokens
+    from httpx import ASGITransport, AsyncClient
+
+    visitor = await make_user(role=roles.VISITOR)
+    token, _ = tokens.issue_access_token(visitor.id, visitor.role)
+    headers = {"Authorization": f"Bearer {token}", "content-type": "application/json"}
+
+    reachable = []
+    # `raise_app_exceptions=False` because this asserts on the *guard*, not the
+    # handler: the test app has no chat service wired, so a route a visitor is
+    # allowed through reaches a handler that raises. A 500 still means "not
+    # refused", which is what is being measured.
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://t") as client:
+        for method, path in _routes(app):
+            if (method, path) in PUBLIC_ROUTES or (method, path) in VISITOR_MAY_REACH:
+                continue
+            response = await client.request(method, _concrete(path), json={}, headers=headers)
+            if response.status_code != 403:
+                reachable.append((method, path, response.status_code))
+
+    assert not reachable, (
+        "A visitor is a stranger who signed themselves up. These routes did "
+        f"not refuse one: {reachable}"
+    )
+
+
+async def test_a_visitor_can_still_use_chat(app, make_user):
+    """The other half: locking visitors out of everything would be easy and
+    useless. Chat is the product for them."""
+    from auth import roles, tokens
+    from httpx import ASGITransport, AsyncClient
+
+    visitor = await make_user(role=roles.VISITOR)
+    token, _ = tokens.issue_access_token(visitor.id, visitor.role)
+
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://t") as client:
+        response = await client.post(
+            "/chat",
+            json={"thread_id": "t", "message": "hello"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert response.status_code != 403
+
+
+def test_the_database_knows_every_role_the_code_does():
+    """The allowed values live in two places — `auth.roles._RANK` and a CHECK
+    constraint. They were out of step by construction until now: the
+    constraint existed only inside a migration, so the SQLite test database
+    had none at all and a role Postgres would reject inserted happily here.
+    """
+    from auth import roles
+    from db.models import AppUser
+
+    check = next(
+        c for c in AppUser.__table__.constraints
+        if getattr(c, "name", None) == "ck_app_user_role"
+    )
+    allowed = str(check.sqltext)
+    for role in roles.ALL_ROLES:
+        assert f"'{role}'" in allowed, f"{role!r} is in the code but not the constraint"

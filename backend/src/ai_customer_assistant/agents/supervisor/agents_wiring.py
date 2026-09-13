@@ -28,7 +28,14 @@ from langgraph.types import interrupt
 from timeouts import KNOWLEDGE_NODE_TIMEOUT_S
 
 from ..contracts import ConversationTurn
-from .routing import _SAFE_FALLBACK_RESPONSE, failure_reason, failure_response
+from rate_limit_signal import saw_rate_limit, turn_scope
+
+from .routing import (
+    _BUSY_RESPONSE,
+    _SAFE_FALLBACK_RESPONSE,
+    failure_reason,
+    failure_response,
+)
 from .schema import SupervisorState
 
 logger = logging.getLogger(__name__)
@@ -69,18 +76,32 @@ def make_knowledge_agent_node(
                 state.get("conversation_history", [])
             ),
         }
+        with turn_scope():
+            return await _run_knowledge_graph(
+                knowledge_graph, knowledge_input, timeout_s
+            )
+
+    async def _run_knowledge_graph(graph, knowledge_input, timeout_s):
         try:
             result = await asyncio.wait_for(
-                knowledge_graph.ainvoke(knowledge_input),
+                graph.ainvoke(knowledge_input),
                 timeout=timeout_s,
             )
         except asyncio.TimeoutError:
             # Not silent: a node that runs out of budget is the single most
             # useful thing to see in a latency investigation.
+            # A throttled turn and a slow one both land here. Only the
+            # provider knows which, so it leaves a note rather than the node
+            # guessing -- and without it a rate limit is reported as an
+            # unknown failure, which is what sent someone debugging this.
+            throttled = saw_rate_limit()
             logger.warning(
-                "knowledge agent exceeded its %.0fs budget and was cancelled",
+                "knowledge agent exceeded its %.0fs budget and was cancelled%s",
                 timeout_s,
+                " (provider was rate limiting)" if throttled else "",
             )
+            if throttled:
+                return _error_result("rate_limited", response=_BUSY_RESPONSE)
             return _error_result("timeout")
         except Exception as exc:  # noqa: BLE001 - the turn degrades rather
             # than failing, but the cause has to reach the log. Previously

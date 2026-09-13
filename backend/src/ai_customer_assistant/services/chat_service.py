@@ -53,6 +53,8 @@ from agents.supervisor.routing import (
 from agents.ticket_agent.store import TicketStore, send_ticket_email
 from db.checkpointer import build_checkpointer
 from services.embeddings import SharedEmbeddings
+from agents.supervisor.routing import _BUSY_RESPONSE
+from rate_limit_signal import saw_rate_limit, turn_scope
 from timeouts import TURN_BUDGET_S
 
 logger = logging.getLogger(__name__)
@@ -217,20 +219,28 @@ class ChatService:
         working too, instead of continuing on a reply that cannot be
         delivered.
         """
-        try:
-            return await asyncio.wait_for(
-                self._run_turn(thread_id, user_message, trace_id=trace_id),
-                timeout=TURN_BUDGET_S,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "chat turn exceeded its %.0fs budget and was cancelled "
-                "(thread_id=%s, trace_id=%s)",
-                TURN_BUDGET_S,
-                thread_id,
-                trace_id,
-            )
-            return _TURN_TIMEOUT_RESPONSE, []
+        with turn_scope():
+            try:
+                return await asyncio.wait_for(
+                    self._run_turn(thread_id, user_message, trace_id=trace_id),
+                    timeout=TURN_BUDGET_S,
+                )
+            except asyncio.TimeoutError:
+                throttled = saw_rate_limit()
+                logger.warning(
+                    "chat turn exceeded its %.0fs budget and was cancelled "
+                    "(thread_id=%s, trace_id=%s)%s",
+                    TURN_BUDGET_S,
+                    thread_id,
+                    trace_id,
+                    " (provider was rate limiting)" if throttled else "",
+                )
+                # Saying "something went wrong" for a turn the provider
+                # throttled sends whoever reads it looking for a bug that is
+                # not there.
+                return (
+                    _BUSY_RESPONSE if throttled else _TURN_TIMEOUT_RESPONSE
+                ), []
 
     async def _run_turn(
         self,
@@ -372,20 +382,27 @@ class ChatService:
 
         async def produce() -> None:
             try:
-                await asyncio.wait_for(
-                    self._drive_turn(thread_id, user_message, trace_id, queue),
-                    timeout=TURN_BUDGET_S,
-                )
+                with turn_scope():
+                    await asyncio.wait_for(
+                        self._drive_turn(thread_id, user_message, trace_id, queue),
+                        timeout=TURN_BUDGET_S,
+                    )
             except asyncio.TimeoutError:
+                throttled = saw_rate_limit()
                 logger.warning(
                     "streamed chat turn exceeded its %.0fs budget and was "
-                    "cancelled (thread_id=%s, trace_id=%s)",
+                    "cancelled (thread_id=%s, trace_id=%s)%s",
                     TURN_BUDGET_S,
                     thread_id,
                     trace_id,
+                    " (provider was rate limiting)" if throttled else "",
                 )
                 await queue.put(
-                    {"type": "error", "reply": _TURN_TIMEOUT_RESPONSE, "reason": "timeout"}
+                    {
+                        "type": "error",
+                        "reply": _BUSY_RESPONSE if throttled else _TURN_TIMEOUT_RESPONSE,
+                        "reason": "rate_limited" if throttled else "timeout",
+                    }
                 )
             except Exception as exc:  # noqa: BLE001 - reported, never swallowed
                 logger.warning(

@@ -206,3 +206,92 @@ class TestErrorResultShape:
         assert result["status"] == "ERROR"
         assert result["error"] == "rate_limited"
         assert result["response"] == _BUSY_RESPONSE
+
+
+# ---------------------------------------------------------------------------
+# A throttled turn must not be reported as an unknown failure.
+#
+# A free Groq tier allows 8,000 tokens a minute; one chat turn measured 6,871.
+# The second question inside a minute was therefore always throttled, and the
+# provider's retries always outlived the node's wall-clock budget — so the
+# customer got "something went wrong on my end" for a condition that was
+# neither wrong nor on our end, and someone went looking for a bug.
+# ---------------------------------------------------------------------------
+
+import asyncio as _asyncio
+
+import pytest as _pytest
+
+from rate_limit_signal import note_rate_limited, saw_rate_limit, turn_scope
+from agents.supervisor.agents_wiring import make_knowledge_agent_node
+from agents.supervisor.routing import _BUSY_RESPONSE, _SAFE_FALLBACK_RESPONSE
+
+
+class _ThrottledThenSlowGraph:
+    """A provider that is being rate limited and never finishes in time."""
+
+    def __init__(self, *, throttled: bool):
+        self.throttled = throttled
+
+    async def ainvoke(self, _state):
+        if self.throttled:
+            note_rate_limited()
+        await _asyncio.sleep(5)          # outlives the node budget below
+        raise AssertionError("should have been cancelled")
+
+
+@_pytest.mark.asyncio
+async def test_a_timeout_while_throttled_is_reported_as_busy():
+    node = make_knowledge_agent_node(
+        _ThrottledThenSlowGraph(throttled=True), timeout_s=0.05
+    )
+
+    result = await node({"user_message": "hello", "conversation_history": []})
+
+    assert result["downstream_result"]["error"] == "rate_limited"
+    assert result["downstream_result"]["response"] == _BUSY_RESPONSE
+
+
+@_pytest.mark.asyncio
+async def test_a_timeout_with_no_throttling_still_reports_a_timeout():
+    """The distinction has to stay: a genuinely slow turn is not a rate
+    limit, and calling it one would hide a real performance problem."""
+    node = make_knowledge_agent_node(
+        _ThrottledThenSlowGraph(throttled=False), timeout_s=0.05
+    )
+
+    result = await node({"user_message": "hello", "conversation_history": []})
+
+    assert result["downstream_result"]["error"] == "timeout"
+    assert result["downstream_result"]["response"] == _SAFE_FALLBACK_RESPONSE
+
+
+@_pytest.mark.asyncio
+async def test_the_signal_does_not_leak_between_turns():
+    """Each turn observes only its own throttling; a ContextVar scoped per
+    turn is what stops one rate-limited question making the next one lie."""
+    throttled = make_knowledge_agent_node(
+        _ThrottledThenSlowGraph(throttled=True), timeout_s=0.05
+    )
+    clean = make_knowledge_agent_node(
+        _ThrottledThenSlowGraph(throttled=False), timeout_s=0.05
+    )
+
+    await throttled({"user_message": "a", "conversation_history": []})
+    result = await clean({"user_message": "b", "conversation_history": []})
+
+    assert result["downstream_result"]["error"] == "timeout"
+    assert saw_rate_limit() is False
+
+
+def test_the_note_survives_a_worker_thread():
+    """The provider runs under `asyncio.to_thread`, which copies the context.
+    A plain ContextVar value set in the copy never reaches the caller, which
+    is why the signal is a mutable object."""
+
+    async def main():
+        with turn_scope():
+            await _asyncio.to_thread(note_rate_limited)
+            return saw_rate_limit()
+
+    assert _asyncio.run(main()) is True

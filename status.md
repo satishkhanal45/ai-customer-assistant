@@ -73,6 +73,338 @@ Two defects found by measurement rather than reasoning. **(1) A read-after-write
 
 Migration `9a4f7c2b83d1`, with a partial unique index enforcing at most one default in the database rather than in whoever remembers to clear the old one. Suite 774 → **798 passing**.
 
+**2026-09-14 — The knowledge-graph explorer.** The renderer was never the
+problem. `force-graph` 2D/3D, force controls, type filters, path-finding and a
+detail panel were all already there; what made the canvas unreadable was what
+it was asked to draw.
+
+Measured first: **479 entities, 507 relations, average degree 2.12.** 116
+entities (24%) have no relations at all, 200 more (42%) have exactly one, and
+one node — Alpinist Studios, degree 78 — carries 15% of every edge. Two thirds
+of the graph is an unconnected cloud or hair on a hub, and a force layout draws
+that faithfully.
+
+Two more numbers decided the rest: **108 entities are isolated but carry facts**
+(knowledge the relation graph cannot show) and **226 are connected but carry
+none** (nodes that are dead ends when clicked).
+
+So: unconnected entities are left out by default, single-link neighbours are
+folded into their hub behind a `+43` badge, and **node radius tracks fact
+count** — square-rooted, because the counts are long-tailed and linear scaling
+would make one node enormous and flatten the rest. Neither omission hides
+anything: both are counted in a new View panel with a checkbox to restore them,
+and the HUD reads `93/201` rather than `93` so "is the canvas hiding things?"
+is answerable without opening a panel.
+
+The legend was 67 type rows and 69 relation rows, alphabetical — a directory,
+not a legend. Both are now ranked by count, capped at ten, with the tail
+grouped as "27 more types · 51" and every name in the tooltip. The Stats panel
+still lists all of them.
+
+`fact_count` reaches the client on the node itself, added to `EntityRef` and
+gathered by one grouped aggregate per request rather than a relationship load
+per node — the graph endpoints return hundreds of nodes and a lazy
+`entity.values` would be a round trip for each.
+
+Two defects fixed on the way. `visibleLinks` scanned `nodesArr` twice per link
+to find its endpoints: ~485,000 comparisons per render for an answer that does
+not change between them, now an index built when the data changes. And
+`drawNode2D` passed `node.x` straight to `createRadialGradient`, which throws
+on a non-finite argument — force-graph paints a node before the simulation has
+placed it, so the first frame after seeding threw and took the canvas down
+with it. It skips that frame now.
+
+**What this does not fix.** Average degree 2.12 means extraction produces far
+more attribute-values (774) than relations (507). A graph is only as
+interesting as its edges, and the lever for that is the extraction prompt and
+ontology, not the frontend. Folding is also a global toggle rather than
+per-hub expansion — a `+55` badge says how much is behind it but cannot be
+opened on its own.
+
+**2026-09-13 — Chat becomes the front door.** The first screen is now the
+assistant, not a login form. A prospective client opens the URL and starts
+asking; staff reach the workspace through a quiet "Staff sign in" link in the
+header. Self-service signup is gone — it answered "how does a stranger get an
+account?", and this makes that question stop existing.
+
+That reverses yesterday's signup work by a day, deliberately. An account
+anyone could create in ten seconds was never access control; it was friction
+pretending to be a gate, and the argument for removing the friction is the
+same one that argued against the gate.
+
+**The rate limiting is the feature, not a follow-up.** Removing the account
+removes the thing quotas were keyed on. `enforce_chat_quota` now resolves
+through `get_optional_user` — a dependency that existed for exactly this and
+had no caller — and keys on the account when there is one, the address when
+there is not. An address is a weak key: shared behind NAT, rotated with a VPN
+in seconds, so the per-caller limits bound an ordinary user and a determined
+one walks straight past them. `CHAT_GLOBAL_PER_DAY` counts **every** turn into
+one bucket regardless of who asked. At ~6,900 tokens a turn against a free
+tier allowing 8,000 a minute, that ceiling is the difference between a busy
+afternoon and an exhausted quota; its test rotates `x-forwarded-for` to prove
+a caller who defeats the per-IP limit still hits it.
+
+The public allowlist went from five entries to six — `/auth/signup` out,
+`/chat` and `/chat/stream` in — and the test asserting its exact size made
+that a deliberate edit with a written reason, as intended.
+
+**Routing.** Signed out and asking for chat gets chat; signed out and asking
+for a staff page still goes to login with the destination remembered, because
+dropping someone who deep-linked to `#/graph` into a chat window would look
+like the app ignoring them.
+
+**Two defects found while building it, both mine.** The login page stopped
+rendering — removing the sign-in/create-account toggle took the shared
+`on()` listener helper with it, which the page reported as
+`Failed to load login: on is not defined` rather than showing a blank screen.
+And a new test imported `main` to assert the signup route was gone; `main`
+calls `config.load_env()` at module scope, so it injected `backend/.env` into
+the whole process and a later test spent thirty seconds failing to resolve the
+Docker hostname `postgres`. That is P0-2 exactly, reintroduced from a test
+rather than from the application. It now inspects the router instead.
+
+Verified end to end in a browser: the site lands on the visitor shell with no
+login form, an anonymous turn answers with citations, the staff link reaches a
+sign-in-only page, and `/graph/search` still 401s without a credential. Suite
+→ **985 passing**.
+
+**2026-09-13 — Sweep for thin sources.** Every crawled source fetched live and
+measured three ways: visible text on the page, what the extractor produces from
+it today, and what is stored. The ratio that matters is stored against visible.
+
+**Extraction is faithful to itself.** For every source, *extractable ≈ stored* —
+so nothing is being lost between the extractor and the database. The whole gap
+is between the page and the extractor, which is an editorial choice
+(trafilatura drops navigation, footers, forms and widgets), not a pipeline
+defect. That distinction is what the sweep was for, and it rules out the
+alarming-looking numbers: `alpinistdashboard` stores 11% of its page's visible
+text, but the denominator is a 70,000-character page mostly made of repeated
+chrome, and its extractable length matches what is stored.
+
+**The nine blog and article pages score 99–108%** — over 100% because stored
+text includes chunk overlap. Trafilatura is built for articles and handles them
+completely. `services` (65%) and `about/` (60%) lose only site chrome: the
+dropped words are *About, Blog, Career, Contact, Phone, Facebook* and the office
+addresses.
+
+**One page is hollow in the same way `Contact` was.** `career` keeps 1,924 of
+3,582 characters, and what is dropped is the substance: the job list, the
+four-step application process (*"Submit Your Application… Interview Process…
+Join the Alpinist Family"*), "Apply Now", and the entire benefits section —
+*Compensation, Competitive, Work-Life Balance, Diversity, Culture*. A visitor
+asking how to apply for a job gets the preamble and nothing else. The fix is
+the same as for contact: author the content rather than re-crawl the page,
+since re-crawling reproduces exactly what is already there.
+
+**One source is stale, which the sweep found by accident.**
+`senior-artificial-intelligence-ai-engineer` returns **404** on the live site:
+the role was taken down, and the corpus still carries 3,453 characters
+advertising it. **Nothing in the system notices when a crawled source's origin
+page disappears** — there is no re-crawl, no liveness check, and a job that
+succeeded a month ago looks identical to one that would succeed today. That is
+a durable gap, not a one-off: a corpus built by crawling decays silently as the
+site changes underneath it.
+
+**2026-09-13 — Acting on the corpus review: the 404 out, contact details in.**
+The 404 source was deactivated through the real path — a `DELETE` job on the
+queue, so `run_delete` ran rather than an ad-hoc `UPDATE`. `vector_search`
+filters `is_active`, and the source had produced **zero** entities, so nothing
+of it survives in either retrieval path.
+
+**Re-crawling the contact page turned out to be the wrong fix, and the system
+said so.** `POST /ingest/crawl` answered `duplicate_skipped`. Dedup is a global
+SHA-256 — not of the page's HTML, but of the **markdown trafilatura extracts
+from it** — and the contact page extracts to 176 characters of hero banner:
+
+    # Find the utility engineering solution you've been looking for.
+    Global. Cost-efficient. Full-stack Engineering.
+
+Byte-identical to what was already stored under the source named `Contact`.
+So the contact page was never missing: it has been in the corpus all along,
+contributing nothing, because everything useful on it — the email address, the
+three offices, the phone numbers, the two-business-day commitment — lives in a
+`<form>`, and an article extractor discards forms as boilerplate. Crawling it
+again would have produced the same 176 characters however many times it ran.
+
+The fix is content, not crawling: `contact_info.md`, written from what is
+published on that page, uploaded through `POST /ingest/upload`. Verified by
+asking as a visitor — *"How do I get in touch with you?"* now returns the
+email, the form URL, all three office phone numbers and the response
+commitment, citing `contact_info.md`.
+
+The hollow `Contact` source was deactivated too, the same way. It had
+produced one entity and **zero** facts carrying provenance, so nothing of it
+remains in either retrieval path, and the contact question still answers from
+`contact_info.md` afterwards — checked, because removing the source a question
+used to hit is exactly when to re-ask it. **23 of 25 sources active.**
+
+**The general lesson is worth more than the fix.** A page being crawled is not
+the same as its content being ingested, and nothing in the pipeline reports
+the difference: the job succeeded, the source exists, the chunk count is 1.
+Any page whose substance is a form, a table widget or a JavaScript-rendered
+panel will be in the corpus and empty. The natural signal is extracted length
+against the page's apparent size, and nothing measures it today —
+`services` at 1,416 characters for an entire services page is the next
+candidate to look at.
+
+**2026-09-13 — Corpus review, before opening the assistant to visitors.**
+All 24 sources read, plus a probe of what the assistant will actually say to
+a stranger. **The corpus is publishable, and the concern raised three times in
+this document was over-cautious.**
+
+What was feared: 36 person entities holding staff names and job titles, with
+interns recorded as `Anil T.`, `Hari P.`, `Parbati B.` — surname-initial form,
+which reads like an internal staff list. It is not one. Those names come from
+the **"## Team Members" section of the public About page** and from **published
+intern testimonials** on the company's news page (`"— Parbati B., PHP Intern"`).
+The surname-initial form is not internal shorthand; it is the privacy-preserving
+form a company uses *when publishing*. Reading the database shape rather than
+the source document is what produced the wrong inference.
+
+**Provenance.** 19 of 24 sources were crawled from the company's own public
+website and blog — services, pricing, careers, AI and MVP articles — so they
+are public by definition. The 5 uploaded PDFs each carry a self-declared
+`document classification` line: `pricing.pdf` says **"public"**; the four
+chapter documents (`company_overview`, `compnay_vision`, `sdlc`, `tech_stck`)
+say **"internal / public company information"**.
+
+**Scanned and clean.** No email addresses, phone numbers, salary figures,
+credentials or internal hostnames anywhere in the corpus. Two regex hits for
+sensitivity markers were both false positives — "confidentiality" as a
+security principle in `sdlc.pdf`, and "career goals" on the careers page. The
+operational detail in `tech_stck.pdf` is capability marketing ("deployments on
+AWS and Azure"), not architecture. `compnay_vision.pdf`'s mentions of
+"revenue" and "board" are a metric category and the word "dashboards".
+
+**Probed end to end**, which is the test that matters — not what is in the
+files but what a stranger is told. Asked *"Who works at Alpinist Studios? Give
+names and roles."* as a visitor, the assistant named one person and said the
+rest were not in its data, rather than dumping 36 entities. `fact_relevance`
+(F4) is what holds that line, and it is now load-bearing for a public
+audience rather than only for answer quality.
+
+**One genuine defect, and it is not a privacy one.** The source named
+`Contact` (`1154a991-…`) is a crawled **404 page** whose entire content is
+`# Oops! # 404 - Page not found`. It is indexed and retrievable and answers
+nothing. A second source also named `Contact` is a real landing page that
+contains no contact details, so neither source answers "how do I get in
+touch?" — the question a prospective client is most likely to ask.
+
+**Decisions left to the company, not to code.** Whether "internal / public
+company information" on the four chapter PDFs means publishable; and the
+typo in `compnay_vision.pdf`, which a visitor now sees rendered as the
+citation "Compnay vision".
+
+**2026-09-13 — The visitor chat surface.** A visitor has one page, so the
+workspace chrome around it was furniture with nothing to navigate. The
+sidebar, the conversation list and the page padding are gone for them; what is
+left is an assistant identity bar, the conversation, a pill composer and a
+disclaimer. The member and admin views are untouched — every rule is scoped
+under `.app.visitor-mode`, and the workspace shell renders exactly as before
+(verified by promoting a test account and screenshotting both).
+
+Only the chrome differs. `roots` is what every other function in `chat.js`
+talks to, so building the same four references means sending, retrying, the
+ticket interrupt flow and localStorage persistence all work unchanged, and
+`renderThreadList` already no-ops without a thread list — which is what lets
+the conversation sidebar simply not exist rather than be hidden.
+
+**Three things a visitor was being shown that they should not have been.**
+Citations rendered raw source names and version numbers: a prospective client
+saw `compnay_vision.pdf · v1` — an internal filename, typo intact, as the
+authority behind an answer. A URL now becomes its page slug and a filename
+loses its extension and separators; anything unrecognisable falls through
+unchanged, because a wrong-but-specific citation is easier to report than a
+confident "our documentation". The `trace_id` was printed under every answer.
+And `**bold**` was not rendered at all, so answers arrived with literal
+asterisks in them.
+
+**An XSS hole, found while fixing the markdown.** `renderAssistant` escaped
+the paragraph branch through `linkify` but interpolated the model's line
+**raw** into the heading and list-item branches. Model output derives from
+ingested documents, so that was a path from "someone uploads a document" to
+"script runs in another reader's browser" — and it mattered more the moment
+the reader could be a visitor rather than the colleague who did the
+uploading. Every branch now escapes first and applies inline markup to the
+escaped string, which is the ordering that makes it safe: every tag in the
+output is one this code wrote.
+
+**2026-09-13 — A third role: `visitor`.** Opening signup meant a stranger
+received `member`, which grants uploading documents, running crawls and
+browsing the knowledge graph. A prospective client asking about pricing and a
+colleague curating the corpus are two different populations; they should not
+share a permission set merely because both are signed in.
+
+The alternative considered was renaming `member` to `visitor` and keeping two
+roles. That would have been strictly worse: the role travels **inside the
+JWT**, so a rename invalidates every live session, and it needs a data
+migration plus a rewrite of every call site. Adding a tier *below* the
+existing one costs neither.
+
+**No endpoint guard was edited.** `roles.satisfies` is a rank comparison and
+the ranks were spaced by ten, so inserting `visitor` at rank 5 made every
+existing `require_member` guard start excluding visitors on its own —
+ingestion, crawling and the graph API were all correct the moment the rank
+existed. Verified live: a visitor gets 403 on `/graph/search`,
+`/ingest/jobs/…`, `/ingest/crawl` and `/admin/stats`, 200 on `/auth/me`, and
+passes the guard on `/chat`. `auth/roles.py` predicted this in its own
+docstring — *"inserting a middle tier later costs one entry in `_RANK` and a
+reclassification of a few endpoints"* — and that is what it cost.
+
+Chat now names `require_visitor` explicitly rather than being open by
+omission, and `api/routes.py` carried a note warning that a customer-facing
+surface should be a separate endpoint "not a relaxation of this one, which
+would silently expose the internal corpus". The premise changed — this corpus
+*is* the customer-facing content — but the half of that warning about
+**retrieval scope** still stands and is now recorded there rather than
+deleted.
+
+Two smaller things fell out. `ck_app_user_role` existed only inside migration
+`8e5a3c9d21f7`, so the SQLite test database had no constraint at all and a
+role Postgres would reject inserted happily in a test; it is declared on
+`AppUser` now, with a test asserting the code and the constraint know the same
+roles. And the frontend guard became the rank comparison its own comment had
+asked for: *"if a middle tier is ever added this has to become a rank
+comparison rather than isAdmin()"*.
+
+Migration `f3c72a1d8b64` widens the constraint and **touches no rows** — it
+cannot tell which existing members were self-service signups and which an
+admin created, and silently demoting a colleague is worse than leaving one
+account over-privileged. `abc@gmail.com`, the account created through the
+signup form, was downgraded by hand. Suite 986 → **992 passing**.
+
+**2026-09-13 — Self-service signup.** *(Superseded the same day: signup now
+creates a `visitor`, not a `member` — see the entry above.)* The login page
+gained a
+"Create account" tab beside "Sign in"; `POST /auth/signup` is public and
+returns a session, so a new member is signed in without retyping the password
+they just chose.
+
+**The role is hardcoded server-side.** `SignupRequest` has no `role` field and
+the handler never reads one, so a `role: "admin"` in the body is dropped
+rather than honoured — verified against the live API, which returned
+`member`. `POST /auth/users` keeps its role parameter because an admin is
+already authenticated there. A test pins the escalation attempt specifically,
+because "the model doesn't have that field" is the kind of property a later
+edit quietly changes.
+
+Rate limited to **3 per IP per hour** — tighter than login's 5 per 15 minutes,
+because a person signs up once where a person mistypes a password several
+times, and it is the only thing between an open endpoint and a script filling
+the table.
+
+`test_route_protection.py` asserts the public allowlist's exact size, so
+growing it from four to five had to be a deliberate edit with a written
+reason. That guard worked as designed.
+
+**The security trade, recorded rather than buried.** A `member` can read the
+entire knowledge graph, upload documents into it, run crawls, and spend the
+shared model budget. Open signup therefore makes an internet-reachable
+deployment's whole corpus readable by anyone who finds the URL. That was
+raised before implementing and chosen deliberately; the alternatives, if it
+is ever revisited, are an email-domain allowlist or an invite code on the same
+endpoint. Suite 973 → **983 passing**.
+
 **2026-09-10 — One thing stored as several entities.** `"offers flexibility"`
 appeared twice under `Agile / flexibility`, beneath a unique constraint that
 should have made it impossible. The constraint was not violated: it is on
@@ -638,7 +970,8 @@ reads as theft and answers by revoking every session the user has.
 ### 4.7 Tooling
 `docker-compose.yml` (postgres/pgvector, MinIO + bucket init, Tika, backend), a multi-stage `Dockerfile`, an entrypoint that waits for Postgres and runs `alembic upgrade head`, a `Makefile` with `up/down/worker/ingest/verify/psql/trunc/chat/graph`, and a `langgraph.json` for LangGraph Studio.
 
-`scripts/create_user.py` creates the first admin — there is no self-signup,
+`scripts/create_user.py` creates the first admin — admin accounts are never
+self-service (members have been since 2026-09-13, via `POST /auth/signup`),
 so every account after that comes from `POST /auth/users`. It prompts for the
 password rather than taking it as an argument, because an argument lands in
 shell history and in `ps` output for every other user on the machine.
@@ -1289,7 +1622,8 @@ make chat                    # open the chat UI (port from APP_PORT in ./.env)
 make verify                  # list knowledge sources
 ```
 
-**Create an account** (there is no self-signup; the first admin has to come
+**Create an admin account** (members can self-signup from the login page; an
+admin never can, so the first one has to come
 from here, because `POST /auth/users` requires one to already exist):
 ```bash
 cd backend

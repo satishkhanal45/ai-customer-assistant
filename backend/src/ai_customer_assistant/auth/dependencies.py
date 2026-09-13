@@ -172,6 +172,11 @@ def require_role(minimum: str) -> Callable:
     return dependency
 
 
+#: Any signed-in account, including a self-service visitor. The floor of the
+#: ordering rather than "no check at all" -- naming it means an endpoint that
+#: is open to everyone says so, and a future role below `visitor` does not
+#: silently gain access to everything using it.
+require_visitor = require_role(roles.VISITOR)
 require_member = require_role(roles.MEMBER)
 require_admin = require_role(roles.ADMIN)
 
@@ -239,12 +244,30 @@ async def enforce(limit: rate_limit.Limit, principal: str) -> None:
 
 
 async def enforce_chat_quota(
-    principal: Principal = Depends(get_current_user),
-) -> Principal:
-    """Both chat limits: a per-minute burst cap and a per-day token budget."""
-    subject = str(principal.id)
+    request: Request,
+    principal: Principal | None = Depends(get_optional_user),
+) -> Principal | None:
+    """Chat's limits, for a caller who may not have an account.
+
+    Chat is the public front door -- a prospective client arrives and starts
+    asking, with no signup in the way -- so this cannot require a principal.
+    When there is one it keys on the account, which is the stronger identity;
+    when there is not it keys on the address.
+
+    **The global ceiling is not decoration.** An IP is a weak key: shared
+    behind NAT, rotated with a VPN in seconds. The per-caller limits bound an
+    ordinary user and a determined one walks straight past them, which on a
+    budget of 8,000 tokens a minute against turns costing 6,871 is the
+    difference between a busy afternoon and an exhausted quota. Counting every
+    turn into one bucket is what makes the endpoint safe to leave open.
+
+    Checked caller-first so an ordinary user who is simply going too fast is
+    told that, rather than being told the whole service is busy.
+    """
+    subject = str(principal.id) if principal is not None else f"ip:{client_ip(request)}"
     await enforce(rate_limit.CHAT_PER_MINUTE, subject)
     await enforce(rate_limit.CHAT_PER_DAY, subject)
+    await enforce(rate_limit.CHAT_GLOBAL_PER_DAY, "all")
     return principal
 
 

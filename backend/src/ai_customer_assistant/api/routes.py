@@ -38,9 +38,31 @@ from schemas.chat import ChatRequest, ChatResponse
 # Authentication bounds who can spend it; `enforce_chat_quota` bounds how
 # much any one of them can.
 #
-# If a customer-facing surface is ever wanted, the right shape is a separate
-# endpoint with its own retrieval scope -- not a relaxation of this one,
-# which would silently expose the internal corpus.
+# This note used to read: "if a customer-facing surface is ever wanted, the
+# right shape is a separate endpoint with its own retrieval scope -- not a
+# relaxation of this one, which would silently expose the internal corpus."
+#
+# A customer-facing surface *was* wanted, and the decision taken was that this
+# corpus IS the customer-facing content: company information, services and
+# pricing, for prospective clients. So `visitor` reaches this endpoint
+# deliberately rather than by relaxation.
+#
+# **The half of that warning still standing is retrieval scope.** There is
+# only one corpus, and everything ingested is answerable to anyone signed in
+# -- including, today, 36 person entities carrying staff names and job
+# titles. Nothing here separates "publishable" from "internal"; that is an
+# editorial decision about what gets ingested, and it is the reason a source
+# review belongs before a public deployment, not after.
+#
+# **Chat is public.** No account, no signup, nothing between the internet and
+# this endpoint -- because a prospective client asking what you charge should
+# not have to register first, and an account they can create in ten seconds
+# was never access control anyway. It was friction pretending to be a gate.
+#
+# What replaces the gate is `enforce_chat_quota`, which keys on the account
+# when there is one and on the address when there is not, and counts every
+# turn into a global daily ceiling regardless. That ceiling is what makes an
+# open endpoint affordable: see `auth.rate_limit.CHAT_GLOBAL_PER_DAY`.
 router = APIRouter(tags=["chat"], dependencies=[Depends(enforce_chat_quota)])
 
 

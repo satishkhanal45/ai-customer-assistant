@@ -180,11 +180,47 @@ Plus:
   `timeouts.py` already uses, and for the same reason: a silently-defaulted
   signing key is worse than a crash.
 - **A CLI** (`scripts/create_user.py`) to create the first admin, and
-  **`POST /auth/users`** (admin-only) for every account after it. Self-signup
-  is not appropriate for an internal knowledge tool. The endpoint matters
-  beyond convenience: it gives the `admin` tier a live, test-exercised caller
-  from the first commit, so the check is not dead code waiting to be trusted
-  for the first time six months from now.
+  **`POST /auth/users`** (admin-only) for every account after it. The endpoint
+  matters beyond convenience: it gives the `admin` tier a live,
+  test-exercised caller from the first commit, so the check is not dead code
+  waiting to be trusted for the first time six months from now.
+
+  > **Reversed 2026-09-13.** This plan said "self-signup is not appropriate
+  > for an internal knowledge tool", and that position was overruled
+  > deliberately: **`POST /auth/signup`** is public and creates `member`
+  > accounts from the login page. The reasoning against it still holds and is
+  > recorded in the README's known limitations — a member reads the whole
+  > knowledge graph, writes to it, and spends the shared model budget, so on a
+  > reachable deployment the corpus is effectively public.
+  >
+  > What makes the endpoint safe *as an endpoint*, as opposed to safe as a
+  > policy: the role is hardcoded rather than taken from the request
+  > (`SignupRequest` has no `role` field, and a test pins that an
+  > `admin` in the body is ignored), and it is rate limited to 3 per IP per
+  > hour. `POST /auth/users` keeps its role parameter precisely because the
+  > caller there is already an authenticated admin.
+  >
+  > Admin accounts remain CLI- or admin-created only. If the policy is ever
+  > revisited, the gate belongs on this same endpoint: an email-domain
+  > allowlist or an invite code, not a second route.
+  >
+  > **Reverted 2026-09-13, and this document's original position restored.**
+  > `POST /auth/signup` is gone. Chat became public instead, so nobody needs
+  > an account to use the assistant and self-signup has nothing left to do.
+  > The original text — "self-signup is not appropriate for an internal
+  > knowledge tool" — turned out to be right for a reason it did not state:
+  > not that strangers should be kept out, but that an account they can
+  > create in ten seconds never kept anyone out. What bounds a public
+  > endpoint is a quota, not a credential. See
+  > `auth.rate_limit.CHAT_GLOBAL_PER_DAY`.
+  >
+  > **Amended the same day.** Signup creates a **`visitor`**, a third role
+  > below `member`, not a member. This document's two-role model assumed
+  > everyone with an account was a trusted colleague; once signup is public
+  > that stops being true, and the fix is a tier for the untrusted population
+  > rather than widening what the trusted one means. `member` keeps the
+  > meaning described in §4 — a colleague who adds content — and is now
+  > admin-created only. See `auth/roles.py`.
 
 ---
 

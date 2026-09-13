@@ -22,9 +22,10 @@ the tens of thousands of relations with high fan-out.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 from uuid import UUID
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import Attribute, Entity, Relation, Value
@@ -39,6 +40,14 @@ class EntityRef:
     entity_type: str
     name: str
     label: str
+    #: How many attribute/value facts this entity carries.
+    #:
+    #: Carried on the *node* rather than fetched per click because it is what
+    #: tells a reader which nodes are worth clicking. In this corpus 226 of
+    #: 479 entities are connected but hold no facts at all, so without it every
+    #: node on the canvas looks equally promising and half of them are dead
+    #: ends. Zero when the caller did not ask for counts.
+    fact_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,8 +89,35 @@ class GraphFragment:
     edges: tuple[RelationRef, ...]
 
 
-def _to_entity_ref(entity: Entity) -> EntityRef:
-    return EntityRef(id=entity.id, entity_type=entity.entity_type, name=entity.name, label=entity.label)
+async def _fact_counts(
+    session: AsyncSession, entity_ids: Sequence[UUID]
+) -> dict[UUID, int]:
+    """Facts per entity, in one query.
+
+    One grouped aggregate rather than a relationship load per node: the graph
+    endpoints return hundreds of nodes at a time, and a lazy `entity.values`
+    would turn each of them into its own round trip.
+    """
+    if not entity_ids:
+        return {}
+    rows = await session.execute(
+        select(Value.entity_id, func.count().label("n"))
+        .where(Value.entity_id.in_(list(entity_ids)))
+        .group_by(Value.entity_id)
+    )
+    return {row.entity_id: row.n for row in rows.all()}
+
+
+def _to_entity_ref(
+    entity: Entity, counts: dict[UUID, int] | None = None
+) -> EntityRef:
+    return EntityRef(
+        id=entity.id,
+        entity_type=entity.entity_type,
+        name=entity.name,
+        label=entity.label,
+        fact_count=(counts or {}).get(entity.id, 0),
+    )
 
 
 async def get_entity(session: AsyncSession, entity_id: UUID) -> EntityDetail | None:
@@ -111,7 +147,9 @@ async def get_entity(session: AsyncSession, entity_id: UUID) -> EntityDetail | N
         )
         for value, attribute in rows
     )
-    return EntityDetail(entity=_to_entity_ref(entity), facts=facts)
+    return EntityDetail(
+        entity=_to_entity_ref(entity, {entity.id: len(facts)}), facts=facts
+    )
 
 
 async def find_entities(
@@ -132,7 +170,8 @@ async def find_entities(
     stmt = stmt.order_by(Entity.name).limit(limit)
 
     entities = (await session.execute(stmt)).scalars().all()
-    return tuple(_to_entity_ref(entity) for entity in entities)
+    counts = await _fact_counts(session, [e.id for e in entities])
+    return tuple(_to_entity_ref(entity, counts) for entity in entities)
 
 
 async def find_entities_by_value(
@@ -156,7 +195,8 @@ async def find_entities_by_value(
     )
 
     entities = (await session.execute(stmt)).scalars().all()
-    return tuple(_to_entity_ref(entity) for entity in entities)
+    counts = await _fact_counts(session, [e.id for e in entities])
+    return tuple(_to_entity_ref(entity, counts) for entity in entities)
 
 
 # Relations aren't meaningfully directional for browsing -- a "founded by"
@@ -220,8 +260,9 @@ async def get_neighbors(session: AsyncSession, entity_id: UUID, *, depth: int = 
         )
     ).scalars().all()
 
+    node_counts = await _fact_counts(session, [e.id for e in entities])
     return GraphFragment(
-        nodes=tuple(_to_entity_ref(entity) for entity in entities),
+        nodes=tuple(_to_entity_ref(entity, node_counts) for entity in entities),
         edges=tuple(
             RelationRef(
                 id=relation.id,

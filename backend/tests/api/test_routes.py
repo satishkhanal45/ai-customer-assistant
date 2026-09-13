@@ -37,11 +37,12 @@ class _CreateTicketClient(StubSupervisorLLMClient):
 def app(as_role):
     """The chat router with a signed-in member.
 
-    `/chat` and `/chat/stream` require authentication since P0-3 -- this is
-    an internal tool, and every turn spends Groq tokens against a shared
-    daily budget. These tests are about the turn, not about the credential,
-    so `as_role` supplies one. That the endpoints refuse an anonymous caller
-    is asserted in `tests/api/test_route_protection.py`.
+    `/chat` and `/chat/stream` are **public** since 2026-09-13 -- a
+    prospective client should not need an account to ask a question. These
+    tests still sign a caller in, because they are about the turn rather than
+    about who asked: a principal keeps the quota keyed on an account instead
+    of on the test client's address. `test_public_chat.py` covers the
+    anonymous path.
     """
     app = FastAPI()
     app.include_router(router)
