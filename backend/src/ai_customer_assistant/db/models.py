@@ -229,6 +229,16 @@ class AppUser(Base):
 
     __tablename__ = "app_user"
 
+    # Kept in step with `auth.roles._RANK` by a test. The allowed values were
+    # previously named only inside migration `8e5a3c9d21f7`, which meant the
+    # SQLite test database had no constraint at all: a role the database would
+    # reject in production inserted happily in a test.
+    __table_args__ = (
+        CheckConstraint(
+            "role IN ('visitor', 'member', 'admin')", name="ck_app_user_role"
+        ),
+    )
+
     # Both defaults on purpose. `server_default` is what a plain SQL INSERT
     # (a migration, a psql session) gets; `default` is what the ORM uses, and
     # it keeps this insert portable to backends without gen_random_uuid --

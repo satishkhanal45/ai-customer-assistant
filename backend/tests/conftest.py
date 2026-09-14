@@ -150,7 +150,7 @@ def as_role():
             as_role(app)                       # a member
             as_role(app, role=roles.ADMIN)     # or an admin
     """
-    from auth.dependencies import Principal, get_current_user
+    from auth.dependencies import Principal, get_current_user, get_optional_user
 
     def _apply(
         app,
@@ -161,6 +161,12 @@ def as_role():
     ) -> Principal:
         principal = Principal(id=user_id or uuid.uuid4(), email=email, role=role)
         app.dependency_overrides[get_current_user] = lambda: principal
+        # Chat is public, so its quota guard resolves the caller through
+        # `get_optional_user` rather than `get_current_user`. Overriding only
+        # the latter leaves the real dependency in place, and the real one
+        # opens a database session -- so the test fails reaching for Postgres
+        # rather than exercising the route.
+        app.dependency_overrides[get_optional_user] = lambda: principal
         return principal
 
     return _apply

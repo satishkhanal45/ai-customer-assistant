@@ -8,6 +8,9 @@ import time
 from typing import Callable, Optional, Protocol
 
 import groq
+
+from rate_limit_signal import note_rate_limited
+from .routing import is_rate_limited
 from groq import Groq
 
 from timeouts import CLASSIFY_BUDGET_S, LLM_SHORT_TIMEOUT_S, sleep_within_budget
@@ -223,6 +226,10 @@ class GroqSupervisorLLMClient:
                 )
                 return response.choices[0].message.content or "{}"
             except groq.APIError as exc:
+                # Classification is the first LLM call of a turn, so on a
+                # tight per-minute budget it is usually the first throttled.
+                if is_rate_limited(exc):
+                    note_rate_limited()
                 last_error = exc
             # No sleep after the final attempt — it delayed the error by a
             # second and a half without buying another try. And no sleep at

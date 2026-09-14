@@ -76,9 +76,44 @@ class Limit:
 LOGIN_PER_IP = Limit("login-ip", 5, timedelta(minutes=15))
 LOGIN_PER_EMAIL = Limit("login-email", 5, timedelta(minutes=15))
 
+def _int_env(name: str, default: int) -> int:
+    """An integer setting, falling back rather than crashing on nonsense.
+
+    A malformed limit should not stop the process booting: the default is
+    safe, and refusing to start over a typo in an optional tuning knob trades
+    a small misconfiguration for a total outage.
+    """
+    raw = os.environ.get(name, "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 # Every chat turn costs Groq tokens.
+#
+# Keyed per *caller* -- an account id when someone is signed in, an IP address
+# when they are not. An IP is a much weaker identity than an account: shared
+# behind NAT, and rotated with a VPN in seconds. These bound an ordinary user;
+# they do not bound a determined one.
 CHAT_PER_MINUTE = Limit("chat-minute", 20, timedelta(minutes=1))
 CHAT_PER_DAY = Limit("chat-day", 500, timedelta(days=1))
+
+# The limit that actually protects the deployment, and the reason it exists.
+#
+# Chat is public: no account, no signup, nothing between the internet and the
+# model budget. One measured turn costs **6,871 tokens** against a free tier
+# allowing 8,000 a minute, so a single caller rotating addresses can drain a
+# day's budget in minutes while every per-IP limit above reads as untouched.
+#
+# So this one counts *every* turn into one bucket regardless of who asked. It
+# is a spend ceiling rather than an abuse limit: when it trips, the assistant
+# says it is busy and stops, which is a bad afternoon instead of an exhausted
+# quota and a week of failed answers.
+CHAT_GLOBAL_PER_DAY = Limit(
+    "chat-global-day", _int_env("CHAT_GLOBAL_PER_DAY", 400), timedelta(days=1)
+)
 
 # Crawls are expensive and noisy for whoever is on the other end.
 INGEST_PER_MINUTE = Limit("ingest-minute", 10, timedelta(minutes=1))

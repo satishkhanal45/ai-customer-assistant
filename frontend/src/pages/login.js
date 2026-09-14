@@ -1,7 +1,9 @@
-/* Sign-in page.
+/* Sign-in page — for staff.
 
-   The only page reachable without a session, and the only one that collects
-   a password. Two things it deliberately does not do:
+   Reached from the quiet "Staff sign in" link in the header, not by being
+   bounced here: chat is the front door and a visitor never sees this page.
+   Accounts are created by an administrator; there is no self-signup, which
+   is why there is nothing on this form but a credential. Two things it deliberately does not do:
 
    * It does not tell the caller whether an address has an account. The
      server answers a wrong password and an unknown address identically, and
@@ -78,7 +80,7 @@
 
       '<form class="login-form" id="loginForm" autocomplete="on" novalidate>' +
       '<h1 class="login-title">Sign in</h1>' +
-      '<p class="login-sub">Use the account your administrator created.</p>' +
+      '<p class="login-sub">For staff accounts. Visitors can use the assistant without signing in.</p>' +
 
       '<label class="login-label" for="loginEmail">Email</label>' +
       '<input class="login-input" id="loginEmail" type="email" name="email"' +
@@ -98,7 +100,19 @@
 
       '<div class="login-error" id="loginError" hidden></div>' +
       '<button class="btn btn-primary btn-full login-btn" id="loginSubmit" type="submit">Sign in</button>' +
-      '<p class="login-foot">No self-signup — accounts are created by an administrator.</p>' +
+
+      /* The way out, for anyone who arrived here and did not mean to.
+         `type="button"` matters: an unqualified <button> inside a <form>
+         defaults to type="submit", so this would try to sign in with an
+         empty form instead of navigating.
+
+         A real button rather than the faint footer link it replaces: this
+         page is a detour from the assistant, and the way back should be as
+         obvious as the way forward. */
+      '<button class="btn btn-ghost btn-full login-back" id="loginBack" type="button">' +
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">' +
+      '<path d="M19 12H5"/><path d="m12 19-7-7 7-7"/></svg>' +
+      'Back to the assistant</button>' +
       '</form>' +
 
       '</div>' +
@@ -109,6 +123,7 @@
     var error = document.getElementById('loginError');
     var password = document.getElementById('loginPassword');
     var reveal = document.getElementById('loginReveal');
+    var back = document.getElementById('loginBack');
 
     function on(node, event, fn) {
       node.addEventListener(event, fn);
@@ -126,6 +141,11 @@
       reveal.setAttribute('aria-label', reveal.title);
       password.focus();
     });
+
+    /* Routed rather than `location.hash = ...` so it behaves like every other
+       navigation in the app -- the router tears this page down, which removes
+       the listeners registered above. */
+    on(back, 'click', function () { NS.router.go('chat'); });
 
     on(form, 'submit', function (event) {
       event.preventDefault();

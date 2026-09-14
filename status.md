@@ -17,8 +17,8 @@ This is a **multi-agent RAG customer-support assistant** for Alpinist Studios, b
 | Dimension | State |
 |---|---|
 | Architecture & module design | **Strong.** Clean layering, dependency injection everywhere, pure functions separated from I/O, excellent docstrings. |
-| Feature completeness (MVP scope) | **~80%.** Chat, RAG, ingestion, crawling, graph browsing, ticket creation, ticket status lookup and the admin *read* surface all work. The admin *write* surface and prompt management do not. |
-| Test suite | **969 passing / 0 failing / 0 erroring / 2 skipped** (971 collected). **Fully green** — the Playwright browser is installed, so the last non-deterministic gap is closed. |
+| Feature completeness (MVP scope) | **~80%.** Public visitor chat, staff chat, RAG, ingestion, crawling, graph browsing, ticket creation, ticket status lookup and the admin *read* surface all work. The admin *write* surface and prompt management do not. |
+| Test suite | **980 passing / 0 failing / 0 erroring / 2 skipped** (982 collected). **Fully green** — the Playwright browser is installed, so the last non-deterministic gap is closed. |
 | Production readiness | **No known blockers, and no open correctness issues** — P1-7 closed 2026-09-10. Authentication, authorisation, a CORS allowlist, rate limiting and an SSRF guard on the crawler are all in place (P0-3). Conversation state no longer reaches the logs (P0-4). Secrets are no longer injected by import side effect (P0-2), and the client/server timeout ladder no longer inverts (P2-4). |
 | Scalability | **Much improved.** All four P1 items are fixed: pgvector-native retrieval, LLM calls off the event loop, one shared connection pool, and ingestion moved out of the web process into a worker service. Two pieces of per-process state that quietly broke horizontal scaling now live in the database (P2-5). |
 | Repo hygiene | **Good.** The duplicated ontology is gone (P2-1); dead files, the committed AI-assistant note, the crawl artefact and the committed debug values are all gone, and the README is real (P2-6). Only the stale branches are left, deliberately untouched. |
@@ -28,6 +28,24 @@ This is a **multi-agent RAG customer-support assistant** for Alpinist Studios, b
 What is left is *unbuilt features* rather than defects — the admin write API, prompt management, CI and lint configuration, and structured logging with metrics. Those are listed in §5 and §7.
 
 ### Changelog
+
+**2026-09-14 — Chat became the front door: a `visitor` role, public chat, and the sign-in page as a side door.** The product had one way in — the login page — and that was backwards for what this system is. A stranger asking the assistant about the company is the *main* audience; uploading documents and browsing the knowledge graph is staff work. So the flow inverted: the app opens on the assistant, and **Staff sign in** is a button in the header rather than a wall.
+
+Three roles now, not two: `visitor` < `member` < `admin` (`auth/roles.py`). The alternative considered was renaming `member` to `visitor` and keeping two, which is strictly worse — the role travels inside the JWT, so renaming it invalidates every live session and needs a data migration plus a rewrite of every call site. **Adding a tier below the existing one costs neither**, because `satisfies` is a rank comparison: inserting `visitor` at rank 5 made every existing `require_member` guard start excluding visitors **without a single guard being edited**. Ingestion, crawling and the graph API were correct the moment the rank existed. Ranks are spaced by five so a further tier fits between any two without renumbering. Migration `f3c72a1d8b64` widens `ck_app_user_role`; that constraint had lived only in a migration, so SQLite tests had no constraint at all — it is declared on the `AppUser` model now, where the tests can see it.
+
+**The chat router is public** (`dependencies=[Depends(enforce_chat_quota)]` on the router itself, no auth dependency). Public chat spends money, so the quota is the boundary rather than the login: anonymous callers are keyed by client IP instead of user id, and a third limit, `CHAT_GLOBAL_PER_DAY` (400, tunable), caps the *whole deployment* — per-caller limits do not bound a bill when the callers are strangers. Provider rate-limiting is now surfaced rather than swallowed: `rate_limit_signal.py` carries the fact out of the model call so the turn can say so. It holds a **mutable dict** in the `ContextVar`, not a boolean, because `asyncio.to_thread` copies the context — a plain `.set()` inside the worker thread never propagates back to the caller, and the signal was silently always false.
+
+A related non-bug worth recording: a chat failure reported from the UI turned out to be Groq's per-minute token ceiling, **measured at 6,871 tokens per turn against a 8,000/min budget**, not a defect in the turn.
+
+**Visitor chat UI.** A trimmed chat for signed-out callers: suggested openers, friendly source labels instead of raw identifiers, no sidebar. Fixed while building it: `renderAssistant` interpolated model output straight into `innerHTML` in its heading and list branches — escaped text in one branch is not a policy, so `inlineMarkup()` is now applied to already-escaped text in **every** branch. The sign-in page gained a **Back to the assistant** button below Sign in; `type="button"` is load-bearing, since an unqualified `<button>` inside a `<form>` defaults to submit.
+
+**Ingest page: what is already in the corpus.** The page could add sources but not show them. `GET /ingest/sources` (member-guarded) lists them split into files and URLs — split on an `manual_upload://` reference prefix rather than on `origin_system`, which reads `"crawler"` for uploads too. Inactive sources are excluded and chunk counts come from one grouped aggregate rather than a query per source. Live: **23 sources, 6 files and 17 URLs**.
+
+**Graph explorer.** The complaint was that the graph was unreadable; the measurement said the cause was the data, not the renderer — 479 entities at **average degree 2.12 with 24% isolated**, which no layout can make legible. So the view gained topology it can act on: degree-scaled radii, folded low-degree neighbourhoods with a count badge, a legend ranked by frequency and capped at ten types, and filters that hide isolates. Two defects fixed by the same work: `createRadialGradient` was called with non-finite coordinates because force-graph paints nodes before the layout has placed them, and the visible-link computation was **O(n²)** — roughly 485,000 comparisons per render — now an index rebuilt only on change.
+
+**Corpus review.** One source 404s on the live site and was removed and re-ingested from the real contact page; a second stale Contact source went with it; thin sources were swept. The review also corrected a concern raised three times in this document's history: staff names in the corpus come from the public About page and published testimonials, so treating them as PII was over-cautious. Still open and needing a decision from the owner: whether *"internal / public company information"* on the four chapter PDFs means publishable, whether to deactivate `senior-artificial-intelligence-ai-engineer` (now 404), and whether to author a careers document — the `career` page is hollow because trafilatura discards the job list, application steps and benefits as page furniture.
+
+Suite **980 passing**, 2 skipped. Verified in a browser end to end: landing on the visitor chat, reaching sign-in from the header, and returning with the back button, with no console errors.
 
 **2026-09-09 — Ingestion: pipeline resources built once per process, and the worker image rebuilt.** `_resolve_deps` constructed everything per call and the worker calls it per job, so the 400 MB embedding model and its tokenizer were loaded from disk **once per document** — `Loading weights: 199/199` appeared in the log for every job, while `pipeline.py`'s docstring claimed the opposite. A new `PipelineResources` holds the session-independent half and is built once by `get_pipeline_resources()`; `_resolve_deps` now only binds the session. `scripts/run_worker.py` builds it at startup, so a broken model or missing MinIO config fails at boot rather than becoming a mystery failure on the first document. **Verified live: three jobs claimed, one model load.** The `httpx.Client` moved there too — it was previously created per job and never closed, leaking a descriptor per document — and is closed in the worker's `finally`.
 
@@ -433,13 +451,13 @@ cd backend && env -u PYTHONPATH ./.venv/bin/python -m pytest -q
 → 10 failed, 268 passed, 6 errors in 170.19s
 ```
 
-**Current, after every P0/P1/P2 item, P1-7, and the whole of `ingestion.md`:**
+**Current, after every P0/P1/P2 item, P1-7, the whole of `ingestion.md`, and the visitor access model:**
 ```
 cd backend && env -u PYTHONPATH ./.venv/bin/python -m pytest -q
-→ 969 passed, 2 skipped in 80.23s
+→ 980 passed, 2 skipped in 150.57s
 ```
 
-Collected: 971 tests, **no failures and no errors**. The most recent 210
+Collected: 982 tests, **no failures and no errors**. The most recent 210
 arrived with the ingestion work: retry policy and dead-lettering, the worker
 loop, fact supersession, value duplication, entity merging. The last 121 arrived with
 P0-3: tokens, passwords, roles, the auth router, rate limiting, the SSRF
@@ -606,22 +624,25 @@ Notably correct details: the mandated retrieval join contract (only `current_ver
 ### 4.6 Frontend — mostly done
 Zero-build vanilla JS (`window.ACA` namespace, classic scripts, hash router), dark/light theming, served same-origin by the backend.
 
-**Login and route guard (P0-3).** The shell is otherwise unchanged from the original design: header, sidebar, cards. What authentication added is a login page, `session.js` holding the signed-in user, the signed-in address and role in the header, and a route guard in `router.js` that gates on two axes -- signed in or not, and `role: 'admin'` on the page.
+**Login and route guard (P0-3).** The shell is otherwise unchanged from the original design: header, sidebar, cards. What authentication added is a login page, `session.js` holding the signed-in user, the signed-in address and role in the header, and a route guard in `router.js` that gates on two axes -- signed in or not, and the minimum `role` on the page.
+
+**The front door is the assistant, not the login page (2026-09-14).** A signed-out caller lands on a trimmed visitor chat; **Staff sign in** is a header button, and the sign-in page carries a **Back to the assistant** button so reaching it by accident is not a dead end. Everything else still requires an account.
 
 A studio three-column layout (icon rail / workspace / context inspector) with a warm-ink and then an aurora palette was built on 2026-09-08 and **reverted on 2026-09-09** at the user's request. The authentication work was kept; only the design was rolled back. The reverted design is recoverable from that day's history if it is ever wanted again.
 
 | Page | Role | State |
 |---|---|---|
-| Login | — | Done — the only page reachable signed out; `router.js` guards the rest and remembers where the user was going |
+| Chat (visitor) | — | Done — the landing page signed out: suggested openers, friendly source labels, no sidebar |
+| Login | — | Done — reached from the header, not forced; `router.js` guards the rest and remembers where the user was going, and a **Back to the assistant** button returns to the visitor chat |
 | Chat | member | Done — thread list in `localStorage`, retry, citations |
-| Graph | member | Done — 2D/3D force-graph explorer (the current feature branch) |
-| Ingest | member | Done — upload, crawl, discover→review→confirm, job polling |
+| Graph | member | Done — 2D/3D force-graph explorer: degree-scaled radii, folded low-degree neighbourhoods, ranked legend, isolate filter |
+| Ingest | member | Done — upload, crawl, discover→review→confirm, job polling, and the list of sources already ingested split into files and URLs |
 | Overview | member | Done |
 | Prompt | **admin** | Partial — prompts are viewable/editable but **device-local only**; no backend write endpoint. Admin-gated because editing the agent's prompts changes how the system answers everyone, and it would be odd for that to become an admin action only on the day it starts persisting |
 | Admin | **admin** | **Stub** — renders "not available"; the `/admin/*` endpoints it calls don't exist. When they are built they go behind the `admin` role, which is why that role exists now |
 
-`router.js` gates on two axes: signed in or not, and `role: 'admin'` on the
-page. Admin pages are hidden from the sidebar for a member and refused if
+`router.js` gates on two axes: signed in or not, and the minimum `role` on
+the page. Admin pages are hidden from the sidebar for a member and refused if
 reached by URL, with a message rather than a silent bounce — being redirected
 with no explanation reads as the app being broken. This is a usability layer,
 not a security boundary: the API refuses unauthorised requests by itself, and
@@ -1351,6 +1372,7 @@ process refuses to start if it does not hold):
 | `CORS_ALLOW_ORIGINS` | empty | Empty means no cross-origin access at all, which restricts nothing — the frontend is same-origin. A wildcard is **not** accepted: the session is a cookie, and the CORS spec forbids combining credentials with `*` |
 | `TRUST_PROXY_HEADERS` | `false` | Read `X-Forwarded-For` for rate-limit keys. Only behind a proxy that sets it — anyone can send the header, so trusting it without one lets a caller choose their own rate-limit key |
 | `RATE_LIMIT_DISABLED` | `false` | Tests and single-user local development only |
+| `CHAT_GLOBAL_PER_DAY` | 400 | The deployment-wide chat ceiling. Chat is public, so per-caller limits do not bound the provider bill — this one does. Anonymous callers are rate-limited by client IP; signed-in ones by user id |
 
 **LLM provider keys** (`llm_credentials.py`, and the Admin › API Keys page):
 

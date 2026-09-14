@@ -1254,3 +1254,187 @@ pre.code { font-family: var(--mono); font-size: 12px; background: var(--bg); bor
 .provider-meta a:hover { text-decoration: underline; }
 
 .provider-foot { margin-top: 16px; }
+
+/* ---- Ingest: what is already in the knowledge base ---- */
+.ingested-grid { margin-top: 22px; }
+
+.ingest-card h3 .count {
+  margin-left: auto;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-dim);
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+}
+
+/* Capped and scrollable: this list grows with the corpus, and a page whose
+   forms are pushed off-screen by their own history is worse than one that
+   scrolls. */
+.ingested-list {
+  max-height: 320px;
+  overflow-y: auto;
+  margin: -4px -4px 0;
+  padding: 4px;
+}
+
+.ingested-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 4px;
+  border-bottom: 1px solid var(--border);
+}
+.ingested-row:last-child { border-bottom: 0; }
+
+.ing-main { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 1px; }
+.ing-name {
+  font-size: 12.5px;
+  color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ing-ref {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.ing-meta { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.ing-chunks {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+/* Ingested, but nothing extractable was in it — the job succeeded and every
+   other signal looks healthy, so this is the only place it shows. */
+.ing-chunks.is-hollow { color: var(--warn, #d9a441); font-weight: 600; }
+
+/* ===================================================================
+   VISITOR MODE
+   ===================================================================
+   A visitor has exactly one page, so the workspace chrome around it is
+   furniture with nothing to navigate. The header stays -- staff still
+   need a way in -- but loses the avatar and the collapse affordance.
+   Every rule is scoped under `.app.visitor-mode`, so the member and
+   admin views are untouched. */
+
+.app.visitor-mode { grid-template-columns: 1fr; }
+.app.visitor-mode .sidebar { display: none; }
+.app.visitor-mode .main { grid-column: 1 / -1; padding: 0; }
+.app.visitor-mode .avatar { display: none; }
+
+.visitor-shell {
+  display: flex;
+  flex-direction: column;
+  /* The header is the only chrome left, and the grid gives it a fixed 60px. */
+  height: calc(100vh - 60px);
+  max-width: 780px;
+  margin: 0 auto;
+  padding: 0 20px;
+}
+
+/* Who you are talking to. A support widget always says this; an internal
+   tool never needs to, because you already know. */
+.visitor-head {
+  display: flex; align-items: center; gap: 12px;
+  padding: 18px 4px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.visitor-mark {
+  width: 38px; height: 38px;
+  display: grid; place-items: center;
+  border-radius: 11px; color: #fff; flex: 0 0 38px;
+  background: linear-gradient(135deg, var(--blue), var(--violet, var(--accent)));
+}
+.visitor-mark svg { width: 21px; height: 21px; }
+.visitor-head-text { display: flex; flex-direction: column; line-height: 1.3; }
+.visitor-head-text strong { font-size: 14.5px; font-weight: 650; color: var(--text); }
+.visitor-head-text span { font-size: 12px; color: var(--text-dim); }
+
+.visitor-status {
+  margin-left: auto;
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11.5px; color: var(--text-dim);
+}
+.visitor-status i {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--ok, #35c07f);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok, #35c07f) 22%, transparent);
+}
+
+.visitor-messages { flex: 1; overflow-y: auto; padding: 22px 4px; }
+
+/* A pill composer rather than the workspace's squared input: it is the only
+   control on the page, so it can afford to look like the thing you use. */
+.visitor-input-bar {
+  border: 1px solid var(--border);
+  border-radius: 26px;
+  padding: 6px 6px 6px 18px;
+  margin: 0 0 10px;
+  background: var(--panel);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, .06);
+}
+.visitor-input-bar input { font-size: 14px; }
+.visitor-input-bar .send-btn { border-radius: 50%; width: 38px; height: 38px; }
+
+.visitor-foot {
+  padding: 0 6px 16px;
+  font-size: 11px; line-height: 1.5; text-align: center;
+  color: var(--text-faint);
+}
+
+/* Quieter than the workspace's, and labelled: a visitor needs to know these
+   are where the answer came from, not links they are expected to chase. */
+.citations-visitor { opacity: .85; }
+.citations-visitor .citations-label {
+  font-size: 10px; letter-spacing: .07em; text-transform: uppercase;
+  color: var(--text-faint); margin-bottom: 3px;
+}
+
+@media (max-width: 640px) {
+  .visitor-shell { padding: 0 12px; }
+  .visitor-head { padding-top: 12px; }
+}
+
+/* The way staff get in, from a page whose audience is customers.
+   Understated on purpose. */
+.staff-signin {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 10px; border-radius: 8px;
+  font-size: 12px; font-weight: 550;
+  color: var(--text-dim); text-decoration: none;
+  border: 1px solid transparent;
+  transition: color .15s ease, background .15s ease, border-color .15s ease;
+}
+.staff-signin:hover {
+  color: var(--text); background: var(--panel-alt); border-color: var(--border);
+}
+.staff-signin svg { width: 14px; height: 14px; }
+
+/* Graph view options — what the canvas leaves out, and how to put it back. */
+.view-opt {
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 0; font-size: 12px; color: var(--text-dim); cursor: pointer;
+}
+.view-opt:hover { color: var(--text); }
+.view-opt input { accent-color: var(--accent); cursor: pointer; }
+.view-opt b { color: var(--text); font-variant-numeric: tabular-nums; }
+
+/* The legend's grouped tail. Not clickable: it is several types at once, and
+   a toggle that hid 57 types in one click would be a trap. */
+.legend-rest { opacity: .6; font-style: italic; cursor: default; }
+
+/* The way back to the assistant from the staff sign-in page. Full width under
+   the sign-in button so the two read as "continue" and "go back" rather than
+   as two things to choose between. */
+.login-back {
+  height: 40px;
+  margin-top: 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  font-size: 13px;
+}
+.login-back svg { width: 15px; height: 15px; }
