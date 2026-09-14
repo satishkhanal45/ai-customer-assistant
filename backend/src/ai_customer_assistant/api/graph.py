@@ -60,10 +60,19 @@ class EntityRefResponse(BaseModel):
     entity_type: str
     name: str
     label: str
+    #: How many facts the entity carries. The explorer sizes nodes by it, so a
+    #: reader can see which are worth clicking before clicking them.
+    fact_count: int = 0
 
     @classmethod
     def from_dataclass(cls, ref: EntityRef) -> "EntityRefResponse":
-        return cls(id=ref.id, entity_type=ref.entity_type, name=ref.name, label=ref.label)
+        return cls(
+            id=ref.id,
+            entity_type=ref.entity_type,
+            name=ref.name,
+            label=ref.label,
+            fact_count=ref.fact_count,
+        )
 
 
 class FactRefResponse(BaseModel):

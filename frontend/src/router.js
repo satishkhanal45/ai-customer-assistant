@@ -42,10 +42,10 @@
      ordering. `auth/roles.py` is the authority; if a middle tier is ever
      added this has to become a rank comparison rather than isAdmin(). */
   var LINKS = [
-    { key: 'overview', label: 'Overview', title: 'AI Customer Assistant — Overview' },
+    { key: 'overview', label: 'Overview', title: 'AI Customer Assistant — Overview', role: 'member' },
     { key: 'chat', label: 'Chat', title: 'AI Customer Assistant — Chat' },
-    { key: 'graph', label: 'Graph', title: 'AI Customer Assistant — Knowledge Graph' },
-    { key: 'ingest', label: 'Ingest', title: 'AI Customer Assistant — Ingest' },
+    { key: 'graph', label: 'Graph', title: 'AI Customer Assistant — Knowledge Graph', role: 'member' },
+    { key: 'ingest', label: 'Ingest', title: 'AI Customer Assistant — Ingest', role: 'member' },
     { key: 'prompt', label: 'Prompt', title: 'AI Customer Assistant — Agent Prompts', role: 'admin' },
     { key: 'admin', label: 'Admin', title: 'AI Customer Assistant — Admin', role: 'admin' },
     { key: 'apikeys', label: 'API Keys', title: 'AI Customer Assistant — API Keys', role: 'admin' }
@@ -58,9 +58,18 @@
     return null;
   }
 
+  /* Reachable without an account. One entry today, named rather than
+     hardcoded at the call site so adding a second is a visible decision --
+     the same reason the backend keeps an explicit public-route allowlist. */
+  var PUBLIC_PAGES = ['chat'];
+
+  function isPublic(key) {
+    return PUBLIC_PAGES.indexOf(key) !== -1;
+  }
+
   function mayView(key) {
     var link = linkFor(key);
-    return !link || !link.role || NS.session.isAdmin();
+    return !link || !link.role || NS.session.hasRole(link.role);
   }
 
   function afterLogin() {
@@ -101,7 +110,15 @@
     var key = parseHash();
     var signedIn = NS.session.isSignedIn();
 
-    if (!signedIn && key !== 'login') {
+    /* Chat is the front door, not a page behind a gate. A signed-out caller
+       asking for it gets it; one asking for a staff page is sent to sign in,
+       with where they were going remembered.
+
+       The distinction matters both ways. Bouncing an anonymous visitor to a
+       login form is the friction this flow exists to remove, and dropping
+       someone who deep-linked to `#/graph` into a chat window instead would
+       look like the app ignoring them. */
+    if (!signedIn && key !== 'login' && !isPublic(key)) {
       intended = key;
       NS.router.go('login');
       return;
@@ -119,13 +136,19 @@
 
     var page = NS.pages && NS.pages[key];
     if (!page) {
-      key = signedIn ? DEFAULT_PAGE : 'login';
+      key = DEFAULT_PAGE;
       page = NS.pages[key];
     }
 
     destroyCurrent();
     renderNav(key);
-    document.querySelector('.app').classList.toggle('signed-out', !signedIn);
+    var app = document.querySelector('.app');
+    app.classList.toggle('signed-out', !signedIn);
+    /* A visitor has one page, so the workspace chrome around it is furniture
+       with nothing to navigate. Stripping it is what turns "an internal tool
+       with the menu removed" into something that reads as a customer
+       assistant. Same mechanism the login page already uses. */
+    app.classList.toggle('visitor-mode', !NS.session.hasRole('member'));
 
     var view = document.getElementById('view');
     currentEl = document.createElement('div');

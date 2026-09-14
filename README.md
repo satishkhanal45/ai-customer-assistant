@@ -26,9 +26,11 @@ concurrently, and the answer prompt gets the two as separate sections.
 Both take `{"thread_id": ..., "message": ...}` and produce the same answer;
 history lives server-side behind the checkpointer, keyed by `thread_id`.
 
-**Both require a signed-in `member`**, as does everything else except
-`/health` and the login endpoints — see [Authentication](#authentication)
-below.
+**Both are public.** Chat is the product's front door, so a signed-out
+visitor can use it; what bounds the cost is the quota rather than the login
+(per-IP limits plus a deployment-wide daily ceiling). Everything else —
+ingestion, crawling, the knowledge graph, the admin surface — requires a
+signed-in account. See [Authentication](#authentication) below.
 
 ---
 
@@ -56,18 +58,18 @@ cp backend/.env.example .env            # docker compose reads APP_PORT from her
 # 2. Start Postgres, MinIO, Tika, the API and the worker.
 make up
 
-# 3. Apply the database schema.
-cd backend && uv run alembic upgrade head && cd ..
-
-# 4. Create the service account that ingestion attributes documents to.
+# 3. Create the service account that ingestion attributes documents to.
+#    The schema is already applied: the container entrypoint runs
+#    `alembic upgrade head` on every start, so there is no separate step.
 make user
 
-# 5. Set a signing secret and create the first admin account.
+# 4. Set a signing secret and create the first admin account.
 #    AUTH_SECRET has no default: the app refuses to start without it.
 python -c "import secrets; print('AUTH_SECRET=' + secrets.token_urlsafe(48))" >> backend/.env
-cd backend && uv run python scripts/create_user.py you@example.com --role admin && cd ..
+docker compose exec backend python scripts/create_user.py you@example.com --role admin
 
-# 6. Open the chat UI and sign in. `make` reads the port from APP_PORT in ./.env.
+# 5. Open the app. It lands on the assistant; staff sign in from the header.
+#    `make` reads the port from APP_PORT in ./.env.
 make frontend
 ```
 
@@ -115,16 +117,20 @@ and the app dies with `ModuleNotFoundError: No module named 'pgvector'`.
 
 ## Authentication
 
-Every endpoint requires a signed-in account except three: `GET /health`,
-`POST /auth/login` and `POST /auth/refresh`. `tests/api/test_route_protection.py`
+Every endpoint requires a signed-in account except `GET /health`, the login
+and refresh endpoints, and chat. `tests/api/test_route_protection.py`
 enumerates the assembled app and asserts exactly that, so a route added later
 is protected by default or the suite fails.
 
-### Two roles
+### Three roles
+
+The line between them is *who the person is to the company*: a stranger, a
+colleague, an owner.
 
 | Role | Can |
 |---|---|
-| `member` | Chat, browse the knowledge graph, upload documents, run crawls, watch jobs. Sidebar: Overview, Chat, Graph, Ingest. |
+| `visitor` | The assistant, and nothing else. Chat is public, so nothing creates these accounts today — the tier is the floor of the ordering, and an account holding it can sign in and reach chat only. |
+| `member` | Chat, browse the knowledge graph, upload documents, run crawls, watch jobs, see what is already ingested. Sidebar: Overview, Chat, Graph, Ingest. |
 | `admin` | All of that, plus the system's own controls: creating accounts, agent prompts, **LLM provider API keys**, the Admin dashboard (sources, jobs, stats, tickets), and — when they are built — retrieval configuration and source deletion. Sidebar adds Prompt, Admin and API Keys. |
 
 The UI hides admin pages from a member and redirects with a message if one is
@@ -132,10 +138,15 @@ reached by URL. That is a convenience, not the protection — the API refuses
 unauthorised requests on its own, which is what holds when someone skips the
 browser.
 
-The line is *uses the system* vs. *changes the system*. Across the endpoints
-that exist today the only live difference is account creation; the split
-exists so the administrative endpoints still to be written have somewhere to
-land that is not the same gate as uploading a PDF.
+The line between `member` and `admin` is *uses the system* vs. *changes the
+system*. Across the endpoints that exist today the only live difference is
+account creation; the split exists so the administrative endpoints still to be
+written have somewhere to land that is not the same gate as uploading a PDF.
+
+Roles are ordered by rank rather than checked by name, which is why adding
+`visitor` beneath `member` needed no guard to be edited: every existing
+`require_member` started excluding visitors the moment the rank existed. The
+ranks are spaced by five so a further tier fits between any two.
 
 ### Accounts
 
@@ -143,10 +154,12 @@ There is no self-signup. The first admin is created from the command line,
 and every account after that through the API:
 
 ```bash
-cd backend
-uv run python scripts/create_user.py sam@example.com --role member
-uv run python scripts/create_user.py sam@example.com --update     # reset a password
+docker compose exec backend python scripts/create_user.py sam@example.com --role member
+docker compose exec backend python scripts/create_user.py sam@example.com --update   # reset a password
 ```
+
+Run it inside the container so it uses the compose network; the same script
+works from the host with `POSTGRES_HOST=localhost POSTGRES_PORT=5433`.
 
 The password is prompted for, never passed as an argument — an argument ends
 up in shell history and in `ps` output. Use `--password-stdin` in a
@@ -183,9 +196,13 @@ page — can read them.
 | `GROQ_API_KEY` and friends | unset | Still read, and still the fallback. A key saved on the **Admin › API Keys** page shadows the matching variable; clearing it falls back here. Stored keys are encrypted under a key derived from `AUTH_SECRET`, so rotating that secret means re-entering them. |
 
 Rate limits: 5 logins per 15 minutes (per address *and* per account), 20 chat
-turns a minute and 500 a day per user, 10 ingestion calls a minute. The chat
-limits matter most — every turn spends Groq tokens against a daily budget
-that one developer exhausted repeatedly during this project's own testing.
+turns a minute and 500 a day per caller, 10 ingestion calls a minute, and
+`CHAT_GLOBAL_PER_DAY` (400) across the whole deployment. Anonymous chat is
+keyed by client IP; a signed-in caller by user id. The chat limits matter most
+— every turn spends Groq tokens against a daily budget that one developer
+exhausted repeatedly during this project's own testing, and the global ceiling
+exists because per-caller limits do not bound a bill when the callers are
+strangers.
 
 Full design and rationale: [`authentication_implementation.md`](authentication_implementation.md).
 
@@ -195,7 +212,11 @@ Full design and rationale: [`authentication_implementation.md`](authentication_i
 
 Nothing can be answered until something is ingested. Every path below only
 *enqueues* a job — the worker does the real work, so watch `make logs` or poll
-`GET /ingest/jobs/{job_id}`. The examples below assume `APP_PORT` is exported from `./.env`.
+`GET /ingest/jobs/{job_id}`. `GET /ingest/sources` lists what is already in
+the corpus, split into uploaded files and crawled URLs with their chunk
+counts — the Ingest page shows both below the upload and crawl forms, because
+a page that can only add sources cannot answer *"is this already in?"*. The
+examples below assume `APP_PORT` is exported from `./.env`.
 
 **Upload a file** (PDF, DOCX or Markdown):
 
@@ -277,7 +298,8 @@ backend/
     db/                    SQLAlchemy models, the shared engine, checkpointer
   alembic/versions/        database migrations
   tests/                   the test suite, mirroring the source layout
-frontend/                  the chat UI and knowledge-graph explorer
+frontend/                  the visitor and staff chat UIs, the ingest page,
+                           and the knowledge-graph explorer
 status.md                  detailed project status, known problems, roadmap
 ```
 

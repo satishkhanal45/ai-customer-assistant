@@ -63,13 +63,42 @@
 
   function user() { return current; }
   function isSignedIn() { return current !== null; }
-  function isAdmin() { return !!current && current.role === 'admin'; }
+  function isAdmin() { return hasRole('admin'); }
+
+  /* Mirrors `auth/roles.py`'s ordering. The backend is the authority -- this
+     only decides what to draw, and a page reached by URL anyway is refused
+     there. Kept as a rank comparison rather than a set of booleans so adding
+     a fourth tier is one entry. */
+  var RANK = { visitor: 5, member: 10, admin: 20 };
+
+  function hasRole(minimum) {
+    if (!current) return false;
+    var mine = RANK[current.role];
+    var needed = RANK[minimum];
+    /* An unrecognised role grants nothing. The server would refuse it too,
+       but drawing a menu item that then 403s is worse than not drawing it. */
+    return typeof mine === 'number' && typeof needed === 'number' && mine >= needed;
+  }
 
   /* Header identity: the signed-in address and a way out. */
   function render() {
     var host = document.getElementById('sessionBox');
     if (!host) return;
-    if (!current) { host.innerHTML = ''; return; }
+    /* Signed out is the normal state now, not an error state: chat is the
+       front door and most people never sign in. So the header offers a quiet
+       way in for staff rather than nothing at all.
+
+       Deliberately understated -- "Staff sign in", not a primary button. A
+       customer who wonders whether they are supposed to log in has already
+       had a worse experience than necessary. */
+    if (!current) {
+      host.innerHTML =
+        '<a class="staff-signin" href="#/login">' +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">' +
+        '<path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><path d="m10 17 5-5-5-5"/><path d="M15 12H3"/>' +
+        '</svg>Staff sign in</a>';
+      return;
+    }
 
     host.innerHTML =
       '<span class="session-email" title="' + NS.utils.esc(current.email) + '">' +
@@ -91,6 +120,7 @@
     expire: expire,
     user: user,
     isSignedIn: isSignedIn,
-    isAdmin: isAdmin
+    isAdmin: isAdmin,
+    hasRole: hasRole
   };
 })(window.ACA);

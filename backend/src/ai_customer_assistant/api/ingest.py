@@ -44,7 +44,7 @@ from uuid import UUID
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import delete
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth.dependencies import Principal, enforce_ingest_quota, require_member
@@ -272,6 +272,80 @@ async def job_status(job_id: UUID, session: AsyncSession = Depends(get_session))
         "entities_created_count": row.entities_created_count,
         "error_details": row.error_details,
     }
+
+
+#: How an upload's `external_reference_id` is prefixed. Uploads and crawls are
+#: not otherwise distinguishable: `origin_system` is written as "crawler" for
+#: both, which is a mislabel on the upload path rather than a fact about the
+#: row, so the reference is what actually says where a source came from.
+UPLOAD_REF_PREFIX = "manual_upload://"
+
+
+@router.get("/sources")
+async def list_ingested(session: AsyncSession = Depends(get_session)) -> dict:
+    """What has already been ingested, for the Ingest page.
+
+    The same question `GET /admin/knowledge-sources` answers, but that one is
+    admin-only and this page is not: a member who can upload a file should be
+    able to see whether they already did. This returns less as a result -- no
+    category, no uploader, no byte sizes -- because a member needs to know
+    what is in there, not to audit it.
+
+    **Inactive sources are left out.** A deactivated source is one somebody
+    removed; listing it under "already ingested" would invite re-uploading
+    something that was taken out on purpose, and the count of what is live is
+    the number this page is asked for.
+
+    Chunk counts come from one grouped aggregate rather than a subquery per
+    row: a correlated count here is one query per source, and the page shows
+    all of them.
+    """
+    from db.models import EmbeddingChunk, KnowledgeSource, KnowledgeSourceVersion
+
+    rows = (
+        await session.execute(
+            select(
+                KnowledgeSource,
+                KnowledgeSourceVersion.status,
+                KnowledgeSourceVersion.version_number,
+            )
+            .select_from(KnowledgeSource)
+            .outerjoin(
+                KnowledgeSourceVersion,
+                KnowledgeSourceVersion.version_id == KnowledgeSource.current_version_id,
+            )
+            .where(KnowledgeSource.is_active.is_(True))
+            .order_by(KnowledgeSource.updated_at.desc())
+        )
+    ).all()
+
+    chunk_counts = {
+        row.version_id: row.n
+        for row in (
+            await session.execute(
+                select(
+                    EmbeddingChunk.version_id, func.count().label("n")
+                ).group_by(EmbeddingChunk.version_id)
+            )
+        ).all()
+    }
+
+    files, urls = [], []
+    for source, status, version_number in rows:
+        reference = source.external_reference_id or ""
+        is_upload = reference.startswith(UPLOAD_REF_PREFIX)
+        entry = {
+            "source_id": str(source.source_id),
+            "name": source.source_name or reference or "(unnamed)",
+            "reference": reference[len(UPLOAD_REF_PREFIX):] if is_upload else reference,
+            "status": status,
+            "version_number": version_number,
+            "chunks": chunk_counts.get(source.current_version_id, 0),
+            "updated_at": source.updated_at.isoformat() if source.updated_at else None,
+        }
+        (files if is_upload else urls).append(entry)
+
+    return {"files": files, "urls": urls, "total": len(files) + len(urls)}
 
 
 @router.post("/upload", status_code=202)

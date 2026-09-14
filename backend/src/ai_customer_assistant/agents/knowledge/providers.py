@@ -31,6 +31,8 @@ from typing import Callable, Optional, Protocol, TypeAlias
 
 import groq
 
+from rate_limit_signal import note_rate_limited
+from agents.supervisor.routing import is_rate_limited
 from timeouts import (
     LLM_ANSWER_RETRY_BUDGET_S,
     LLM_ANSWER_TIMEOUT_S,
@@ -267,6 +269,13 @@ class GroqKnowledgeProvider:
                 return response.choices[0].message.content or "{}"
             except Exception as exc:  # noqa: BLE001 - APIError + wrapped connection errors
                 last_error = exc
+                # Leave a note the node can read if the turn's clock runs out
+                # before this loop does: a timeout on its own cannot say
+                # whether it was throttled or merely slow, and telling a
+                # throttled customer "something went wrong on my end" sends
+                # them looking for a bug that is not there.
+                if is_rate_limited(exc):
+                    note_rate_limited()
             if attempt < _RETRY_ATTEMPTS - 1:
                 cooldown = _cooldown_seconds(str(last_error)) or _RETRY_BASE_DELAY
                 if not sleep_within_budget(cooldown * (attempt + 1), deadline, timeout):

@@ -1,40 +1,48 @@
 """The role ordering.
 
-Two roles, and the line between them is **"uses the system" vs. "changes the
-system"**:
+Three roles, and the line between them is **who the person is to the
+company**:
 
-* ``member`` — everything the application currently does: ask questions,
-  browse the knowledge graph, upload documents, run crawls, watch jobs.
-  Anyone with an account is a trusted colleague who can add content.
-* ``admin`` — all of that, plus the system's own controls: who has accounts,
-  what the prompts and retrieval parameters are, and destroying sources.
+* ``visitor`` -- anyone. Chat is public, so nothing creates these accounts
+  today; the tier remains the floor of the ordering, and an account that
+  still holds it can sign in and reach the assistant and nothing else.
+* ``member`` -- a colleague, created by an admin rather than self-service.
+  Adds content: upload documents, run crawls, watch jobs, browse the
+  knowledge graph.
+* ``admin`` -- all of that, plus the system's own controls: who has accounts,
+  the agent prompts, the provider API keys, and destroying sources.
 
-Across the endpoints that exist today the two are almost identical; the only
-live difference is account creation. What the split buys is that the
-*unbuilt* administrative endpoints — prompt management, retrieval
-configuration, source deletion — have somewhere to land that is not the same
-gate as uploading a PDF. Those are the operations where a mistake is silent:
-change ``similarity_threshold`` and every answer degrades with no error
-anywhere, whereas a member's worst case is a bad document, which is visible
-and deletable.
+**Why three rather than two.** ``visitor`` and ``member`` are two genuinely
+different populations: a stranger and a colleague should not share a
+permission set merely because both are signed in. The alternative considered
+was renaming ``member`` to ``visitor`` and keeping two roles, which would have
+been strictly worse -- the role travels inside the JWT, so renaming it
+invalidates every live session, and it needs a data migration and a rewrite of
+every call site. Adding a tier *below* the existing one costs neither.
+
+The ordering is what makes that cheap. ``satisfies`` is a rank comparison, so
+inserting ``visitor`` below ``member`` made every existing ``require_member``
+guard start excluding visitors **without being edited** -- ingestion, crawling
+and the graph API were all correct the moment the rank existed.
 
 The role is stored as an ordered string, never as an ``is_admin`` boolean.
-The two cost the same today, but inserting a middle tier later costs one
-entry in ``_RANK`` and a reclassification of a few endpoints, rather than a
-migration plus a rewrite of every call site.
+The ranks are spaced by five so a further tier can be inserted between any
+two without renumbering the others.
 """
 
 from __future__ import annotations
 
 from typing import Final
 
+VISITOR: Final[str] = "visitor"
 MEMBER: Final[str] = "member"
 ADMIN: Final[str] = "admin"
 
+#: What an *admin* creating an account gets if they do not say otherwise.
 DEFAULT_ROLE: Final[str] = MEMBER
 
 # Ascending authority. The values are the ranks; only their order matters.
-_RANK: Final[dict[str, int]] = {MEMBER: 10, ADMIN: 20}
+_RANK: Final[dict[str, int]] = {VISITOR: 5, MEMBER: 10, ADMIN: 20}
 
 ALL_ROLES: Final[tuple[str, ...]] = tuple(
     sorted(_RANK, key=lambda role: _RANK[role])
