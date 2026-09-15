@@ -20,6 +20,7 @@ actually shipped, not with invented ones.
 from __future__ import annotations
 
 import pytest
+from conftest import fake_session_factory
 
 from agents.knowledge.config import KnowledgeAgentConfig
 from agents.knowledge.constants import STRATEGY_HYBRID, STRATEGY_STRUCTURED, STRATEGY_VECTOR
@@ -213,19 +214,12 @@ class TestTheChoiceIsRecorded:
             ),
         )
 
-        class _Session:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *exc):
-                return False
-
         graph = build_knowledge_agent_graph(
             config=config,
             rewrite_llm_complete=lambda p: "{}",
             extraction_llm_complete=lambda p: "{}",
             answer_llm_complete=lambda s, u: "{}",
-            session_factory=lambda: _Session(),
+            session_factory=fake_session_factory(),
             embed_query=lambda text: (0.0,) * config.embedding_dimension,
         )
         result = await graph.ainvoke({"raw_query": question, "conversation_history": ()})

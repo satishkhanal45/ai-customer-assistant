@@ -72,7 +72,35 @@ value_table = Table(
     Column("value", String, nullable=False),
     Column("searchable", Boolean, nullable=False),
     Column("created_at", DateTime, nullable=False),
+    Column("superseded_at", DateTime, nullable=True),
 )
+
+
+def _current(statement: Select) -> Select:
+    """Restrict a value query to facts that are still asserted.
+
+    Superseded rows are kept, not deleted, so that the rate that used to
+    apply remains a recoverable historical fact. But they must never reach
+    an answer as though they still applied: two contradictory prices
+    returned as equally true is a *wrong* answer delivered confidently,
+    where a missing one is at least visibly missing.
+
+    NULL is current, which is also what every row written before provenance
+    tracking existed carries -- so this filter changes nothing for them.
+    """
+    return statement.where(value_table.c.superseded_at.is_(None))
+
+
+def _newest_first(statement: Select) -> Select:
+    """Order values by recency, newest first.
+
+    Neither value query had an ORDER BY, so several values for one attribute
+    came back in whatever order the scan produced -- and the caller reads
+    them as a list of equally-weighted facts. Even among genuinely current
+    values, the most recently learned one is the better first answer, and an
+    arbitrary order is not a defensible alternative to any order.
+    """
+    return statement.order_by(value_table.c.created_at.desc(), value_table.c.value)
 
 relation_table = Table(
     "relation",
@@ -244,10 +272,19 @@ def _lookup_kind(query: StructuredQuery) -> str:
 
 def _attribute_lookup_statement(entity_ids: Sequence[str], attribute_name: str) -> Select:
     return (
-        select(value_table.c.value, attribute_table.c.value_type)
-        .select_from(value_table.join(attribute_table, value_table.c.attribute_id == attribute_table.c.id))
-        .where(value_table.c.entity_id.in_(entity_ids))
-        .where(attribute_table.c.name == attribute_name)
+        _newest_first(
+            _current(
+                select(value_table.c.value, attribute_table.c.value_type)
+                .select_from(
+                    value_table.join(
+                        attribute_table,
+                        value_table.c.attribute_id == attribute_table.c.id,
+                    )
+                )
+                .where(value_table.c.entity_id.in_(entity_ids))
+                .where(attribute_table.c.name == attribute_name)
+            )
+        )
     )
 
 
@@ -292,9 +329,20 @@ async def _attribute_lookup(entity_rows: Sequence[Row], query: StructuredQuery, 
 
 def _general_values_statement(entity_ids: Sequence[str]) -> Select:
     return (
-        select(attribute_table.c.name.label("attribute_name"), value_table.c.value, attribute_table.c.value_type)
-        .select_from(value_table.join(attribute_table, value_table.c.attribute_id == attribute_table.c.id))
-        .where(value_table.c.entity_id.in_(entity_ids))
+        _current(
+            select(
+                attribute_table.c.name.label("attribute_name"),
+                value_table.c.value,
+                attribute_table.c.value_type,
+            )
+            .select_from(
+                value_table.join(
+                    attribute_table,
+                    value_table.c.attribute_id == attribute_table.c.id,
+                )
+            )
+            .where(value_table.c.entity_id.in_(entity_ids))
+        )
     )
 
 

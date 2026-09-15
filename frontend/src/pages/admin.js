@@ -1,6 +1,14 @@
 /* Admin dashboard — Sources / Jobs / Stats / Tickets.
-   Backend endpoints are not wired yet (see frontend_plan.md §6.2); the UI
-   renders a graceful "not available" state until they exist. */
+
+   The four endpoints live in `api/admin.py` and are admin-only. Each
+   returns `{ <list>, total, limit, offset }` rather than a bare array, so
+   a caller can tell "all of it" from "the first page of it"; the readers
+   below still accept a bare array, because tolerating the weaker shape
+   costs one `Array.isArray` and removes a way to break.
+
+   The "not available" state is kept for the case where the API is down or
+   the caller has lost admin — a real thing that happens. It is no longer
+   the normal state of this page. */
 (function (NS) {
   'use strict';
 
@@ -14,7 +22,8 @@
   var STATUS_BADGES = {
     PENDING: 'badge-muted', PROCESSING: 'badge-accent', INDEXED: 'badge-ok',
     FAILED: 'badge-bad', STALE: 'badge-warn', ARCHIVED: 'badge-muted',
-    QUEUED: 'badge-muted', RUNNING: 'badge-accent', SUCCEEDED: 'badge-ok'
+    QUEUED: 'badge-muted', RUNNING: 'badge-accent', SUCCEEDED: 'badge-ok',
+    DEAD_LETTER: 'badge-bad'
   };
 
   var roots = {};
@@ -72,9 +81,15 @@
   function renderUnavailable(tab, err) {
     roots.body.innerHTML =
       '<div class="card admin-empty">' +
-      '<div class="admin-empty-title">Endpoint not available yet</div>' +
+      '<div class="admin-empty-title">' +
+      (err && err.status === 403 ? 'Administrator access required' : 'Could not load this view') +
+      '</div>' +
       '<div class="hint">GET ' + NS.utils.esc(ENDPOINTS[tab]) + ' failed: ' + NS.utils.esc(err.message || err) + '</div>' +
-      '<div class="hint">This view activates once the backend admin endpoints are wired (see <b>frontend_plan.md §6.2</b>: wire <code>ingestion/storage/api.py</code> deps, add <code>api/admin.py</code>).</div>' +
+      '<div class="hint">' +
+      (err && err.status === 403
+        ? 'This page is restricted to the <b>admin</b> role. Your account may have been changed since you signed in.'
+        : 'These endpoints are served by <code>api/admin.py</code>. If this persists, check the API is running and reachable.') +
+      '</div>' +
       '<button class="action" id="adminRetry">Retry</button></div>';
     var retry = roots.body.querySelector('#adminRetry');
     retry.addEventListener('click', renderTab);
@@ -90,6 +105,27 @@
   function badge(status) {
     var cls = STATUS_BADGES[String(status).toUpperCase()] || 'badge-muted';
     return '<span class="badge ' + cls + '">' + NS.utils.esc(status == null ? '—' : status) + '</span>';
+  }
+
+  /* "24 sources" and "60 failed, 22 succeeded" are the two questions a
+     list like this gets asked first. Both come from the payload rather
+     than from counting the rows on screen, which would be wrong the moment
+     a page limit applies. */
+  function summary(data, key) {
+    if (Array.isArray(data) || !data) return '';
+    var shown = (data[key] || []).length;
+    var parts = [];
+    if (data.total != null) {
+      parts.push('<span>' + (shown < data.total
+        ? shown + ' of ' + data.total
+        : data.total + ' ' + (data.total === 1 ? key.replace(/s$/, '') : key)) + '</span>');
+    }
+    if (data.by_status) {
+      Object.keys(data.by_status).forEach(function (k) {
+        parts.push('<span class="sum-chip">' + badge(k) + ' ' + data.by_status[k] + '</span>');
+      });
+    }
+    return parts.length ? '<div class="admin-summary">' + parts.join('') + '</div>' : '';
   }
 
   function table(headers, rows) {
@@ -108,20 +144,40 @@
         '<td>' + NS.utils.esc(NS.utils.formatDate(s.updated_at || s.created_at)) + '</td>' +
         '<td>' + (s.is_active === false ? 'no' : 'yes') + '</td>';
     });
-    roots.body.innerHTML = table(['Name', 'Type', 'Category', 'Status', 'Updated', 'Active'], rows);
+    roots.body.innerHTML = summary(data, 'sources') +
+      table(['Name', 'Type', 'Category', 'Status', 'Updated', 'Active'], rows);
+  }
+
+  /* "Will this fix itself?" is the question this table exists to answer, and
+     status alone cannot: a QUEUED row holding a future next_attempt_at is a
+     pending retry, not fresh work. */
+  function attempts(j) {
+    var n = j.attempt_count == null ? 0 : j.attempt_count;
+    if (!n) return '—';
+    if (j.next_attempt_at) {
+      return '<span class="badge badge-warn" title="Next attempt ' +
+        NS.utils.esc(NS.utils.formatDate(j.next_attempt_at)) + '">' + n + ' · retrying</span>';
+    }
+    return NS.utils.esc(String(n));
   }
 
   function renderJobs(data) {
     var rows = (Array.isArray(data) ? data : (data && data.jobs) || []).map(function (j) {
-      return '<td>' + NS.utils.esc(j.job_type || '—') + '</td>' +
+      /* Which document failed is the first thing anyone asks of this
+         table, and it was the one column missing from it. */
+      return '<td>' + NS.utils.esc(j.source_name || String(j.source_id || '').slice(0, 8) || '—') + '</td>' +
+        '<td>' + NS.utils.esc(j.job_type || '—') + '</td>' +
         '<td>' + badge(j.status) + '</td>' +
+        '<td>' + attempts(j) + '</td>' +
+        '<td>' + NS.utils.esc(j.failure_kind || '—') + '</td>' +
         '<td>' + NS.utils.esc(j.chunks_created_count == null ? '—' : j.chunks_created_count) + '</td>' +
         '<td>' + NS.utils.esc(j.entities_created_count == null ? '—' : j.entities_created_count) + '</td>' +
         '<td>' + NS.utils.esc(NS.utils.formatDate(j.started_at)) + '</td>' +
         '<td>' + NS.utils.esc(NS.utils.formatDate(j.completed_at)) + '</td>' +
         '<td>' + (j.error_details ? '<span class="err-detail" title="' + NS.utils.esc(j.error_details) + '">' + NS.utils.esc(String(j.error_details).slice(0, 60)) + '</span>' : '—') + '</td>';
     });
-    roots.body.innerHTML = table(['Type', 'Status', 'Chunks', 'Entities', 'Started', 'Completed', 'Error'], rows);
+    roots.body.innerHTML = summary(data, 'jobs') +
+      table(['Source', 'Type', 'Status', 'Attempts', 'Failure', 'Chunks', 'Entities', 'Started', 'Completed', 'Error'], rows);
   }
 
   function renderStats(data) {
@@ -162,7 +218,8 @@
         '<td>' + badge(t.status) + '</td>' +
         '<td>' + NS.utils.esc(NS.utils.formatDate(t.created_at)) + '</td>';
     });
-    roots.body.innerHTML = table(['ID', 'Email', 'Query', 'Priority', 'Status', 'Created'], rows);
+    roots.body.innerHTML = summary(data, 'tickets') +
+      table(['ID', 'Email', 'Query', 'Priority', 'Status', 'Created'], rows);
   }
 
   NS.pages = NS.pages || {};

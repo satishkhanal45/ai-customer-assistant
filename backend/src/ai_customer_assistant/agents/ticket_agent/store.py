@@ -339,6 +339,51 @@ class TicketStore:
 
         return ticket, True
 
+    async def get_ticket(self, ticket_id: str) -> Ticket | None:
+        """Look one ticket up by id. ``None`` when there is no such row.
+
+        The read half of this store. Creation has existed since the first
+        milestone; status lookup answered "not available yet" from a
+        hardcoded string in the router, so a customer who had just been given
+        a ticket id could not ask what had become of it.
+
+        A malformed id is a miss, not an error: the id arrives from a person
+        typing it into a chat box, and "no ticket with that id" is the honest
+        answer to "abc123" as much as to a well-formed uuid that does not
+        exist. Raising would turn a typo into a failed turn.
+        """
+        try:
+            key = _as_uuid(ticket_id)
+        except (ValueError, AttributeError, TypeError):
+            return None
+
+        # No database configured: fall back to what this process has created,
+        # the same way next_sequence does. Keeps the in-memory store usable
+        # in tests and dev without a second code path in the caller.
+        if self._session_factory is None:
+            # `rows` is the ledger of everything created here; `_by_key` only
+            # holds tickets that carried an idempotency key, so searching it
+            # alone would miss any ticket created without one.
+            return next(
+                (t for t in self.rows if str(t.ticket_id) == str(key)), None
+            )
+
+        from db.models import Ticket as _DbTicket
+
+        async with self._session_factory() as session:
+            row = await session.get(_DbTicket, key)
+
+        if row is None:
+            return None
+        return Ticket(
+            ticket_id=str(row.ticket_id),
+            email=row.email,
+            query=row.query,
+            reason=row.reason,
+            priority=row.priority,
+            status=row.status,
+        )
+
     @staticmethod
     async def _load_by_key(session: AsyncSession, idempotency_key: str | None) -> Ticket | None:
         """Rebuild the domain ``Ticket`` for an existing idempotency key."""

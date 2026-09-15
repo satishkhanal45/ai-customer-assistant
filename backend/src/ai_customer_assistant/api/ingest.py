@@ -44,16 +44,26 @@ from uuid import UUID
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import delete
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from auth.dependencies import Principal, enforce_ingest_quota, require_member
+from auth.ssrf import UnsafeURLError, assert_url_is_safe, safe_get
 from db.engine import get_session
 from ingestion.crawler.config import CrawlConfig, CrawlMode
 from ingestion.crawler.models import DiscoveryResult
 from ingestion.pipeline_types import FileType
 from ingestion.queue.document_producer import register_document_version
 
-router = APIRouter(prefix="/ingest", tags=["ingest"])
+# Every route here requires an authenticated `member`. Declared on the router
+# rather than per-endpoint so a route added later is protected by default --
+# the failure mode of per-endpoint dependencies is the endpoint someone
+# forgets, and it fails open.
+router = APIRouter(
+    prefix="/ingest",
+    tags=["ingest"],
+    dependencies=[Depends(require_member)],
+)
 
 DEFAULT_USER_ID = UUID("00000000-0000-0000-0000-000000000000")
 
@@ -170,6 +180,14 @@ async def _get_discovery(session: AsyncSession, discovery_id: str) -> _CachedDis
 
 
 def _uploaded_by() -> UUID:
+    """The fallback owner for ingestion that has no authenticated caller.
+
+    Since P0-3 the API paths pass the signed-in user's id instead, so this is
+    only reached by the worker and the offline scripts. It is kept because
+    `knowledge_source.uploaded_by` is NOT NULL and a background job genuinely
+    has no person behind it -- not as a default for HTTP requests, which is
+    what it used to be, and which meant no upload was attributable to anyone.
+    """
     raw = os.environ.get("INGEST_DEFAULT_USER_ID")
     return UUID(raw) if raw else DEFAULT_USER_ID
 
@@ -189,6 +207,14 @@ _CRAWL_DOC_MIME_TO_FILE_TYPE: dict[str, FileType | None] = {
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": None,
     "application/vnd.ms-excel": None,
 }
+
+async def _assert_fetchable(url: str) -> None:
+    """Reject a URL the server must not fetch, as a 400 rather than a 500."""
+    try:
+        await assert_url_is_safe(url)
+    except UnsafeURLError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
 
 RouteKind = Literal["html", "document"]
 
@@ -211,6 +237,7 @@ async def _register_and_enqueue(
     mime_type: str,
     file_type: FileType | None,
     category_id: UUID | None,
+    uploaded_by: UUID | None = None,
 ) -> dict:
     job = await register_document_version(
         session,
@@ -218,7 +245,7 @@ async def _register_and_enqueue(
         raw_bytes=raw_bytes,
         mime_type=mime_type,
         file_type=file_type,
-        uploaded_by=_uploaded_by(),
+        uploaded_by=uploaded_by or _uploaded_by(),
         category_id=category_id,
     )
     if job is None:
@@ -247,11 +274,86 @@ async def job_status(job_id: UUID, session: AsyncSession = Depends(get_session))
     }
 
 
+#: How an upload's `external_reference_id` is prefixed. Uploads and crawls are
+#: not otherwise distinguishable: `origin_system` is written as "crawler" for
+#: both, which is a mislabel on the upload path rather than a fact about the
+#: row, so the reference is what actually says where a source came from.
+UPLOAD_REF_PREFIX = "manual_upload://"
+
+
+@router.get("/sources")
+async def list_ingested(session: AsyncSession = Depends(get_session)) -> dict:
+    """What has already been ingested, for the Ingest page.
+
+    The same question `GET /admin/knowledge-sources` answers, but that one is
+    admin-only and this page is not: a member who can upload a file should be
+    able to see whether they already did. This returns less as a result -- no
+    category, no uploader, no byte sizes -- because a member needs to know
+    what is in there, not to audit it.
+
+    **Inactive sources are left out.** A deactivated source is one somebody
+    removed; listing it under "already ingested" would invite re-uploading
+    something that was taken out on purpose, and the count of what is live is
+    the number this page is asked for.
+
+    Chunk counts come from one grouped aggregate rather than a subquery per
+    row: a correlated count here is one query per source, and the page shows
+    all of them.
+    """
+    from db.models import EmbeddingChunk, KnowledgeSource, KnowledgeSourceVersion
+
+    rows = (
+        await session.execute(
+            select(
+                KnowledgeSource,
+                KnowledgeSourceVersion.status,
+                KnowledgeSourceVersion.version_number,
+            )
+            .select_from(KnowledgeSource)
+            .outerjoin(
+                KnowledgeSourceVersion,
+                KnowledgeSourceVersion.version_id == KnowledgeSource.current_version_id,
+            )
+            .where(KnowledgeSource.is_active.is_(True))
+            .order_by(KnowledgeSource.updated_at.desc())
+        )
+    ).all()
+
+    chunk_counts = {
+        row.version_id: row.n
+        for row in (
+            await session.execute(
+                select(
+                    EmbeddingChunk.version_id, func.count().label("n")
+                ).group_by(EmbeddingChunk.version_id)
+            )
+        ).all()
+    }
+
+    files, urls = [], []
+    for source, status, version_number in rows:
+        reference = source.external_reference_id or ""
+        is_upload = reference.startswith(UPLOAD_REF_PREFIX)
+        entry = {
+            "source_id": str(source.source_id),
+            "name": source.source_name or reference or "(unnamed)",
+            "reference": reference[len(UPLOAD_REF_PREFIX):] if is_upload else reference,
+            "status": status,
+            "version_number": version_number,
+            "chunks": chunk_counts.get(source.current_version_id, 0),
+            "updated_at": source.updated_at.isoformat() if source.updated_at else None,
+        }
+        (files if is_upload else urls).append(entry)
+
+    return {"files": files, "urls": urls, "total": len(files) + len(urls)}
+
+
 @router.post("/upload", status_code=202)
 async def upload(
     file: UploadFile,
     category_id: UUID | None = None,
     session: AsyncSession = Depends(get_session),
+    principal: Principal = Depends(enforce_ingest_quota),
 ) -> dict:
     mime = (file.content_type or "application/octet-stream").split(";", 1)[0].strip().lower()
     file_type = _UPLOAD_MIME_TO_FILE_TYPE.get(mime)
@@ -271,6 +373,7 @@ async def upload(
         mime_type=mime,
         file_type=file_type,
         category_id=category_id,
+        uploaded_by=principal.id,
     )
 
 
@@ -333,6 +436,11 @@ async def _run_discovery(
 
     from ingestion.crawler.crawler import discover
 
+    # The crawler's fetch boundary checks every URL it touches, so this is
+    # not the only guard -- it is the one that answers a hostile root with a
+    # 400 in milliseconds instead of after Chromium has started.
+    await _assert_fetchable(root_url)
+
     host = urlsplit(root_url).netloc
     config = CrawlConfig(
         mode=CrawlMode.SITE,
@@ -358,7 +466,10 @@ def _review_payload(discovery_id: str, result: DiscoveryResult) -> dict:
 
 
 async def _ingest_documents(
-    session: AsyncSession, documents, category_id: UUID | None
+    session: AsyncSession,
+    documents,
+    category_id: UUID | None,
+    uploaded_by: UUID | None = None,
 ) -> dict:
     """Register + run ingestion for every successfully crawled item."""
     outcomes = []
@@ -373,20 +484,29 @@ async def _ingest_documents(
             mime_type=_crawl_mime(doc.file_type),
             file_type=FileType.MD if not doc.file_type else _crawl_file_type(doc.file_type),
             category_id=category_id,
+            uploaded_by=uploaded_by,
         )
         outcome["url"] = doc.url
         outcomes.append(outcome)
     return {"status": "submitted", "results": outcomes}
 
 
-async def _crawl_single_page(req: CrawlRequest, session: AsyncSession) -> dict:
+async def _crawl_single_page(
+    req: CrawlRequest, session: AsyncSession, uploaded_by: UUID | None = None
+) -> dict:
     """PAGE scope: crawl exactly the given URL (v1 behavior), no discovery."""
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
-            response = await client.get(req.url)
-            response.raise_for_status()
-            content_type = response.headers.get("content-type", "application/octet-stream")
-            raw_bytes = response.content
+        # `safe_get` rather than a bare client: it validates the URL, walks
+        # redirects one hop at a time re-validating each, and re-checks the
+        # address actually connected to. `follow_redirects=True` here was the
+        # bypass -- a public URL that 302s to 169.254.169.254 sailed straight
+        # through the check on the URL the caller supplied.
+        response = await safe_get(req.url, timeout=30.0)
+        response.raise_for_status()
+        content_type = response.headers.get("content-type", "application/octet-stream")
+        raw_bytes = response.content
+    except UnsafeURLError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=400, detail=f"Failed to fetch URL: {exc}") from exc
 
@@ -412,6 +532,7 @@ async def _crawl_single_page(req: CrawlRequest, session: AsyncSession) -> dict:
             mime_type="text/markdown",
             file_type=FileType.MD,
             category_id=req.category_id,
+            uploaded_by=uploaded_by,
         )
 
     from urllib.parse import urlsplit
@@ -428,16 +549,17 @@ async def _crawl_single_page(req: CrawlRequest, session: AsyncSession) -> dict:
     )
     page = classify_url(req.url)
     documents = await crawl_confirmed((page,), config)
-    return await _ingest_documents(session, documents, req.category_id)
+    return await _ingest_documents(session, documents, req.category_id, uploaded_by)
 
 
 @router.post("/crawl", status_code=202)
 async def crawl(
     req: CrawlRequest,
     session: AsyncSession = Depends(get_session),
+    principal: Principal = Depends(enforce_ingest_quota),
 ) -> dict:
     if req.scope == "PAGE":
-        return await _crawl_single_page(req, session)
+        return await _crawl_single_page(req, session, principal.id)
 
     # SITE scope: discovery-first, always goes through a review step before any
     # crawling happens. No same-request auto-crawl.
@@ -452,6 +574,7 @@ async def crawl(
 async def crawl_discover(
     req: DiscoverRequest,
     session: AsyncSession = Depends(get_session),
+    principal: Principal = Depends(enforce_ingest_quota),
 ) -> dict:
     result, config = await _run_discovery(
         req.root_url, wait_strategy=req.wait_strategy, wait_selector=req.wait_selector
@@ -465,6 +588,7 @@ async def crawl_confirm(
     discovery_id: str,
     req: ConfirmRequest,
     session: AsyncSession = Depends(get_session),
+    principal: Principal = Depends(enforce_ingest_quota),
 ) -> dict:
     from ingestion.crawler.crawler import crawl_confirmed
 
@@ -475,4 +599,6 @@ async def crawl_confirm(
             detail="Unknown or expired discovery_id. Run /crawl/discover again.",
         )
     documents = await crawl_confirmed(cached.result.pages, cached.config)
-    return await _ingest_documents(session, documents, req.category_id)
+    return await _ingest_documents(
+        session, documents, req.category_id, principal.id
+    )

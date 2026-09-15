@@ -399,7 +399,7 @@ answer:     "I'm sorry, but I don't have information on the reason..."
 
 ---
 
-### F8 — `hybrid_retrieve` cannot safely be called with the hybrid strategy 🟡
+### ✅ F8 — `hybrid_retrieve` could not be called with the hybrid strategy — **RESOLVED BY REMOVAL 2026-09-06**
 
 **Evidence.** Calling it with a single `AsyncSession` raised:
 
@@ -410,7 +410,28 @@ concurrent operations are not permitted
 
 `hybrid_retrieve(...)` takes one `session`, but `_hybrid_fan_out` runs both arms under `asyncio.gather`, and one session cannot serve two concurrent coroutines. The compiled graph never hits this because its nodes each open their own session from a factory — so the bug only bites a direct caller, which is precisely what this function is advertised for.
 
-**Fix.** Change the signature to take a `session_factory` and open one session per arm, matching what `nodes.py` already does. It is a small change and it removes a trap from a public API.
+**Resolved by deleting the function**, after two intermediate steps worth recording because they show the shape of the decision.
+
+**First it was fixed.** The signature changed to a `session_factory`, one session per arm, matching `nodes.py`. Verified against real Postgres: `facts=4, chunks=1` where it previously raised.
+
+**Then the harder question was asked: should it exist at all?** `hybrid_retrieve` had no production callers. The compiled graph reaches `structured_lookup` and `vector_search` through its own nodes and never imported it. So it was a second implementation of four behaviours the graph already had — strategy dispatch, graceful-miss handling, the P1-6 fallback and the F4 filter — kept in step by hand. Both P1-6 and F4 had required matching edits in both copies.
+
+**It is now deleted.** `hybrid.py` went from 337 lines to 151 and became what its remaining contents actually are: pure retrieval *policy*. `decide_strategy`, `should_fall_back_to_vector` and the two graceful-miss constants stay, because the graph imports them.
+
+**Nothing about retrieval changed.** Verified after the deletion, against the live database:
+
+```
+strategy : hybrid
+facts    : 4   <- structured arm
+chunks   : 1   <- vector arm
+answer   : "Soani Tech rebranded to Alpinist Studios to signal its evolution..."
+```
+
+Hybrid retrieval is a property of the graph's fan-out edge, not of any function named after it. That distinction was the crux — it is easy to read "delete `hybrid_retrieve`" as "stop doing hybrid search", and they are unrelated.
+
+**Test coverage moved rather than shrank.** Eleven call sites went; the behaviours they asserted are now checked on the nodes and the compiled graph — the path that actually runs, and the one that caught P1-6 when the isolated tests passed straight through it. Four duplicate session fakes were consolidated into `tests/agents/knowledge/conftest.py`. Suite 645 → 638, all passing.
+
+**The F8 fix became moot, and that is the point.** "Make the duplicate work" and "remove the duplicate" were both on the table; only the second shrinks the surface. An hour was spent on the first before the second was chosen — recorded so the sequence is visible rather than tidied away.
 
 ---
 
@@ -425,14 +446,14 @@ concurrent operations are not permitted
 | ~~5~~ | ~~**F7** — stream the response~~ | — | **Done 2026-09-06** |
 | ~~6a~~ | ~~**F5** — routing consistency~~ | — | **Done 2026-09-06** |
 | ~~6b~~ | ~~**F6** — the Supervisor refuses an answerable question~~ | — | **Done 2026-09-06** |
-| 7 | **F8** — session factory in `hybrid_retrieve` | ~30 min | Removes an API trap |
+| ~~7~~ | ~~**F8** — session factory in `hybrid_retrieve`~~ | — | **Done 2026-09-06** |
 | ~~8~~ | ~~**F9** — a structured fact deleted the chunk holding the answer~~ | — | **Done 2026-09-06** |
 
 **F3 was done first, deliberately.** Two of the three failures in this test were opaque, and diagnosing them consumed most of the effort. With the logging in place every subsequent fix was cheaper to verify — F2's and F1's verification both used it directly.
 
 **The three timeout findings are now closed, and they were one problem seen from three angles:** nothing bounded the whole, the bounds that existed were the wrong size, and when they fired nobody could tell.
 
-**F4 closed the last defect that made the assistant refuse an answerable question, and F7 closed the last one that made it *feel* broken.** What remains is routing consistency (F5/F6) and an API trap (F8) — real, but neither produces a wrong answer or a blank wait.
+**F4 closed the last defect that made the assistant refuse an answerable question, and F7 closed the last one that made it *feel* broken.**
 
 **Every finding with a customer-visible effect is now closed.** What remains is **F8**, a developer-facing trap in a public function: `hybrid_retrieve` accepts one session while its hybrid path runs both arms concurrently, which SQLAlchemy forbids. The compiled graph avoids it by using a session factory per node, so nothing in production hits it — only a direct caller would, which is precisely what that function is advertised for.
 

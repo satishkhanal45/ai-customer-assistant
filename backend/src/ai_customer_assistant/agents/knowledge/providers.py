@@ -31,6 +31,8 @@ from typing import Callable, Optional, Protocol, TypeAlias
 
 import groq
 
+from rate_limit_signal import note_rate_limited
+from agents.supervisor.routing import is_rate_limited
 from timeouts import (
     LLM_ANSWER_RETRY_BUDGET_S,
     LLM_ANSWER_TIMEOUT_S,
@@ -38,6 +40,8 @@ from timeouts import (
     LLM_SHORT_TIMEOUT_S,
     sleep_within_budget,
 )
+
+import llm_credentials
 
 from .config import KnowledgeAgentConfig
 
@@ -130,7 +134,7 @@ class AnthropicKnowledgeProvider:
     ) -> None:
         import anthropic
 
-        resolved_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        resolved_key = api_key or llm_credentials.api_key_for("anthropic")
         if not resolved_key:
             raise ValueError("ANTHROPIC_API_KEY not set.")
 
@@ -206,7 +210,7 @@ class GroqKnowledgeProvider:
         answer_timeout: float = LLM_ANSWER_TIMEOUT_S,
         answer_retry_budget: float = LLM_ANSWER_RETRY_BUDGET_S,
     ) -> None:
-        resolved_key = api_key or os.environ.get("GROQ_API_KEY")
+        resolved_key = api_key or llm_credentials.api_key_for("groq")
         if not resolved_key:
             raise ValueError("GROQ_API_KEY not set.")
 
@@ -265,6 +269,13 @@ class GroqKnowledgeProvider:
                 return response.choices[0].message.content or "{}"
             except Exception as exc:  # noqa: BLE001 - APIError + wrapped connection errors
                 last_error = exc
+                # Leave a note the node can read if the turn's clock runs out
+                # before this loop does: a timeout on its own cannot say
+                # whether it was throttled or merely slow, and telling a
+                # throttled customer "something went wrong on my end" sends
+                # them looking for a bug that is not there.
+                if is_rate_limited(exc):
+                    note_rate_limited()
             if attempt < _RETRY_ATTEMPTS - 1:
                 cooldown = _cooldown_seconds(str(last_error)) or _RETRY_BASE_DELAY
                 if not sleep_within_budget(cooldown * (attempt + 1), deadline, timeout):
@@ -317,7 +328,7 @@ class GeminiKnowledgeProvider:
         timeout: float = LLM_SHORT_TIMEOUT_S,
         answer_timeout: float = LLM_ANSWER_TIMEOUT_S,
     ) -> None:
-        resolved_key = api_key or os.environ.get("GEMINI_API_KEY")
+        resolved_key = api_key or llm_credentials.api_key_for("gemini")
         if not resolved_key:
             raise ValueError("GEMINI_API_KEY not set.")
 
@@ -451,15 +462,23 @@ def _resolved_provider_from_config(config: Optional[KnowledgeAgentConfig]) -> st
     configured = getattr(config, "llm_provider", "stub")
     if configured in _PROVIDER_FACTORIES and _has_credentials(configured):
         return configured
-    for candidate in ("groq", "gemini"):
-        if _has_credentials(candidate):
+    # The administrator's chosen default is tried before the hard-coded
+    # order, so setting it on the Admin page actually decides something.
+    for candidate in (llm_credentials.default_provider(), "groq", "gemini"):
+        if candidate in _PROVIDER_FACTORIES and _has_credentials(candidate):
             return candidate
     return "stub"
 
 
 def _has_credentials(provider: str) -> bool:
-    env_var = _ENV_VAR_BY_PROVIDER.get(provider)
-    return bool(env_var and os.environ.get(env_var))
+    """Whether this provider has a key at all -- saved or in the environment.
+
+    `llm_credentials.api_key_for` checks the admin-saved key first and the
+    provider's environment variable second, so a deployment that never uses
+    the Admin page behaves exactly as it did when this read `os.environ`
+    directly.
+    """
+    return bool(llm_credentials.api_key_for(provider))
 
 
 def llm_completions(provider: KnowledgeProvider) -> LLMCompletions:

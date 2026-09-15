@@ -24,6 +24,7 @@ from timeouts import KNOWLEDGE_NODE_TIMEOUT_S
 from .agents_wiring import (
     make_knowledge_agent_node,
     make_ticket_agent_node,
+    make_ticket_status_node,
 )
 from .llm_client import StubSupervisorLLMClient, SupervisorLLMClient
 from .node import assemble_response_node, make_classify_and_route_node
@@ -35,11 +36,13 @@ CLASSIFY_NODE = "classify_and_route"
 ASSEMBLE_NODE = "assemble_response"
 KNOWLEDGE_AGENT_NODE = "knowledge_agent"
 TICKET_AGENT_NODE = "ticket_agent"
+TICKET_STATUS_NODE = "ticket_status"
 
 # Where classification/post-downstream routing can send the conversation.
 _ROUTE_TARGETS = {
     NextAgent.KNOWLEDGE_AGENT: KNOWLEDGE_AGENT_NODE,
     NextAgent.TICKET_AGENT: TICKET_AGENT_NODE,
+    NextAgent.TICKET_STATUS_AGENT: TICKET_STATUS_NODE,
     NextAgent.NONE: END,
 }
 
@@ -76,6 +79,7 @@ def build_supervisor_graph(
     *,
     knowledge_agent_node: Optional[Callable[[SupervisorState], dict]] = None,
     ticket_agent_node: Optional[Callable[[SupervisorState], dict]] = None,
+    ticket_status_node: Optional[Callable[[SupervisorState], dict]] = None,
     knowledge_graph: Optional[Callable] = None,
     knowledge_timeout_s: float = KNOWLEDGE_NODE_TIMEOUT_S,
     ticket_ops: Optional[Callable] = None,
@@ -141,6 +145,18 @@ def build_supervisor_graph(
             ),
         ),
     )
+    # Shares `ticket_ops` with the ticket agent: same store, opposite
+    # direction -- one writes a ticket, this one reads it back.
+    graph.add_node(
+        TICKET_STATUS_NODE,
+        _log_node(
+            TICKET_STATUS_NODE,
+            ticket_status_node
+            or make_ticket_status_node(
+                ticket_ops if ticket_ops is not None else TicketStore()
+            ),
+        ),
+    )
     graph.add_node(
         ASSEMBLE_NODE, _log_node(ASSEMBLE_NODE, assemble_response_node)
     )
@@ -149,6 +165,7 @@ def build_supervisor_graph(
     graph.add_conditional_edges(CLASSIFY_NODE, _route_after_classification)
     graph.add_edge(KNOWLEDGE_AGENT_NODE, ASSEMBLE_NODE)
     graph.add_edge(TICKET_AGENT_NODE, ASSEMBLE_NODE)
+    graph.add_edge(TICKET_STATUS_NODE, ASSEMBLE_NODE)
     graph.add_edge(ASSEMBLE_NODE, END)
 
     return graph.compile(checkpointer=checkpointer)

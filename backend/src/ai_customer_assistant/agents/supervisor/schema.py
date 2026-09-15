@@ -27,6 +27,11 @@ class Intent(str, Enum):
 class NextAgent(str, Enum):
     KNOWLEDGE_AGENT = "KNOWLEDGE_AGENT"
     TICKET_AGENT = "TICKET_AGENT"
+    # Separate from TICKET_AGENT on purpose: that node's whole job is
+    # *creating* a ticket, and it does so by interrupting twice to collect a
+    # reason and an email. Looking one up asks a different question and
+    # writes nothing.
+    TICKET_STATUS_AGENT = "TICKET_STATUS_AGENT"
     NONE = "NONE"
 
 

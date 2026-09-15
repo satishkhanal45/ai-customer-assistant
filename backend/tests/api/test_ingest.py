@@ -54,14 +54,30 @@ class _FakeSession:
         return self._jobs.get(str(job_id))
 
 
-def _build_app(ingest, fake_session) -> FastAPI:
+def _build_app(ingest, fake_session, principal=None) -> FastAPI:
+    """The ingest router, with a fake session and a signed-in caller.
+
+    Every route on this router requires an authenticated `member` since
+    P0-3. These tests are about ingestion rather than about authentication,
+    so the caller is supplied by overriding `get_current_user` -- the single
+    dependency that `require_member` and `enforce_ingest_quota` both resolve
+    through. `tests/api/test_route_protection.py` is what proves the routes
+    are actually protected; repeating that here would only make these tests
+    fail for the wrong reason.
+    """
+    from auth.dependencies import Principal, get_current_user
+
     app = FastAPI()
     app.include_router(ingest.router)
 
     async def _override_session():
         yield fake_session
 
+    caller = principal or Principal(
+        id=uuid.uuid4(), email="tester@example.com", role="member"
+    )
     app.dependency_overrides[ingest.get_session] = _override_session
+    app.dependency_overrides[get_current_user] = lambda: caller
     return app
 
 
@@ -133,23 +149,20 @@ async def test_crawl_page_enqueues_only_and_does_not_run_the_job(ingest, monkeyp
         def raise_for_status(self):
             pass
 
-    class _FakeClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return False
-
-        async def get(self, url):
-            return _FakeResponse()
+    async def _fake_safe_get(url, **kwargs):
+        return _FakeResponse()
 
     async def _fake_register(session, **kwargs):
         return SimpleNamespace(job_id=job_id, source_id=uuid.uuid4(), version_id=uuid.uuid4())
 
-    monkeypatch.setattr(ingest.httpx, "AsyncClient", _FakeClient)
+    # Patched at `safe_get` rather than at `httpx.AsyncClient`: since P0-3
+    # the endpoint fetches through the SSRF guard, which validates the URL,
+    # walks redirects one hop at a time and re-checks the address actually
+    # connected to. Stubbing httpx underneath all of that would also make
+    # this test depend on live DNS for example.com. The guard has its own
+    # tests in tests/auth/test_ssrf.py; the case below covers the one thing
+    # this endpoint is responsible for -- turning a refusal into a 400.
+    monkeypatch.setattr(ingest, "safe_get", _fake_safe_get)
     monkeypatch.setattr(ingest, "register_document_version", _fake_register)
 
     async with AsyncClient(
@@ -175,3 +188,44 @@ async def test_crawl_page_enqueues_only_and_does_not_run_the_job(ingest, monkeyp
 async def test_api_module_exposes_no_inline_job_runner(ingest):
     """Guard against the fire-and-forget path being reintroduced."""
     assert not hasattr(ingest, "_run_job")
+
+
+@pytest.mark.asyncio
+async def test_crawl_page_refuses_an_internal_address(ingest):
+    """The SSRF hole this endpoint used to be.
+
+    `POST /ingest/crawl` makes the server fetch a URL the caller chose, so
+    before P0-3 an authenticated-or-not caller could read the cloud instance
+    metadata endpoint -- credentials, in one request -- along with anything
+    else bound inside the network. The guard answers 400 rather than 500:
+    this is a refused request, not a broken one.
+    """
+    app = _build_app(ingest, _FakeSession([]))
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        resp = await client.post(
+            "/ingest/crawl",
+            json={"url": "http://169.254.169.254/latest/meta-data/", "scope": "PAGE"},
+        )
+
+    assert resp.status_code == 400
+    assert "link-local" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_site_discovery_refuses_an_internal_address(ingest):
+    """The same guard on the discovery path, which reaches the crawler
+    rather than httpx and would otherwise start Chromium first."""
+    app = _build_app(ingest, _FakeSession([]))
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        resp = await client.post(
+            "/ingest/crawl/discover", json={"root_url": "http://127.0.0.1:9200/"}
+        )
+
+    assert resp.status_code == 400
+    assert "loopback" in resp.json()["detail"]

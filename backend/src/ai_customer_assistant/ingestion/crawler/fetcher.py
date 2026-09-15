@@ -23,11 +23,32 @@ import asyncio
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from auth.ssrf import UnsafeURLError, assert_url_is_safe
+
 from .config import CrawlConfig
-from .exception import FetchError
+from .exception import BlockedURLError, FetchError
 from .models import FetchedBytes, FetchedPage
 
 _TRANSIENT_ERRORS = (PlaywrightError, PlaywrightTimeoutError)
+
+
+async def _guard(url: str) -> None:
+    """Refuse a URL that must not be fetched, before any request is made.
+
+    This module is the only network I/O boundary for page and document
+    fetching, which makes it the one place the SSRF guard has to be applied
+    to cover everything: the discovery walk, robots.txt, sitemap.xml, every
+    document download, and every link followed during a confirmed crawl.
+
+    Checking only the URL the API was handed would not be enough. A site is
+    crawled by following its links, and a link on a public page pointing at
+    an intranet host is fetched by exactly the same code path -- so the check
+    belongs where the fetch happens, not where the request arrives.
+    """
+    try:
+        await assert_url_is_safe(url)
+    except UnsafeURLError as exc:
+        raise BlockedURLError(str(exc)) from exc
 
 
 def _backoff_delay(attempt: int, config: CrawlConfig) -> float:
@@ -69,6 +90,7 @@ async def fetch_page(
     the wait step differs. Invalid strategies are rejected at config
     construction, never here.
     """
+    await _guard(url)
     wait = _WAIT_STRATEGIES[config.wait_strategy]
 
     async def attempt(remaining: int) -> FetchedPage:
@@ -95,6 +117,7 @@ async def fetch_bytes(
     url: str, context, config: CrawlConfig
 ) -> FetchedBytes:
     """Fetch raw response bytes over Playwright's plain ``context.request``."""
+    await _guard(url)
 
     async def attempt(remaining: int) -> FetchedBytes:
         try:
