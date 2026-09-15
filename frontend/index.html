@@ -52,6 +52,9 @@
       <div class="brand">AI Customer Assistant</div>
     </div>
     <div class="header-right">
+      <!-- Filled by session.js: the signed-in address and a sign-out
+           button. Empty while signed out. -->
+      <div class="session-box" id="sessionBox"></div>
       <button class="icon-btn" id="themeToggle" title="Toggle theme"></button>
       <div class="avatar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 4-6 8-6s8 2 8 6"/></svg></div>
     </div>
@@ -78,13 +81,16 @@
 <script src="src/utils.js"></script>
 <script src="src/config.js"></script>
 <script src="src/api.js"></script>
+<script src="src/session.js"></script>
 <script src="src/router.js"></script>
+<script src="src/pages/login.js"></script>
 <script src="src/pages/overview.js"></script>
 <script src="src/pages/chat.js"></script>
 <script src="src/pages/graph.js"></script>
 <script src="src/pages/ingest.js"></script>
 <script src="src/pages/prompt.js"></script>
 <script src="src/pages/admin.js"></script>
+<script src="src/pages/apikeys.js"></script>
 <script>window.ACA.router.init();</script>
 </body>
 </html>

@@ -49,6 +49,13 @@ class JobStatus(str, Enum):
     RUNNING = "RUNNING"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
+    # Retried until the attempt budget ran out. Distinct from FAILED on
+    # purpose: FAILED means "this cannot work as it stands" (a checksum
+    # mismatch, a model that rejects the content), DEAD_LETTER means "this
+    # kept failing for reasons that usually pass, and we stopped trying".
+    # They need different things from a human, so the Jobs page has to be
+    # able to tell them apart.
+    DEAD_LETTER = "DEAD_LETTER"
 
 
 class EntityMapRelationship(str, Enum):
@@ -92,6 +99,9 @@ class JobRef:
     job_type: JobType
     status: JobStatus
     triggered_by: str
+    # How many times this job has already been tried. Carried on the ref so
+    # the retry decision can be made without a second read of the row.
+    attempt_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,3 +191,8 @@ class JobOutcome:
     chunks_created_count: int = 0
     entities_created_count: int = 0
     error_details: str | None = None
+    # The stage that failed, as a bare code -- the same string that used to
+    # be recoverable only by splitting `error_details` on its first colon.
+    # The retry policy dispatches on this, so it has to be structured rather
+    # than parsed back out of a human-readable sentence.
+    failure_kind: str | None = None

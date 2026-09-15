@@ -1,7 +1,9 @@
 # Crawler — Frontend Integration Guide
 
 > **Current.** Every endpoint documented here was verified against
-> `api/ingest.py` on 2026-09-06 and still matches.
+> `api/ingest.py` on 2026-09-08. Updated for P0-3: **every ingest route now
+> requires an authenticated `member`**, and the crawler refuses URLs that do
+> not resolve to a publicly-routable address. See §1.1 and §6.
 
 How the web frontend integrates with the AI Customer Assistant's document
 crawler/ingestion API. This covers every endpoint you need, the request/response
@@ -22,8 +24,36 @@ There is **no `/api` prefix**; the routers are mounted at the app root.
 The frontend already resolves this in `frontend/src/config.js` via
 `NS.config.apiBase`. Use it for every call below.
 
-> CORS is wide open (`allow_origins=["*"]`) for dev. There is currently **no
-> auth** on the ingest routes.
+---
+
+## 1.1 Authentication (P0-3)
+
+**Every route in this guide requires a signed-in `member`.** An
+unauthenticated call gets `401` with a `WWW-Authenticate` header.
+
+In the browser there is nothing to do beyond sending cookies: the session is
+a pair of `HttpOnly` cookies the browser attaches itself, and no token is
+readable from JavaScript. Two consequences for the code in §5:
+
+1. **Every `fetch` needs `credentials: 'include'`.** Without it the browser
+   omits the cookies and the call 401s. The snippets below include it.
+2. **Prefer `NS.api` over raw `fetch`.** `frontend/src/api.js` already sends
+   credentials, and — more importantly — it refreshes and replays once on a
+   `401`, through a *single shared* in-flight refresh. Access tokens last
+   fifteen minutes, so expiry mid-session is ordinary rather than
+   exceptional. Rolling your own refresh per call is actively dangerous:
+   refresh tokens rotate, so two concurrent refreshes present the same token
+   twice, which the server correctly reads as theft and answers by revoking
+   every session the user has.
+
+From a script, log in with `transport: "bearer"` and send
+`Authorization: Bearer <token>`. The root `README.md` has a worked example.
+
+CORS is no longer open. It is off entirely by default, which restricts
+nothing: the frontend is served from the API's own origin, so its requests
+are same-origin and never consult CORS. `CORS_ALLOW_ORIGINS` is an explicit
+allowlist for a genuinely cross-origin frontend; a wildcard is not accepted,
+because the session is a cookie.
 
 ---
 
@@ -110,7 +140,10 @@ submission record:
 If the URL is a document (PDF/DOCX) it returns the bulk shape below
 (`results` array with one entry).
 
-Errors: `400` — URL could not be fetched; `502` — page fetched but HTML
+Errors: `400` — URL could not be fetched, **or refused by the SSRF guard**
+(the `detail` says why: a private, loopback, link-local or otherwise
+non-routable address, a disallowed scheme, or a redirect to one of those);
+`502` — page fetched but HTML
 extraction failed.
 
 **When `scope: "SITE"`**
@@ -244,6 +277,7 @@ Errors: `415` — unsupported media type; `400` — empty file.
 ```js
 const res = await fetch(`${apiBase}/ingest/crawl`, {
   method: 'POST',
+  credentials: 'include',            // send the session cookies (§1.1)
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
     url,
@@ -265,6 +299,7 @@ if (body.status === 'submitted') {
 // 1) Discover
 const disc = await fetch(`${apiBase}/ingest/crawl/discover`, {
   method: 'POST',
+  credentials: 'include',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({ root_url: siteUrl, wait_strategy: 'networkidle' }),
 }).then(r => r.json());
@@ -273,6 +308,7 @@ const disc = await fetch(`${apiBase}/ingest/crawl/discover`, {
 // 2) Show review list to the user, then confirm their selection
 const conf = await fetch(`${apiBase}/ingest/crawl/${disc.discovery_id}/confirm`, {
   method: 'POST',
+  credentials: 'include',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({ category_id }),
 }).then(r => r.json());
@@ -294,7 +330,11 @@ const fd = new FormData();
 fd.append('file', fileInput.files[0]);
 if (categoryId) fd.append('category_id', categoryId);
 
-const res = await fetch(`${apiBase}/ingest/upload`, { method: 'POST', body: fd });
+const res = await fetch(`${apiBase}/ingest/upload`, {
+  method: 'POST',
+  credentials: 'include',
+  body: fd,
+});
 const body = await res.json();
 if (body.status === 'submitted') await pollJob(body.job_id);
 ```
@@ -307,8 +347,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function pollJob(jobId, onUpdate) {
   for (let i = 0; i < 120; i++) {          // ~2 min cap
-    const res = await fetch(`${apiBase}/ingest/jobs/${jobId}`);
+    const res = await fetch(`${apiBase}/ingest/jobs/${jobId}`, {
+      credentials: 'include',
+    });
     if (res.status === 404) return null;   // job gone
+    if (res.status === 401) return null;   // signed out mid-poll; NS.api
+                                           // handles this properly
     const job = await res.json();
     onUpdate?.(job);
     if (TERMINAL.has(job.status)) return job;
@@ -339,6 +383,13 @@ Surface `error_details` from a failed job to the user.
 
 ## 6. Error-handling checklist
 
+- `401` on any route — not signed in, or the access token expired. If you
+  are using `NS.api` this is already handled: it refreshes once and replays.
+  On a second `401`, send the user to the login page.
+- `403` — signed in, but not permitted. Refreshing will **not** help, so do
+  not retry; show the message.
+- `429` — rate limited (10 ingest calls a minute per user). Honour the
+  `Retry-After` header rather than retrying immediately.
 - `404` on `/ingest/jobs/{id}` — job unknown; treat as gone.
 - `404` on `/ingest/crawl/{id}/confirm` — discovery expired; re-run discovery.
 - `422` — validation error (e.g. `wait_strategy: "selector"` without
@@ -362,3 +413,14 @@ All error bodies use FastAPI's `{"detail": "..."}` shape.
 - **Wait strategy default is `fixed_timeout`**, which will capture a loading
   shell on SPA sites. Prefer `networkidle` or `selector` when crawling
   client-rendered sites.
+- **The crawler will not fetch internal hosts.** Since P0-3 every URL — the
+  one you submit, every redirect hop, and every link followed during a site
+  crawl — must resolve to a publicly-routable address. `localhost`,
+  `127.0.0.1`, `10.x`, `192.168.x`, `169.254.169.254` and `file://` are all
+  refused with `400`. To crawl an intranet site deliberately, name its
+  network in `CRAWL_ALLOW_ADDRESSES` (a CIDR list, so exempting one range
+  does not exempt the cloud metadata endpoint).
+- **Uploads are attributed to the signed-in user.** `knowledge_source.uploaded_by`
+  is the caller's account, not the service account. Rows ingested before
+  P0-3 still point at the service account; that history cannot be
+  reconstructed.

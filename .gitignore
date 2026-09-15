@@ -93,3 +93,9 @@ Thumbs.db
 # Crawler/ingestion scratch output (a crawl writes markdown here); one of
 # these files was committed by accident, which is why it is listed.
 output/
+
+status.md
+test.md
+ingestion.md
+account.md
+authentication_implementation.md

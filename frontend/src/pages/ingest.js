@@ -80,7 +80,22 @@
       '    <div class="review-panel" id="reviewPanel" hidden></div>' +
       '  </div>' +
       '</div>' +
-      '<div id="result" class="card result" hidden></div>';
+      '<div id="result" class="card result" hidden></div>' +
+
+      /* What is already in there, on the page where you add to it. Without
+         it the only way to answer "did I already upload this?" is to upload
+         it again and read the response -- and the answer to a duplicate is a
+         silent `duplicate_skipped`, which looks like nothing happened. */
+      '<div class="ingest-grid ingested-grid">' +
+      '  <div class="ingest-card">' +
+      '    <h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg> Uploaded files <span class="count" id="countFiles"></span></h3>' +
+      '    <div class="ingested-list" id="listFiles"><div class="hint">Loading…</div></div>' +
+      '  </div>' +
+      '  <div class="ingest-card">' +
+      '    <h3><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></svg> Crawled pages <span class="count" id="countUrls"></span></h3>' +
+      '    <div class="ingested-list" id="listUrls"><div class="hint">Loading…</div></div>' +
+      '  </div>' +
+      '</div>';
 
     roots.dropzone = wrap.querySelector('#dropzone');
     roots.fileInput = wrap.querySelector('#fileInput');
@@ -98,6 +113,10 @@
     roots.statChunks = wrap.querySelector('#statChunks');
     roots.statEntities = wrap.querySelector('#statEntities');
     roots.reviewPanel = wrap.querySelector('#reviewPanel');
+    roots.listFiles = wrap.querySelector('#listFiles');
+    roots.listUrls = wrap.querySelector('#listUrls');
+    roots.countFiles = wrap.querySelector('#countFiles');
+    roots.countUrls = wrap.querySelector('#countUrls');
     roots.result = wrap.querySelector('#result');
     roots.selectedFile = null;
     roots.scope = 'page';
@@ -131,6 +150,64 @@
 
     roots.waitStrategy.addEventListener('change', updateWaitHint);
     roots.waitSelector.addEventListener('input', updateWaitHint);
+
+    loadIngested();
+  }
+
+  /* ---------------- what is already ingested ---------------- */
+
+  var STATUS_CLASS = {
+    INDEXED: 'ok', PROCESSING: 'busy', PENDING: 'busy',
+    FAILED: 'bad', STALE: 'warn', ARCHIVED: 'muted'
+  };
+
+  function ingestedRow(item) {
+    var status = item.status || 'PENDING';
+    var chunks = item.chunks === 1 ? '1 chunk' : (item.chunks || 0) + ' chunks';
+    /* A source with a current version but no chunks is the hollow-page case
+       -- crawled successfully, nothing extractable in it. Worth saying,
+       because the job succeeded and every other signal looks healthy. */
+    var hollow = item.status === 'INDEXED' && !item.chunks;
+    return '<div class="ingested-row">' +
+      '<div class="ing-main">' +
+      '<span class="ing-name" title="' + NS.utils.esc(item.reference || item.name) + '">' +
+      NS.utils.esc(item.name) + '</span>' +
+      (item.reference && item.reference !== item.name
+        ? '<span class="ing-ref">' + NS.utils.esc(item.reference) + '</span>' : '') +
+      '</div>' +
+      '<div class="ing-meta">' +
+      '<span class="ing-chunks' + (hollow ? ' is-hollow' : '') + '"' +
+      (hollow ? ' title="Ingested, but nothing extractable was found on the page."' : '') +
+      '>' + chunks + '</span>' +
+      '<span class="badge badge-' + (STATUS_CLASS[status] || 'muted') + '">' +
+      NS.utils.esc(status) + '</span>' +
+      '</div></div>';
+  }
+
+  function renderIngested(data) {
+    var files = (data && data.files) || [];
+    var urls = (data && data.urls) || [];
+    if (roots.countFiles) roots.countFiles.textContent = files.length;
+    if (roots.countUrls) roots.countUrls.textContent = urls.length;
+    if (roots.listFiles) {
+      roots.listFiles.innerHTML = files.length
+        ? files.map(ingestedRow).join('')
+        : '<div class="hint">No files uploaded yet.</div>';
+    }
+    if (roots.listUrls) {
+      roots.listUrls.innerHTML = urls.length
+        ? urls.map(ingestedRow).join('')
+        : '<div class="hint">No pages crawled yet.</div>';
+    }
+  }
+
+  function loadIngested() {
+    return NS.api.get('/ingest/sources').then(renderIngested, function (err) {
+      var message = '<div class="hint err">Could not load the list: ' +
+        NS.utils.esc((err && err.message) || 'request failed') + '</div>';
+      if (roots.listFiles) roots.listFiles.innerHTML = message;
+      if (roots.listUrls) roots.listUrls.innerHTML = message;
+    });
   }
 
   function destroy() { roots = {}; discovery = null; }
@@ -340,9 +417,17 @@
         NS.api.get('/ingest/jobs/' + jobId).then(function (st) {
           if (st.status === 'SUCCEEDED') {
             clearInterval(timer);
+            /* The list is on the same screen as the form, so leaving it stale
+               after a successful ingest would show the page contradicting
+               itself. */
+            loadIngested();
             resolve({ status: 'succeeded', chunks: st.chunks_created_count || 0, entities: st.entities_created_count || 0 });
           } else if (st.status === 'FAILED') {
             clearInterval(timer);
+            /* Refreshed on failure too: a failed job still registers the
+               source, so it appears with a status that is not INDEXED and
+               that is worth seeing. */
+            loadIngested();
             resolve({ status: 'error', error: st.error_details || 'Ingestion failed.' });
           } else if (++tries >= MAX_TRIES) {
             clearInterval(timer);

@@ -1,10 +1,81 @@
-/* Shared API client — GET/POST/UPLOAD with timeout, error mapping, retry. */
+/* Shared API client — GET/POST/UPLOAD with timeout, error mapping, retry,
+   and transparent re-authentication.
+
+   Credentials are cookies the browser sets for itself: the access and
+   refresh tokens are HttpOnly, so nothing in this file ever sees a token.
+   `credentials: 'include'` is what attaches them; without it fetch omits
+   cookies and every call 401s.
+
+   The access token lasts fifteen minutes and a chat turn can take a minute,
+   so expiry mid-session is normal rather than exceptional. A 401 therefore
+   triggers one refresh and one replay before it is treated as "signed out".
+*/
 (function (NS) {
   'use strict';
 
   var DEFAULT_TIMEOUT = 15000;
 
   function base() { return NS.config.apiBase; }
+
+  /* Endpoints that must never trigger the refresh-and-replay path: a 401
+     from /auth/refresh is the definition of "the session is over", and
+     retrying it would be an infinite loop. */
+  var AUTH_PATHS = ['/auth/login', '/auth/refresh', '/auth/logout'];
+
+  function isAuthPath(path) {
+    for (var i = 0; i < AUTH_PATHS.length; i++) {
+      if (path.indexOf(AUTH_PATHS[i]) === 0) return true;
+    }
+    return false;
+  }
+
+  /* One refresh at a time, shared by every caller waiting on it.
+
+     This coalescing is not an optimisation, it is a correctness
+     requirement. Refresh tokens ROTATE: presenting one revokes it. A page
+     that fires four requests in parallel gets four simultaneous 401s, and
+     four independent refreshes would present the same token four times.
+     The server treats a re-presented refresh token as evidence of theft and
+     revokes every session the user has — so without this, an ordinary
+     parallel page load would log the user out and look like an attack. */
+  var refreshInFlight = null;
+
+  function refreshSession() {
+    if (refreshInFlight) return refreshInFlight;
+
+    refreshInFlight = fetch(base() + '/auth/refresh', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: '{}'
+    }).then(function (response) {
+      if (!response.ok) {
+        var err = new Error('Session expired.');
+        err.status = response.status;
+        throw err;
+      }
+      return response.json().catch(function () { return null; });
+    });
+
+    var settle = function () { refreshInFlight = null; };
+    refreshInFlight.then(settle, settle);
+    return refreshInFlight;
+  }
+
+  function onSessionLost() {
+    if (NS.session && typeof NS.session.expire === 'function') NS.session.expire();
+  }
+
+  /* Run `attempt`; on a 401, refresh once and run it again. */
+  function withReauth(path, attempt) {
+    return attempt().catch(function (err) {
+      if (!err || err.status !== 401 || isAuthPath(path)) throw err;
+      return refreshSession().then(attempt, function () {
+        onSessionLost();
+        throw err;
+      });
+    });
+  }
 
   function parseError(response, body) {
     var detail = body && (body.detail || body.message);
@@ -24,7 +95,7 @@
       headers['Content-Type'] = 'application/json';
       body = JSON.stringify(body);
     }
-    var init = { method: method, headers: headers, body: body };
+    var init = { method: method, headers: headers, body: body, credentials: 'include' };
     if (controller) init.signal = controller.signal;
 
     return fetch(base() + path, init).then(function (response) {
@@ -93,13 +164,18 @@
     return new Promise(function (resolve, reject) {
       var init = {
         method: 'POST',
+        credentials: 'include',
         headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
         body: JSON.stringify(body)
       };
       if (controller) init.signal = controller.signal;
 
       fetch(base() + path, init).then(function (response) {
-        if (!response.ok) throw new Error('HTTP ' + response.status);
+        if (!response.ok) {
+          var httpError = new Error('HTTP ' + response.status);
+          httpError.status = response.status;
+          throw httpError;
+        }
         if (!response.body || !response.body.getReader) {
           // No streaming support in this browser — the caller falls back.
           var e = new Error('streaming unsupported');
@@ -143,7 +219,13 @@
   }
 
   NS.api = {
-    stream: stream,
+    /* A request that deliberately does NOT re-authenticate: the auth
+       endpoints themselves, and anything that wants to see a raw 401. */
+    raw: request,
+    refreshSession: refreshSession,
+    stream: function (path, body, options) {
+      return withReauth(path, function () { return stream(path, body, options); });
+    },
     get: function (path, params) {
       var q = '';
       if (params) {
@@ -151,19 +233,40 @@
           .map(function (k) { return encodeURIComponent(k) + '=' + encodeURIComponent(params[k]); });
         if (parts.length) q = '?' + parts.join('&');
       }
-      return retryable(function () { return request('GET', path + q); });
+      return withReauth(path, function () {
+        return retryable(function () { return request('GET', path + q); });
+      });
     },
     post: function (path, body, options) {
       var opts = options || {};
-      return retryable(function () { return request('POST', path, { body: body, timeout: opts.timeout }); });
+      return withReauth(path, function () {
+        return retryable(function () { return request('POST', path, { body: body, timeout: opts.timeout }); });
+      });
+    },
+    /* PUT and DELETE go through the same re-auth path as GET and POST.
+       Without that, a 401 on a save would surface as a failure rather than
+       refreshing and retrying, and the user would lose what they typed. */
+    put: function (path, body) {
+      return withReauth(path, function () {
+        return request('PUT', path, { body: body });
+      });
+    },
+    del: function (path) {
+      return withReauth(path, function () {
+        return request('DELETE', path);
+      });
     },
     upload: function (path, file, extraFields) {
-      var fd = new FormData();
-      fd.append('file', file);
-      if (extraFields) {
-        Object.keys(extraFields).forEach(function (k) { if (extraFields[k] != null) fd.append(k, extraFields[k]); });
-      }
-      return request('POST', path, { body: fd, json: false, timeout: 60000 });
+      return withReauth(path, function () {
+        /* Rebuilt per attempt: a FormData that has been sent once cannot be
+           relied on to send again after the refresh. */
+        var fd = new FormData();
+        fd.append('file', file);
+        if (extraFields) {
+          Object.keys(extraFields).forEach(function (k) { if (extraFields[k] != null) fd.append(k, extraFields[k]); });
+        }
+        return request('POST', path, { body: fd, json: false, timeout: 60000 });
+      });
     }
   };
 })(window.ACA);

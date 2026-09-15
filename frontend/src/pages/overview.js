@@ -36,7 +36,13 @@
       moduleCard('chat', 'Chat', 'Ask questions and interact with the AI Customer Assistant.', '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>') +
       moduleCard('graph', 'Knowledge Graph', 'Explore entities and relationships visually.', '<circle cx="5" cy="6" r="2.5"/><circle cx="19" cy="6" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M7 7.3 10.3 16 M17 7.3 13.7 16 M7.5 6h9"/>') +
       moduleCard('ingest', 'Data Ingestion', 'Upload documents or crawl web content into the knowledge base.', '<path d="M21 15v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-3M17 8l-5-5-5 5M12 3v12"/>') +
-      moduleCard('admin', 'Admin', 'Monitor sources, jobs and system statistics.', '<path d="M12 22s8-3.5 8-10V5l-8-3-8 3v7c0 6.5 8 10 8 10z"/><path d="m9 12 2 2 4-4"/>') +
+      /* Admin-only. Not a design choice -- the router refuses this page to
+         a member, so offering them a card that bounces them straight back
+         with "that page is for administrators" is worse than not offering
+         it at all. The router remains what enforces it. */
+      (NS.session.isAdmin()
+        ? moduleCard('admin', 'Admin', 'Monitor sources, jobs and system statistics.', '<path d="M12 22s8-3.5 8-10V5l-8-3-8 3v7c0 6.5 8 10 8 10z"/><path d="m9 12 2 2 4-4"/>')
+        : '') +
       '</div>';
 
     roots.scroll = scroll;

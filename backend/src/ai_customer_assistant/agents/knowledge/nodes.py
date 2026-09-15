@@ -72,13 +72,9 @@ concern belongs at the graph boundary, not inside `rewriting.py` or
 Graceful-miss handling at the node level: `structured_lookup_node` and
 `vector_search_node` both catch their respective "expected miss"
 exceptions (`hybrid.GRACEFUL_STRUCTURED_MISSES` /
-`hybrid.GRACEFUL_VECTOR_MISSES` — the exact same classification
-hybrid.py's fan-out uses) and degrade to an empty tuple in state,
-regardless of which strategy routed to them. This is a deliberate,
-graph-level design choice distinct from `hybrid_retrieve()`'s own
-contract (see hybrid.py's docstring: its pure-strategy handlers
-propagate, since as a standalone convenience function a caller may
-want to know exactly what happened). At the graph level, a confidently
+`hybrid.GRACEFUL_VECTOR_MISSES`, which name the two sets) and degrade
+to an empty tuple in state, regardless of which strategy routed to
+them. That is a deliberate graph-level choice: a confidently
 determined "not found" is normal data flow — it feeds
 context_builder.py's already-covered empty-section placeholders and
 ultimately lets the LLM honestly say "I don't have enough
@@ -256,9 +252,9 @@ def make_structured_fallback_edge(*, config: KnowledgeAgentConfig) -> SingleEdge
     running alongside, so the fallback can never double-run it.
 
     Since F5 removed structured-only as a routing outcome, this branch no
-    longer fires in the compiled graph. It is kept as a backstop for
-    `hybrid_retrieve`'s callers and against anything that routes there
-    again — see `hybrid.decide_strategy`.
+    longer fires. It is kept as a backstop against anything that routes
+    there again — deleting it would mean re-introducing P1-6 the moment
+    something did. See `hybrid.decide_strategy`.
     """
 
     def _structured_fallback_edge(state: KnowledgeAgentState) -> str:

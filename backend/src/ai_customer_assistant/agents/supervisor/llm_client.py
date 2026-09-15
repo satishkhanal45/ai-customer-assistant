@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import json
 import os
+
+import llm_credentials
 import time
 from typing import Callable, Optional, Protocol
 
 import groq
+
+from rate_limit_signal import note_rate_limited
+from .routing import is_rate_limited
 from groq import Groq
 
 from timeouts import CLASSIFY_BUDGET_S, LLM_SHORT_TIMEOUT_S, sleep_within_budget
@@ -90,7 +95,7 @@ class GeminiSupervisorLLMClient:
         model: str = "gemini-2.0-flash",
         timeout: float = LLM_SHORT_TIMEOUT_S,
     ) -> None:
-        resolved_key = api_key or os.environ.get("GEMINI_API_KEY")
+        resolved_key = api_key or llm_credentials.api_key_for("gemini")
         if not resolved_key:
             raise ValueError("GEMINI_API_KEY not set.")
 
@@ -161,7 +166,7 @@ class GroqSupervisorLLMClient:
         timeout: float = LLM_SHORT_TIMEOUT_S,
         retry_budget: float = CLASSIFY_BUDGET_S,
     ) -> None:
-        resolved_key = api_key or os.environ.get("GROQ_API_KEY")
+        resolved_key = api_key or llm_credentials.api_key_for("groq")
         if not resolved_key:
             raise ValueError("GROQ_API_KEY not set.")
 
@@ -221,6 +226,10 @@ class GroqSupervisorLLMClient:
                 )
                 return response.choices[0].message.content or "{}"
             except groq.APIError as exc:
+                # Classification is the first LLM call of a turn, so on a
+                # tight per-minute budget it is usually the first throttled.
+                if is_rate_limited(exc):
+                    note_rate_limited()
                 last_error = exc
             # No sleep after the final attempt — it delayed the error by a
             # second and a half without buying another try. And no sleep at
@@ -241,12 +250,17 @@ _PROVIDER_FACTORIES: dict[str, Callable[[], SupervisorLLMClient]] = {
 
 
 def build_llm_client(provider: Optional[str] = None) -> SupervisorLLMClient:
-    resolved_provider = (
-        provider
-        if provider is not None
-        else "groq" if os.environ.get("GROQ_API_KEY")
-        else "stub"
-    )
+    # The administrator's default first, then Groq, then the stub -- so the
+    # Admin page's choice decides which provider classifies a turn, and a
+    # deployment with no key still starts.
+    resolved_provider = provider
+    if resolved_provider is None:
+        for candidate in (llm_credentials.default_provider(), "groq"):
+            if candidate in _PROVIDER_FACTORIES and llm_credentials.api_key_for(candidate):
+                resolved_provider = candidate
+                break
+    if resolved_provider is None:
+        resolved_provider = "stub"
 
     try:
         factory = _PROVIDER_FACTORIES[resolved_provider]

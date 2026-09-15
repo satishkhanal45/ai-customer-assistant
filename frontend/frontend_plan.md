@@ -1,9 +1,15 @@
 # Frontend Implementation Plan — AI Customer Assistant
 
-> **Historical — the original frontend plan.** Its status line predates the
-> streaming chat surface; `chat.js` now consumes `POST /chat/stream` and
-> renders progress stages, falling back to `POST /chat`. See the root
-> `README.md` and `status.md`.
+> **Historical — the original frontend plan.** Two of its premises are now
+> false. Its status line predates the streaming chat surface: `chat.js` now
+> consumes `POST /chat/stream` and renders progress stages, falling back to
+> `POST /chat`. And its repeated observation that there is no authentication
+> — the empty `auth/jwt.py`, the missing middleware, the suggestion to open
+> CORS with `allow_origins=["*"]` — was resolved by P0-3 on 2026-09-08, and
+> resolved differently: cookies rather than headers, and CORS turned *off*
+> rather than opened, because the frontend is served same-origin and so never
+> consults it. See the root `README.md`, `status.md` and
+> `authentication_implementation.md`.
 
 Status: **Phases 0–3 implemented. Phase 4 UI implemented (backend-blocked — endpoints not wired). Phase 5 partial (responsive CSS + basic polish).**
 Scope: `frontend/` — build the missing customer portal (chat), ingestion UI, admin dashboard, and unify/upgrade the existing knowledge-graph explorers around the ready backend.

@@ -20,15 +20,12 @@ production actually traverses — the bug lived in the *topology*, so a test of
 from __future__ import annotations
 
 import pytest
+from conftest import fake_session_factory
 
 from agents.knowledge.config import KnowledgeAgentConfig
 from agents.knowledge.constants import STRATEGY_HYBRID, STRATEGY_STRUCTURED, STRATEGY_VECTOR
 from agents.knowledge.exceptions import EmptyRetrievalError, EntityNotFoundError
-from agents.knowledge.hybrid import (
-    _structured_only,
-    decide_strategy,
-    should_fall_back_to_vector,
-)
+from agents.knowledge.hybrid import decide_strategy, should_fall_back_to_vector
 from agents.knowledge.types import (
     ChunkProvenance,
     RetrievedChunk,
@@ -112,99 +109,66 @@ class TestTheRule:
         assert decide_strategy(THE_QUERY, config=config) == STRATEGY_HYBRID
 
 
-class TestHybridRetrieve:
-    async def test_an_empty_structured_lookup_retries_semantically(self, config):
-        """Driven through `_structured_only` directly: since F5 nothing
-        *routes* here, but the handler must still behave — `hybrid_retrieve`
-        is public and a caller can reach it."""
-        calls = []
+class TestTheRetrievalNodesDegradeGracefully:
+    """These behaviours used to be asserted through `hybrid_retrieve`.
 
-        async def structured(query, *, session):
-            calls.append("structured")
-            return ()
+    That function is gone — it was an unused second implementation of the
+    graph's own orchestration — so the same properties are now asserted on
+    the nodes the graph actually runs. The behaviour is unchanged; only the
+    thing being called moved onto the production path.
+    """
 
-        async def vector(rewritten, *, config, session, embed_query):
-            calls.append("vector")
-            return (_chunk(),)
+    @staticmethod
+    def _state(query=None):
+        from agents.knowledge.state import KnowledgeAgentState
 
-        result = await _structured_only(
-            THE_QUERY, REWRITTEN, config=config, session=object(), embed_query=lambda t: (),
-            structured_lookup_fn=structured, vector_search_fn=vector,
+        return KnowledgeAgentState(
+            raw_query="q", structured_query=query or THE_QUERY, rewritten_query=REWRITTEN
         )
 
-        assert calls == ["structured", "vector"]
-        assert len(result.retrieved_chunks) == 1
-        assert result.retrieved_chunks[0].similarity_score == 0.519
+    async def test_entity_not_found_degrades_to_no_facts(self, monkeypatch):
+        """"No such entity" is the commonest way a lookup comes up empty, and
+        it is what the P1-6 fallback exists for — it must not propagate."""
+        from agents.knowledge import nodes
 
-    async def test_entity_not_found_also_triggers_the_fallback(self, config):
-        """"No such entity" is the commonest way this strategy comes up empty
-        and is exactly what the fallback is for — it must not propagate."""
-
-        async def structured(query, *, session):
+        async def _lookup(query, *, session):
             raise EntityNotFoundError(message="no Policy entities", entity_type="Policy")
 
-        async def vector(rewritten, *, config, session, embed_query):
-            return (_chunk(),)
+        monkeypatch.setattr(nodes, "structured_lookup", _lookup)
+        node = nodes.make_structured_lookup_node(session_factory=fake_session_factory())
 
-        result = await _structured_only(
-            THE_QUERY, REWRITTEN, config=config, session=object(), embed_query=lambda t: (),
-            structured_lookup_fn=structured, vector_search_fn=vector,
+        assert (await node(self._state()))["structured_facts"] == ()
+
+    async def test_an_empty_vector_search_is_an_answer_not_an_error(self, monkeypatch, config):
+        """The corpus genuinely having nothing is a legitimate outcome."""
+        from agents.knowledge import nodes
+
+        async def _search(rewritten, *, config, session, embed_query):
+            raise EmptyRetrievalError(
+                message="nothing cleared the threshold", query_text="q", top_k=8
+            )
+
+        monkeypatch.setattr(nodes, "vector_search", _search)
+        node = nodes.make_vector_search_node(
+            config=config, session_factory=fake_session_factory(), embed_query=lambda t: ()
         )
-        assert len(result.retrieved_chunks) == 1
 
-    async def test_facts_found_means_no_vector_call(self, config):
-        """The fallback must not cost a query on the happy path."""
-        called = []
+        assert (await node(self._state()))["retrieved_chunks"] == ()
 
-        async def structured(query, *, session):
-            return (_fact(),)
-
-        async def vector(rewritten, *, config, session, embed_query):
-            called.append("vector")
-            return (_chunk(),)
-
-        result = await _structured_only(
-            THE_QUERY, REWRITTEN, config=config, session=object(), embed_query=lambda t: (),
-            structured_lookup_fn=structured, vector_search_fn=vector,
-        )
-        assert called == []
-        assert len(result.structured_facts) == 1
-        assert result.retrieved_chunks == ()
-
-    async def test_both_empty_is_an_answer_not_an_error(self, config):
-        """The corpus really having nothing is a legitimate outcome; the
-        fallback must not convert it into an exception."""
-
-        async def structured(query, *, session):
-            return ()
-
-        async def vector(rewritten, *, config, session, embed_query):
-            raise EmptyRetrievalError(message="nothing cleared the threshold",
-                                      query_text="q", top_k=8)
-
-        result = await _structured_only(
-            THE_QUERY, REWRITTEN, config=config, session=object(), embed_query=lambda t: (),
-            structured_lookup_fn=structured, vector_search_fn=vector,
-        )
-        assert result.structured_facts == ()
-        assert result.retrieved_chunks == ()
-
-    async def test_a_real_failure_still_propagates(self, config):
+    async def test_a_real_failure_still_propagates(self, monkeypatch):
         """Only "found nothing" degrades. An infrastructure fault must not be
         silently converted into an empty answer — that is the failure mode
         this whole class of bug is made of."""
+        from agents.knowledge import nodes
 
-        async def structured(query, *, session):
+        async def _lookup(query, *, session):
             raise RuntimeError("connection reset")
 
-        async def vector(rewritten, *, config, session, embed_query):
-            return (_chunk(),)
+        monkeypatch.setattr(nodes, "structured_lookup", _lookup)
+        node = nodes.make_structured_lookup_node(session_factory=fake_session_factory())
 
         with pytest.raises(RuntimeError, match="connection reset"):
-            await _structured_only(
-                THE_QUERY, REWRITTEN, config=config, session=object(), embed_query=lambda t: (),
-                structured_lookup_fn=structured, vector_search_fn=vector,
-            )
+            await node(self._state())
 
 
 class TestTheConditionalEdge:
@@ -295,19 +259,12 @@ class TestTheCompiledGraph:
             ),
         )
 
-        class _Session:
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *exc):
-                return False
-
         graph = build_knowledge_agent_graph(
             config=config,
             rewrite_llm_complete=lambda p: "{}",
             extraction_llm_complete=lambda p: "{}",
             answer_llm_complete=lambda s, u: "{}",
-            session_factory=lambda: _Session(),
+            session_factory=fake_session_factory(),
             embed_query=lambda text: (0.0,) * config.embedding_dimension,
         )
         return graph, visited

@@ -25,12 +25,38 @@ import json
 import uuid
 from typing import AsyncIterator
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 
+from auth.dependencies import enforce_chat_quota
 from schemas.chat import ChatRequest, ChatResponse
 
-router = APIRouter(tags=["chat"])
+# Chat is authenticated. This is an internal support tool, not a public
+# widget: the corpus is the company's own documents, tickets collect an
+# email address for follow-up, and every turn spends Groq tokens against a
+# daily budget that one developer exhausted repeatedly during testing.
+# Authentication bounds who can spend it; `enforce_chat_quota` bounds how
+# much any one of them can.
+#
+# If a customer-facing surface is ever wanted, the right shape is a separate
+# endpoint with its own retrieval scope -- not a relaxation of this one,
+# which would silently expose the internal corpus.
+# **Chat is public.** No account, no signup, nothing between the internet and
+# this endpoint -- because a prospective client asking what you charge should
+# not have to register first, and an account they can create in ten seconds
+# was never access control anyway. It was friction pretending to be a gate.
+#
+# What replaces the gate is `enforce_chat_quota`, which keys on the account
+# when there is one and on the address when there is not, and counts every
+# turn into a global daily ceiling regardless. That ceiling is what makes an
+# open endpoint affordable: see `auth.rate_limit.CHAT_GLOBAL_PER_DAY`.
+#
+# An earlier note here warned that a customer-facing surface should be a
+# separate endpoint, "not a relaxation of this one, which would silently
+# expose the internal corpus". The premise changed -- this corpus *is* the
+# customer-facing content -- but the half about **retrieval scope** stands:
+# there is one corpus, and everything ingested is answerable to anyone.
+router = APIRouter(tags=["chat"], dependencies=[Depends(enforce_chat_quota)])
 
 
 @router.post("/chat", response_model=ChatResponse)
