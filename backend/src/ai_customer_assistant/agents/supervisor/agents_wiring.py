@@ -28,6 +28,7 @@ from langgraph.types import interrupt
 from timeouts import KNOWLEDGE_NODE_TIMEOUT_S
 
 from ..contracts import ConversationTurn
+from ..ticket_agent.validation import InvalidEmailError
 from rate_limit_signal import saw_rate_limit, turn_scope
 
 from .routing import (
@@ -264,31 +265,64 @@ def make_ticket_agent_node(
             }
         )
         reason = _resume_text(clarifying_response, key="reason")
+        if _looks_like_cancellation(reason):
+            return _ticket_result(_TICKET_CANCELLED)
 
         # Step 2 — open the pending ticket with the reason attached, then ask
         # for the email. `call` is pure, so re-running it on each resume (as
         # LangGraph replays the node from the top) is harmless.
         pending = ticket_ops.call(query, reason)
-        email = interrupt(
-            {
-                "type": "email-collection",
-                "query": query,
-                "clarifying_reason": reason,
-            }
-        )
-
-        # Step 3 — book the ticket.
         configurable = (get_config() or {}).get("configurable", {})
         key = await _idempotency_key(configurable, ticket_ops)
-        ticket = await ticket_ops.create_ticket(
-            pending, _resume_text(email, key="email"), idempotency_key=key
-        )
-        return {
-            "downstream_result": {
-                "status": "GROUNDED",
-                "response": _confirmation(ticket),
-            }
+
+        # Step 3 — collect an email and book the ticket.
+        #
+        # This loop exists because an unusable answer here is *ordinary user
+        # behaviour*, not an exceptional condition. It previously passed the
+        # raw message straight to `create_ticket`, so "wait i don't want to
+        # book it" raised `InvalidEmailError` out of the node — and a node
+        # that raises inside an interrupted flow does not merely fail the
+        # turn, it wedges the thread permanently: the task keeps both its
+        # interrupt and its error, so every later message is delivered as a
+        # resume to the dead task, replays the same stored text, and fails
+        # again. One typo bricked the conversation. See `_prepare_turn` in
+        # chat_service for the matching guard.
+        #
+        # `interrupt()` inside a loop is sound: LangGraph replays the node
+        # from the top on each resume and satisfies interrupts in call
+        # order, so the already-answered ones return their stored values and
+        # only the newest one pauses.
+        prompt: dict = {
+            "type": "email-collection",
+            "query": query,
+            "clarifying_reason": reason,
         }
+        for _ in range(_MAX_EMAIL_ATTEMPTS):
+            answer = _resume_text(interrupt(prompt), key="email")
+            if _looks_like_cancellation(answer):
+                return _ticket_result(_TICKET_CANCELLED)
+            try:
+                ticket = await ticket_ops.create_ticket(
+                    pending, answer, idempotency_key=key
+                )
+            except InvalidEmailError:
+                # Ask again rather than failing. A distinct `type` carries
+                # the retry wording; `_render_interrupt`'s generic branch
+                # picks up the "question" key with no change needed there.
+                logger.info("ticket email rejected, re-prompting the customer")
+                prompt = {
+                    "type": "email-retry",
+                    "question": _TICKET_EMAIL_RETRY,
+                    "clarifying_reason": reason,
+                }
+                continue
+            return _ticket_result(_confirmation(ticket))
+
+        # Bounded on purpose: without a cap an unusable answer every time
+        # would pause the graph forever and the thread could never be used
+        # for anything else.
+        logger.info("ticket abandoned after %d invalid emails", _MAX_EMAIL_ATTEMPTS)
+        return _ticket_result(_TICKET_ABANDONED)
 
     return ticket_agent
 
@@ -399,6 +433,74 @@ def _status_reply(ticket_id: str | None, ticket: Any) -> str:
 
 
 _TICKET_REASON_QUESTION = "For what reason do you want to create a ticket?"
+
+#: How many unusable email answers to tolerate before giving up. Bounded so
+#: a customer who never supplies one cannot leave the thread paused forever.
+_MAX_EMAIL_ATTEMPTS = 3
+
+_TICKET_CANCELLED = (
+    "No problem — I haven't created a ticket. Ask me anything else whenever "
+    "you're ready."
+)
+
+_TICKET_EMAIL_RETRY = (
+    "That doesn't look like an email address. Please reply with one (like "
+    "name@example.com), or say \"cancel\" if you've changed your mind."
+)
+
+_TICKET_ABANDONED = (
+    "I still don't have a valid email address, so I haven't created a ticket. "
+    "Just ask again when you're ready and we'll start over."
+)
+
+#: Phrases that mean "stop, I don't want this after all".
+#:
+#: Deliberately explicit rather than clever. This is only consulted at the
+#: two points where the customer has been asked a direct question, and a
+#: false positive silently abandons a ticket they wanted — so the cost of
+#: matching too eagerly is higher than the cost of matching too rarely, and
+#: an unmatched message simply gets asked again.
+_CANCELLATION_MARKERS: tuple[str, ...] = (
+    "cancel",
+    "never mind",
+    "nevermind",
+    "forget it",
+    "changed my mind",
+    "change my mind",
+    "don't want",
+    "dont want",
+    "do not want",
+    "donot want",
+    "no thanks",
+    "no thank you",
+    "not anymore",
+    "not any more",
+    "stop",
+)
+
+
+def _looks_like_cancellation(text: str) -> bool:
+    """Pure: whether the customer is backing out of the ticket flow.
+
+    An address is never a cancellation, however it is worded, so anything
+    containing an ``@`` is excluded before the markers are consulted — that
+    keeps a genuine address like ``dont.want.spam@example.com`` from
+    cancelling the very ticket it was supplied for.
+    """
+    lowered = text.strip().lower()
+    if not lowered or "@" in lowered:
+        return False
+    return any(marker in lowered for marker in _CANCELLATION_MARKERS)
+
+
+def _ticket_result(response: str) -> dict:
+    """DownstreamResult-shaped wrapper for a finished ticket turn.
+
+    Cancelling, giving up and succeeding are all *completed* turns, not
+    errors: the customer got the outcome they asked for, so they carry
+    ``GROUNDED`` and reach `assemble_response` the same way a booking does.
+    """
+    return {"downstream_result": {"status": "GROUNDED", "response": response}}
 
 
 def _resume_text(resume_value: object, *, key: str) -> str:

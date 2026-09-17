@@ -18,7 +18,7 @@ This is a **multi-agent RAG customer-support assistant** for Alpinist Studios, b
 |---|---|
 | Architecture & module design | **Strong.** Clean layering, dependency injection everywhere, pure functions separated from I/O, excellent docstrings. |
 | Feature completeness (MVP scope) | **~80%.** Public visitor chat, staff chat, RAG, ingestion, crawling, graph browsing, ticket creation, ticket status lookup and the admin *read* surface all work. The admin *write* surface and prompt management do not. |
-| Test suite | **980 passing / 0 failing / 0 erroring / 2 skipped** (982 collected). **Fully green** — the Playwright browser is installed, so the last non-deterministic gap is closed. |
+| Test suite | **1040 passing / 0 failing / 0 erroring / 13 skipped** (1053 collected; the 11 extra skips are the opt-in live classification golden set). **Fully green** — the Playwright browser is installed, so the last non-deterministic gap is closed. |
 | Production readiness | **No known blockers, and no open correctness issues** — P1-7 closed 2026-09-10. Authentication, authorisation, a CORS allowlist, rate limiting and an SSRF guard on the crawler are all in place (P0-3). Conversation state no longer reaches the logs (P0-4). Secrets are no longer injected by import side effect (P0-2), and the client/server timeout ladder no longer inverts (P2-4). |
 | Scalability | **Much improved.** All four P1 items are fixed: pgvector-native retrieval, LLM calls off the event loop, one shared connection pool, and ingestion moved out of the web process into a worker service. Two pieces of per-process state that quietly broke horizontal scaling now live in the database (P2-5). |
 | Repo hygiene | **Good.** The duplicated ontology is gone (P2-1); dead files, the committed AI-assistant note, the crawl artefact and the committed debug values are all gone, and the README is real (P2-6). Only the stale branches are left, deliberately untouched. |
@@ -28,6 +28,72 @@ This is a **multi-agent RAG customer-support assistant** for Alpinist Studios, b
 What is left is *unbuilt features* rather than defects — the admin write API, prompt management, CI and lint configuration, and structured logging with metrics. Those are listed in §5 and §7.
 
 ### Changelog
+
+**2026-09-17 — One bad answer bricked a conversation permanently.** Asked for an email address, a customer replied *"wait i donot want to book it"* — which is ordinary behaviour, not an exceptional condition. `ticket_agent` passed the raw message to `create_ticket`, `InvalidEmailError` escaped the node, and the damage went far past failing that turn: **every subsequent message on the thread, on any subject, returned the same error.** "hello" three turns later still raised `InvalidEmailError: 'wait i donot want to book it'`. On `POST /chat` it was **HTTP 500 with an empty body**; on `/chat/stream` it rendered as the generic apology, which is what made it look like the earlier quota problem and not a defect.
+
+The mechanism is worth recording because it will catch the next node too. Inspecting the poisoned checkpoint:
+
+```
+next     = ()
+tasks    = 1
+  name='ticket_agent'
+    interrupts = (Interrupt(value={'type': 'email-collection', ...}),)
+    error      = InvalidEmailError("'nope changed my mind' is not a valid …")
+```
+
+**A failed task keeps its interrupt alongside its error.** `_prepare_turn` decided "is this message a resume?" from `snapshot.next or any(task.interrupts …)`, which cannot tell a graph *waiting for the customer* from one that *crashed mid-flow*. So each new message was delivered as a resume to the dead task, which replayed its stored input, failed identically, and stayed dead. Self-perpetuating, exactly like the `persist_chunks` duplicate-chunk state: once poisoned, nothing the customer could type would clear it.
+
+**Two fixes, because either alone leaves a hole.**
+
+*The node no longer raises on ordinary input.* Email collection is a bounded loop (`_MAX_EMAIL_ATTEMPTS = 3`): an unusable answer re-prompts with `_TICKET_EMAIL_RETRY`, an explicit withdrawal ends the flow with `_TICKET_CANCELLED` and books nothing, and three failures give up with `_TICKET_ABANDONED` rather than pausing the thread forever. `interrupt()` inside a loop is sound — LangGraph replays the node from the top and satisfies interrupts in call order, so answered ones return their stored values and only the newest pauses. Cancellation is also offered at the *reason* step, since that is the other place the customer is asked a direct question. `_looks_like_cancellation` is a pure predicate over an explicit marker list, deliberately conservative: a false positive silently abandons a ticket somebody wanted, while an unmatched message merely gets asked again. Anything containing `@` is excluded first, so `dont.want.spam@example.com` books the ticket it was supplied for instead of cancelling it.
+
+*The serving layer no longer resumes a task that carries an error.* A healthy pause has an interrupt and **no** error, so the error is the discriminator. When one is present the pending flow is abandoned, the message starts a fresh turn — which is what the customer meant by sending it — and a warning names the thread and the error. This is the backstop for the next node that raises, not the fix for this one.
+
+Verified live against the rebuilt image, on the exact transcript that failed: the withdrawal answers *"No problem — I haven't created a ticket"*, and the following *"what is alpinist studios?"* and *"hello"* both answer normally, all **HTTP 200**. A typo path too: `satish.gmail.com` → re-prompt → `satish@gmail.com` → ticket created → the thread keeps working. And a thread already poisoned **before** the fix recovers on its next message, logging `abandoning a failed pending task and starting a fresh turn`.
+
+Suite 1016 → **1040 passing**.
+
+**2026-09-17 — Chat latency: a turn cost more than the whole per-minute budget.** The complaint was "retrieval is slow". Retrieval was **0.2s** — `vector_search` 0.16–0.29s, `structured_lookup` 0.02s, the SQL itself 68.8ms on 78 chunks, and every pure node (rank, deduplicate, build_context, build_prompt) at 0.00s. The knowledge graph measured node by node, with no contention, runs end to end in **3.0s**. The 30–40s turns were something else entirely.
+
+Measured by reading the provider's own headroom before and after a turn and correcting for refill: **one turn cost ~11,478 tokens against an 8,000-token minute.** Not two turns — *one*. Even starting from a full bucket a turn had to stop partway and wait, because Groq does not refuse an oversized request, it *holds* it until the bucket refills at ~133 tokens/second. That is why no 429 ever appeared in the log for the slow turns, and why "it's throttling" looked wrong.
+
+The arithmetic predicts the latency exactly, which is what makes it the diagnosis rather than a theory: short by `11,478 − 8,000 = 3,478` tokens, `3,478 ÷ 133 = 26s` of waiting plus ~4s of compute — against 30.0s observed. An isolated 2,279-token call with 613 tokens of headroom predicted 12.5s and measured 13.73s.
+
+Where the tokens were, captured from the real prompts at all four calls: **answer 27,038 chars (59%)**, **classify 10,801 (24%)**, extract 4,920 (11%), rewrite 2,732 (6%).
+
+**Two changes, both measured before being made rather than after.**
+
+**Retrieval context: `KNOWLEDGE_AGENT_TOP_K` 8 → 4.** `scripts/calibrate_retrieval.py` against the golden set says 8, 6 and 4 all hold **recall@k at 100% and MRR at 0.933** — identical — while mean chunks reaching the answer prompt fall **5.2 → 3.4** at the configured margin. **top_k=3 is where it breaks** (recall 96.15%, MRR 0.923), so 4 is a measured floor and not a guess. Config only.
+
+**The classification prompt: 11,359 → 6,498 characters (−43%).** It is sent on every turn and nothing downstream can sanity-check its output — `parse_llm_response` degrades anything malformed to `OUT_OF_SCOPE`/`UNKNOWN` *silently*, so a prompt edit that made the model worse would surface as "the assistant started refusing things" with nothing in any log. Removed: seven of ten worked examples (every rule they illustrated is stated in prose above them; the three kept are the hard discriminations — a greeting carrying a real question, a bare "ticket", and a follow-up that only resolves against history), a duplicated output-format block (the schema was specified three times, and the transport already constrains it — `response_format={"type": "json_object"}` on Groq, a prefilled brace on Anthropic), and a step-by-step procedure that restated the rules immediately before stating them. **No decision rule, literal value, confidence band or priority ordering was removed.**
+
+That claim is enforced rather than asserted. A new `test_classification_golden.py` pins the structure without a network — every literal `parse_llm_response` maps, every field name it reads, the `{DOMAIN_DEFINITION}` placeholder, the 0.8 clarification threshold that `decide_route` also uses, and the five hard discriminations — plus a character ceiling that the old prompt fails. On top of that sits an **11-case live golden set**, opt-in like the Groq integration test, chosen for discrimination rather than coverage. **11/11 before the trim, 11/11 after.** The live run itself dropped from 149s to 67s, which is the token effect showing up independently.
+
+**Result, measured the same way as the diagnosis: turn cost 11,478 → 9,013 tokens (−21%), and one question 30.0s → 10.5s.** On the question that prompted this, 33s → **9s**.
+
+**Third change, and the one that crossed the line: the token bucket is per model, not per account.** 9,013 was still above 8,000, and trimming the remaining ~1,000 tokens looked expensive — until measurement showed the constraint was the wrong shape. Spending 2,780 tokens on `openai/gpt-oss-20b` left `openai/gpt-oss-120b`'s headroom **untouched at 7,927**: each model has its own 8,000/minute allowance. So the fix was not to cut tokens at all but to stop putting all four calls in one bucket. `KNOWLEDGE_AGENT_REWRITE_MODEL_NAME=openai/gpt-oss-20b` moves rewrite and extraction (they share one model field, `providers.py:226-229`) off the bucket the answer call needs. Config only.
+
+**Final, measured the same way throughout: the 120b bucket carries ~6,679 tokens a turn and the 20b bucket ~2,605 — both under 8,000, so the refill wait is gone.** One question **30.0s → 4.6-9.0s**. And the complaint that started this: *"what is alpinist studios?"* then *"what is mvp development?"*, which used to answer once and then apologise, now answers **both** — 6.5s and 27.4s.
+
+**The quality cost is real but small, and it is recorded rather than assumed.** Extraction on 20b agrees with 120b on the retrieval strategy for **5 of 8** probe questions; on the other three it fails to name an entity type and the turn degrades from `hybrid` to `vector`, losing the structured-fact half. Checked end to end, those three still answered well and cited sources (1, 3 and 2 citations, 4.6-5.9s) — the semantic index carried them. The residual risk is a question whose answer lives *only* in the graph and not in any chunk's text; three probes cannot rule that out. The conservative alternative, if that ever bites: move the **classifier** to 20b instead and keep extraction on 120b — arithmetic says ~6,800 on the 120b bucket, also under the ceiling — which needs the classifier's model to become configurable (hardcoded at `llm_client.py:165`).
+
+Two genuinely fast questions inside one minute remains out of reach: it needs ~8,000 tokens per turn across both buckets and a turn costs ~9,300. That is the free tier's floor, not something trimming reaches.
+
+Suite 996 → **1016 passing**.
+
+**2026-09-17 — Anthropic is now a first-class provider: the Supervisor could not classify with Claude.** The Knowledge Agent has had an `AnthropicKnowledgeProvider` since the provider split, and the Admin › API Keys page has always listed Anthropic — but the Supervisor's `_PROVIDER_FACTORIES` held only `stub`, `gemini` and `groq`. Pasting a Claude key therefore produced a system that **answered with Claude and classified with the stub**, which returns `OUT_OF_SCOPE` / `UNKNOWN` for every question and raises nothing. Verified before the fix: an Anthropic-only environment resolved to `AnthropicKnowledgeProvider` for the answer and `StubSupervisorLLMClient` for the route. The app would have started cleanly and declined every question, with no error anywhere — the same silent-failure shape as P1-6 and F9.
+
+A new `AnthropicSupervisorLLMClient` mirrors the Groq one: the same wall-clock-bounded retry loop, the same `note_rate_limited()` on a throttle, the same `sleep_within_budget` guard. Two API differences are absorbed at this boundary rather than pushed onto callers. **There is no `response_format={"type": "json_object"}`** on the Messages API, so JSON comes from *prefilling* the assistant turn with an opening brace — which constrains the first token — and prepending the brace back; `parse_llm_response` already degrades a malformed payload to the safe fallback, so a model that ignores the prefill costs one classification rather than the turn. And **the system prompt is a request field, not a message**, as `AnthropicKnowledgeProvider` already sends it.
+
+The subtle one is message normalisation. Anthropic requires the first message to be `user` and rejects two consecutive messages with the same role; Groq and Gemini tolerate both. Neither holds here, because `node._bounded_history` keeps a *tail* of the conversation and can cut a user/assistant pair in half — so a perfectly ordinary follow-up question would have been rejected by the API on a history that starts mid-pair. `_anthropic_messages` drops leading assistant turns and merges same-role runs, and it is a pure function with its own tests.
+
+Second defect, found while fixing the first: **auto-selection could not reach a provider the hard-coded tuple did not name.** Both resolvers tried `(admin default, "groq")` — the Knowledge one also `"gemini"` — and then gave up to the stub. Since `default_provider()` falls back to `"groq"` when no administrator has chosen, a deployment holding only an Anthropic key never reached it even once the factory existed. Both now sweep every registered provider after their preferred order, which is what makes *"paste a key for any supported vendor and it works"* true.
+
+**Nothing changes for the current deployment**, and that is asserted rather than assumed: with only `GROQ_API_KEY` set, resolution still gives `GroqSupervisorLLMClient` and `GroqKnowledgeProvider` on `openai/gpt-oss-120b`. Groq stays the default because it is what the timeout ladder was measured against. Verified live after rebuilding the image: a chat turn answered in 6s with a citation.
+
+An OpenAI key can still be stored and still resolves to nothing — there is no OpenAI client on either side. That is now a known gap rather than an invisible one.
+
+Suite 980 → **996 passing**.
 
 **2026-09-14 — Chat became the front door: a `visitor` role, public chat, and the sign-in page as a side door.** The product had one way in — the login page — and that was backwards for what this system is. A stranger asking the assistant about the company is the *main* audience; uploading documents and browsing the knowledge graph is staff work. So the flow inverted: the app opens on the assistant, and **Staff sign in** is a button in the header rather than a wall.
 
@@ -454,10 +520,10 @@ cd backend && env -u PYTHONPATH ./.venv/bin/python -m pytest -q
 **Current, after every P0/P1/P2 item, P1-7, the whole of `ingestion.md`, and the visitor access model:**
 ```
 cd backend && env -u PYTHONPATH ./.venv/bin/python -m pytest -q
-→ 980 passed, 2 skipped in 150.57s
+→ 1040 passed, 13 skipped in 88.70s
 ```
 
-Collected: 982 tests, **no failures and no errors**. The most recent 210
+Collected: 1053 tests, **no failures and no errors**. The most recent 210
 arrived with the ingestion work: retry policy and dead-lettering, the worker
 loop, fact supersession, value duplication, entity merging. The last 121 arrived with
 P0-3: tokens, passwords, roles, the auth router, rate limiting, the SSRF
@@ -1356,10 +1422,10 @@ process refuses to start if it does not hold):
 |---|---|---|
 | `KNOWLEDGE_AGENT_SIMILARITY_THRESHOLD` | 0.50 | Absolute floor. **Measured, not guessed** — see P2-2 before changing it |
 | `KNOWLEDGE_AGENT_RELATIVE_SCORE_MARGIN` | 0.12 | How far below the best hit a chunk may score and survive |
-| `KNOWLEDGE_AGENT_TOP_K` | 8 | Must not exceed `MAX_CONTEXT_CHUNKS` |
+| `KNOWLEDGE_AGENT_TOP_K` | 8 (**set to 4**) | Must not exceed `MAX_CONTEXT_CHUNKS`. **Measured floor is 4**: 8, 6 and 4 all give recall@k 100% / MRR 0.933 on the golden set while mean chunks fall 5.2 → 3.4; 3 breaks it (96.15%). The answer prompt is the largest line item in a turn's token cost, so this is the cheapest latency lever |
 | `KNOWLEDGE_AGENT_MAX_CONTEXT_CHUNKS` / `MAX_STRUCTURED_FACTS` | 12 / 20 | Prompt budgets |
 | `KNOWLEDGE_AGENT_EXTRACTION_CONFIDENCE_THRESHOLD` | 0.55 | No longer used for routing (F5); still gates extraction |
-| `KNOWLEDGE_AGENT_LLM_PROVIDER` / `LLM_MODEL_NAME` / `REWRITE_MODEL_NAME` | anthropic / claude-sonnet-5 | Falls back to the stub when the credential is absent |
+| `KNOWLEDGE_AGENT_LLM_PROVIDER` / `LLM_MODEL_NAME` / `REWRITE_MODEL_NAME` | anthropic / claude-sonnet-5 | Groq, Anthropic and Gemini all work end to end (classifier *and* Knowledge Agent). Resolution is: this setting if its key exists, then the Admin page's default, then any provider with a key, then the stub. **The split model fields are only honoured when `LLM_PROVIDER` names the provider that actually resolves** — otherwise that vendor's own default model is used, so a config tuned for one vendor never leaks model names into another's API |
 | `EMBEDDING_QUERY_INSTRUCTION` | *model-derived* | Overrides the BGE query prefix; set to empty to disable it |
 
 **Authentication** (P0-3, `auth/`):
