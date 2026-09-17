@@ -12,11 +12,14 @@ Python 3.12  ·  FastAPI  ·  LangGraph  ·  PostgreSQL + pgvector  ·  MinIO  �
 1040 tests passing  ·  0 failing
 ```
 
+![The visitor chat answering a question, with its source cited](docs/images/02-visitor-chat-answer.png)
+
 ---
 
 ## Table of contents
 
 - [What it does](#what-it-does)
+  - [Screenshots](#screenshots)
 - [How it works](#how-it-works)
 - [Tech stack](#tech-stack)
 - [Getting started](#getting-started)
@@ -70,6 +73,15 @@ the database, not the browser.
 | **Versioned corpus** | Re-ingesting a document supersedes the old version atomically; superseded facts are kept and marked, never deleted |
 | **Authentication** | JWT with rotating refresh tokens, Argon2id password hashing, three roles |
 | **Admin surface** | Sources, jobs, statistics, tickets, and per-provider LLM API keys |
+
+### Screenshots
+
+| | |
+|---|---|
+| **Visitor chat** — the landing page, no account required<br>![](docs/images/01-visitor-chat.png) | **Staff sign-in** — reached from the header, not forced<br>![](docs/images/03-staff-sign-in.png) |
+| **Knowledge graph** — nodes sized by fact count, with type and relation filters<br>![](docs/images/04-knowledge-graph.png) | **Ingest** — upload, crawl, and what is already in the corpus<br>![](docs/images/05-ingest.png) |
+| **Overview** — corpus and graph counts at a glance<br>![](docs/images/06-overview.png) | **Admin** — sources, jobs, statistics and tickets<br>![](docs/images/07-admin.png) |
+| **Agent prompts** — the Supervisor and Knowledge system prompts, admin-only<br>![](docs/images/08-prompt.png) | **API keys** — per-provider credentials, write-only and encrypted at rest<br>![](docs/images/09-api-keys.png) |
 
 ---
 
