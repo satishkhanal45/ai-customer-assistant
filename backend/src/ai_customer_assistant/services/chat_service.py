@@ -290,6 +290,33 @@ class ChatService:
             getattr(task, "interrupts", ()) for task in snapshot.tasks
         )
 
+        # A task that *failed* also stays in the checkpoint, and it keeps its
+        # interrupt alongside its error — so "has an interrupt" alone cannot
+        # tell a graph waiting for the customer apart from one that crashed
+        # mid-flow. Resuming a crashed task replays its stored input, which
+        # fails identically, which leaves it crashed: the thread is wedged
+        # for good and every later message, on any subject, returns the same
+        # error. Observed with one invalid email in the ticket flow, where
+        # "hello" three turns later still raised InvalidEmailError on the
+        # original text.
+        #
+        # A healthy pause has an interrupt and no error, so the error is the
+        # discriminator. When one is present the pending flow is abandoned
+        # and the message starts a fresh turn, which is what the customer
+        # meant by sending it. The ticket node no longer raises on a bad
+        # address (see agents_wiring), so this is the backstop for the next
+        # node that raises, not the fix for that one.
+        failed = [task for task in snapshot.tasks if getattr(task, "error", None)]
+        if failed and pending:
+            logger.warning(
+                "abandoning a failed pending task and starting a fresh turn "
+                "(thread_id=%s, task=%s, error=%s)",
+                thread_id,
+                ", ".join(getattr(t, "name", "?") for t in failed),
+                str(getattr(failed[0], "error", ""))[:200],
+            )
+            pending = False
+
         if pending:
             # A previous turn paused waiting for the user (ticket email
             # collection): this message is the resume value.

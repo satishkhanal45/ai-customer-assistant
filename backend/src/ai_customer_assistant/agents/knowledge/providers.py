@@ -464,7 +464,16 @@ def _resolved_provider_from_config(config: Optional[KnowledgeAgentConfig]) -> st
         return configured
     # The administrator's chosen default is tried before the hard-coded
     # order, so setting it on the Admin page actually decides something.
-    for candidate in (llm_credentials.default_provider(), "groq", "gemini"):
+    # The trailing sweep over every registered provider is what makes
+    # "paste a key for any supported vendor and it works" true -- without
+    # it, a deployment holding only a key this tuple does not name falls
+    # through to the stub, which answers plausibly and cites nothing.
+    for candidate in (
+        llm_credentials.default_provider(),
+        "groq",
+        "gemini",
+        *(p.name for p in llm_credentials.PROVIDERS),
+    ):
         if candidate in _PROVIDER_FACTORIES and _has_credentials(candidate):
             return candidate
     return "stub"
